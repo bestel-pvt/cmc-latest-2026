@@ -18,10 +18,16 @@ GRID_OPTIONS: list[tuple[int, int, str]] = [
     (1, 1, "1 × 1"),
     (2, 2, "2 × 2"),
     (3, 3, "3 × 3"),
-    # Larger grids would need per-channel low-res transcodes on the
-    # server (killed 2026-08-03 after 111 libx264 workers spiked load
-    # avg to 694). 3x3 = 9 HD streams is the sweet spot: laptop can
-    # decode them, Tailscale can carry them, server stays idle.
+    (4, 4, "4 × 4"),
+    (5, 5, "5 × 5"),
+    (6, 6, "6 × 6"),
+    (8, 4, "8 × 4 (32)"),
+    # CMC has only 32 channels total and every -lo transcode is kept
+    # ALWAYS WARM on the server via runOnInit, so a big wall doesn't
+    # trigger cold-start pileup. -lo is 480 p at ~700 kbps, so a full
+    # 32-tile view over LAN is ~22 Mbps in — trivially decodable on
+    # any modern desktop, and same-network operators can run this
+    # without a client-side bottleneck.
 ]
 
 
@@ -51,7 +57,7 @@ class WallWindow:
         self._logo_img: tk.PhotoImage | None = None
         self._analysys_img: tk.PhotoImage | None = None
 
-        root.title("DEMP Video Wall — Powered by Analysys")
+        root.title("CMC Video Wall — Powered by Analysys")
         root.geometry("1600x900")
         root.configure(bg="#FFFFFF")
         root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -61,7 +67,7 @@ class WallWindow:
         if sys.platform == "win32":
             try:
                 import ctypes
-                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("pk.gov.demp.viewer")
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("pk.gov.pak-navy.cmc.viewer")
             except Exception:
                 pass
         ico = _assets_dir() / "demp.ico"
@@ -127,7 +133,7 @@ class WallWindow:
                 pass
 
         # DEMP wordmark in Pakistan green
-        tk.Label(bar, text="DEMP", bg="#FFFFFF", fg="#166534",
+        tk.Label(bar, text="PAK NAVY", bg="#FFFFFF", fg="#166534",
                  font=("Segoe UI", 16, "bold")).pack(side="left")
         tk.Label(bar, text="  Video Wall", bg="#FFFFFF", fg="#334155",
                  font=("Segoe UI", 11)).pack(side="left")
@@ -261,7 +267,7 @@ class WallWindow:
 
     def _on_channels_load_failed(self, err: BaseException) -> None:
         self.status_var.set("Load failed")
-        messagebox.showerror("DEMP", f"Failed to load channels:\n{err}")
+        messagebox.showerror("PAK NAVY", f"Failed to load channels:\n{err}")
 
     def _reauthenticate(self) -> None:
         from demp_viewer.ui.login import do_login
@@ -271,7 +277,7 @@ class WallWindow:
         self.client.set_token(None)
         result = do_login(self.client, self.cfg.email or "", self.cfg.api_base or "")
         if not self.client.access_token or result is None:
-            messagebox.showwarning("DEMP", "Sign-in cancelled — you can retry from the toolbar.")
+            messagebox.showwarning("PAK NAVY", "Sign-in cancelled — you can retry from the toolbar.")
             return
         email, api_base = result
         self.cfg.email = email or self.cfg.email

@@ -89,16 +89,24 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
     }
   }
 
+  // CMC: transcode video to 720p on record (was passthrough 1080p on DEMP).
+  // Cheaper storage per channel, matches PAK NAVY's target retention
+  // budget on a shared 32-channel server. veryfast keeps CPU at
+  // ~5-8% per channel × 32 = ~2 cores total on the R740XD2.
   const args = [
     '-hide_banner', '-loglevel', 'warning', '-nostdin',
     '-fflags', '+genpts+discardcorrupt',
     '-err_detect', 'ignore_err',
     ...(kind === 'UDP' || kind === 'RTP' ? ['-f', 'mpegts'] : []),
     '-i', input,
-    // Stream copy — no re-encode. Handles MPEG-2 / H264 alike.
-    '-c:v', 'copy',
+    '-map', '0:v:0', '-map', '0:a:0?',
+    // 720p transcode with letterbox pad so aspect stays right for any source.
+    '-vf', 'scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2',
+    '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency',
+    '-profile:v', 'main', '-pix_fmt', 'yuv420p',
+    '-b:v', '2500k', '-maxrate', '3000k', '-bufsize', '5000k',
+    '-g', '50', '-keyint_min', '25', '-sc_threshold', '0',
     '-c:a', 'aac', '-b:a', A_BITRATE, '-ac', '2', '-ar', '48000',
-    '-map', '0:v:0', '-map', '0:a:0',
     '-f', 'segment',
     '-segment_time', String(SEG_SECONDS),
     '-segment_format', 'mp4',
@@ -337,8 +345,8 @@ async function clipWorker(job: { clipId: string }) {
     '-filter_complex',
     `[0:v]scale=${w}:${h}:force_original_aspect_ratio=decrease,` +
       `pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,` +
-      // Persistent DEMP wordmark top-right + Powered by Analysys line
-      `drawtext=text='DEMP':fontcolor=white@0.55:fontsize=42:fontfile=${FONT_BOLD}:x=w-tw-24:y=24,` +
+      // Persistent PAK NAVY wordmark top-right + Powered by Analysys line
+      `drawtext=text='PAK NAVY':fontcolor=white@0.55:fontsize=42:fontfile=${FONT_BOLD}:x=w-tw-24:y=24,` +
       `drawtext=text='Powered by Analysys':fontcolor=white@0.55:fontsize=14:fontfile=${FONT_REG}:x=w-tw-24:y=68,` +
       // Bottom strip with operator/timestamp watermark
       `drawbox=x=0:y=ih-30:w=iw:h=30:color=#0B1E3A@0.8:t=fill,` +

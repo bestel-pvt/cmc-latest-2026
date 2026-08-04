@@ -230,7 +230,6 @@ export default function ChannelsPage() {
                     <td className="px-4 py-3">
                       <div className="flex flex-col gap-1 items-start">
                         <Badge variant={signalVariant}>{signal}</Badge>
-                        {c.aiFeaturesEnabled && <Badge variant="brand">AI</Badge>}
                       </div>
                     </td>
                     <td className="px-4 py-3">

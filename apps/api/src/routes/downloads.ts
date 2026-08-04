@@ -23,7 +23,7 @@ interface Build {
 const BUILDS: Build[] = [
   {
     platform: 'windows',
-    filename: 'DEMP-Viewer.exe',
+    filename: 'CMC-Viewer.exe',
     contentType: 'application/vnd.microsoft.portable-executable',
     notes: 'Windows 64-bit — bundles VLC + all deps. Just double-click.',
   },

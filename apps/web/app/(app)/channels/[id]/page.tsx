@@ -89,7 +89,6 @@ export default function ChannelDetailPage() {
               <h1 className="font-display text-2xl font-bold tracking-tight">{ch.name}</h1>
               <Badge variant="brand">{ch.category}</Badge>
               <Badge variant="outline">{ch.language}</Badge>
-              {ch.aiFeaturesEnabled && <Badge variant="green">AI ENABLED</Badge>}
             </div>
             <div className="text-[11px] text-muted-2 mt-0.5 font-mono uppercase tracking-widest">/{ch.slug}</div>
           </div>

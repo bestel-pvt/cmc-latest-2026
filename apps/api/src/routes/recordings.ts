@@ -322,7 +322,16 @@ const routes: FastifyPluginAsync = async (app) => {
           '-f', 'segment',
           '-segment_time', '6',
           '-segment_format', 'mpegts',
-          '-reset_timestamps', '1',
+          // -reset_timestamps 1 RESTARTED each sub-slice's PTS at 0,
+          // which made hls.js recompute its timeline every 6 s and
+          // stall around slice 2-3 (the 9-10 s stall the operator
+          // reported), and made audio drift out of sync with video.
+          // 0 preserves the source PTS across slices — hls.js walks
+          // one continuous timeline for the whole 60-s segment.
+          '-reset_timestamps', '0',
+          '-avoid_negative_ts', 'make_zero',
+          '-copyts',
+          '-muxdelay', '0', '-muxpreload', '0',
           join(outDir, '%d.ts'),
         ], { stdio: ['ignore', 'pipe', 'pipe'] });
         let tail = '';

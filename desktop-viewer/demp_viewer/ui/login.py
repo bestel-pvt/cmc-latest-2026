@@ -39,14 +39,14 @@ def do_login(client: DempClient, initial_email: str = "",
     """Blocks until sign-in succeeds. Returns (email, api_base) or None."""
 
     root = tk.Tk()
-    root.title("DEMP Viewer — Sign in")
+    root.title("CMC Viewer — Sign in")
     root.configure(bg=BG)
     root.resizable(False, False)
 
     if sys.platform == "win32":
         try:
             import ctypes
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("pk.gov.demp.viewer")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("pk.gov.pak-navy.cmc.viewer")
         except Exception:
             pass
     ico = _assets_dir() / "demp.ico"
@@ -85,12 +85,12 @@ def do_login(client: DempClient, initial_email: str = "",
         except Exception:
             pass
 
-    tk.Label(header, text="DEMP", bg=BG, fg=DEMP_GRN,
+    tk.Label(header, text="PAK NAVY", bg=BG, fg=DEMP_GRN,
              font=("Segoe UI", 26, "bold")).pack(pady=(6, 0))
 
-    tk.Label(root, text="Government of Pakistan · Directorate of Electronic Media & Publications",
+    tk.Label(root, text="Government of Pakistan · Pakistan Navy",
              bg=BG, fg=MUTED_2, font=("Segoe UI", 8)).pack(pady=(2, 2))
-    tk.Label(root, text="AI-enabled Media Monitoring System",
+    tk.Label(root, text="Channel Monitoring & Clipping",
              bg=BG, fg=MUTED, font=("Segoe UI", 9)).pack(pady=(0, 20))
 
     # ── Form ────────────────────────────────────────────────────
@@ -105,7 +105,7 @@ def do_login(client: DempClient, initial_email: str = "",
         e.pack(fill="x", ipady=4)
         return v, e
 
-    api_var,   api_e   = _row("Server",   default=initial_api_base or "http://100.105.45.112:4001")
+    api_var,   api_e   = _row("Server",   default=initial_api_base or "http://172.16.205.21:4001")
     email_var, email_e = _row("Email",    default=initial_email)
     pw_var,    pw_e    = _row("Password", secret=True)
 
@@ -157,10 +157,10 @@ def do_login(client: DempClient, initial_email: str = "",
         pw = pw_var.get()
         api_base = api_var.get().strip().rstrip("/")
         if not email or not pw:
-            messagebox.showwarning("DEMP", "Email and password required", parent=root)
+            messagebox.showwarning("PAK NAVY", "Email and password required", parent=root)
             return
         if not api_base:
-            messagebox.showwarning("DEMP", "Server URL required", parent=root)
+            messagebox.showwarning("PAK NAVY", "Server URL required", parent=root)
             return
         btn.configure(state="disabled", text="Signing in…")
         root.update_idletasks()

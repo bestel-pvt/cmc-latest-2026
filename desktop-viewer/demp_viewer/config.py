@@ -6,9 +6,9 @@ import os
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
-APP_NAME = "DEMP Viewer"
+APP_NAME = "CMC Viewer"
 
-DEFAULT_API_BASE = os.environ.get("DEMP_API_BASE", "http://100.105.45.112:4001")
+DEFAULT_API_BASE = os.environ.get("CMC_API_BASE", "http://172.16.205.21:4001")
 
 
 def _config_dir() -> Path:
@@ -16,7 +16,7 @@ def _config_dir() -> Path:
         base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
     else:
         base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-    d = base / "DEMP-Viewer"
+    d = base / "CMC-Viewer"
     d.mkdir(parents=True, exist_ok=True)
     return d
 

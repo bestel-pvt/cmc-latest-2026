@@ -1,0 +1,23 @@
+[Unit]
+Description=DEMP Recording (FFmpeg segmenter + clip renderer)
+After=network-online.target docker.service
+Requires=docker.service
+PartOf=demp.target
+
+[Service]
+Type=simple
+User=demp
+Group=demp
+WorkingDirectory=/opt/demp
+Environment=NODE_ENV=production
+EnvironmentFile=/opt/demp/.env
+ExecStart=/usr/bin/pnpm --filter @demp/recording start
+Restart=on-failure
+RestartSec=10
+# Recording spawns many FFmpeg subprocesses; raise limits.
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=demp.target

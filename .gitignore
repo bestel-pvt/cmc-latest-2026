@@ -1,0 +1,51 @@
+node_modules
+.pnpm-store
+dist
+build
+.next
+.turbo
+out
+
+# env
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# logs
+*.log
+logs
+pnpm-debug.log*
+
+# os
+.DS_Store
+Thumbs.db
+
+# runtime / data — SCOPED to data root only so we don't clobber code
+# folders that happen to be named `recordings`, `clips`, etc.
+/data/
+/data/**
+apps/*/data/
+services/*/data/
+/recordings/
+/clips/
+/models/
+.mediamtx.pid
+*.sqlite
+*.db
+
+# ide
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea
+
+# python
+__pycache__
+*.pyc
+.venv
+venv
+
+# generated
+apps/*/prisma-client
+packages/db/generated

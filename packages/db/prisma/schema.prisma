@@ -1,0 +1,553 @@
+// =====================================================================
+// DEMP — Prisma schema (Phase 1)
+// See plan: C:/Users/ibrahim laptops/.claude/plans/breezy-strolling-sky.md
+// =====================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------- Users & Auth ------------------------------------------------
+
+enum Role {
+  ADMIN
+  OPERATOR
+  ANALYST
+  VIEWER
+}
+
+model User {
+  id             String    @id @default(cuid())
+  email          String    @unique
+  name           String
+  passwordHash   String
+  role           Role      @default(VIEWER)   // preset — used as authorization fallback
+  roleName       String?                       // operator-defined label ("Newsroom Analyst")
+  permissions    Json?                         // list of "feature:action" strings; if null, role's default set applies
+  mfaSecret      String?
+  disabledAt     DateTime?
+  lastLoginAt    DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  auditLogs      AuditLog[]
+  clips          Clip[]
+  legalHolds     LegalHold[]
+  keywords       Keyword[]
+  collages       Collage[]
+  aiJobs         AIJob[]
+  conversations  Conversation[]
+
+  @@index([role])
+}
+
+// ---------- Audit ------------------------------------------------------
+// Append-only. Never edit, never delete. In prod we push a copy to a WORM
+// store via a follow-on job. Phase 1 keeps it in Postgres.
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action     String   // e.g. "channel.create", "clip.export", "user.login"
+  entityType String?  // e.g. "Channel", "Source"
+  entityId   String?
+  meta       Json?
+  ip         String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([entityType, entityId])
+  @@index([action, createdAt])
+}
+
+// ---------- Channels + Sources ------------------------------------------
+
+enum ChannelLanguage {
+  EN
+  UR
+  AR
+  PA
+  OTHER
+}
+
+enum ChannelCategory {
+  NEWS
+  ENTERTAINMENT
+  SPORTS
+  MUSIC
+  RELIGIOUS
+  KIDS
+  BUSINESS
+  DOCUMENTARY
+  REGIONAL
+  OTHER
+}
+
+model Channel {
+  id              String            @id @default(cuid())
+  slug            String            @unique
+  name            String
+  logoUrl         String?
+  category        ChannelCategory   @default(NEWS)
+  language        ChannelLanguage   @default(UR)
+  active          Boolean           @default(true)
+  aiFeaturesEnabled Boolean         @default(false)   // demo scope: only enabled channels get recording, tickers/flashers OCR, transcription, alerts
+  recordingEnabled  Boolean         @default(false)   // operator-toggled: recording service records only channels with this true
+  // Manual region hints. If set, workers use them directly instead of auto-detect.
+  tickerCropRect       Json?        // deprecated — kept for back-compat; use tickerPrimaryRect
+  tickerPrimaryRect    Json?        // { x, y, w, h } in [0..1]
+  tickerSecondaryRect  Json?        // secondary scroller if the channel has two
+  flasherLeftRect      Json?
+  flasherRightRect     Json?
+  dempOutputPort  Int?              @unique          // UDP port DEMP publishes this channel on for network consumers
+  notes           String?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  sources         Source[]
+  segments        RecordingSegment[]
+  manifests       RecordingManifest[]
+  clips           Clip[]
+  alerts          Alert[]
+  legalHolds      LegalHold[]
+  tickerEvents    TickerEvent[]
+
+  @@index([active])
+  @@index([category])
+  @@index([language])
+}
+
+enum SourceKind {
+  UDP
+  SRT
+  RTSP
+  RTMP
+  HLS
+  FILE
+}
+
+model Source {
+  id         String     @id @default(cuid())
+  channelId  String
+  channel    Channel    @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  name       String     @default("")   // operator label: "Satellite", "OTT Backup", "Fiber", …
+  kind       SourceKind @default(UDP)
+  url        String     // udp://@239.0.0.1:1234  |  srt://...  etc.
+  isPrimary  Boolean    @default(false)
+  priority   Int        @default(0) // higher first when scores tie
+  notes      String?
+  createdAt  DateTime   @default(now())
+  updatedAt  DateTime   @updatedAt
+
+  segments   RecordingSegment[]
+
+  @@index([channelId, isPrimary])
+  @@index([channelId, priority])
+}
+
+// ---------- Recording ---------------------------------------------------
+
+model RecordingSegment {
+  id           String    @id @default(cuid())
+  channelId    String
+  channel      Channel   @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  sourceId     String?
+  source       Source?   @relation(fields: [sourceId], references: [id], onDelete: SetNull)
+  startedAt    DateTime
+  durationMs   Int
+  path         String    // absolute path under RECORDINGS_DIR
+  sizeBytes    BigInt
+  sha256       String    // hex; evidentiary chain
+  resolution   String?   // "1920x1080"
+  codec        String?   // "h264/aac"
+  createdAt    DateTime  @default(now())
+
+  transcripts  Transcript[]
+  detections   Detection[]
+
+  @@index([channelId, startedAt])
+  @@index([startedAt])
+}
+
+model RecordingManifest {
+  id           String   @id @default(cuid())
+  channelId    String
+  channel      Channel  @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  hourStart    DateTime // truncated to :00:00
+  segmentIds   String[] // list of RecordingSegment.id in order
+  signature    String   // ed25519 signature of the sorted (id|sha256) list
+  createdAt    DateTime @default(now())
+
+  @@unique([channelId, hourStart])
+  @@index([hourStart])
+}
+
+// ---------- Legal Hold --------------------------------------------------
+
+model LegalHold {
+  id          String    @id @default(cuid())
+  channelId   String?
+  channel     Channel?  @relation(fields: [channelId], references: [id], onDelete: SetNull)
+  startsAt    DateTime
+  endsAt      DateTime
+  reason      String
+  active      Boolean   @default(true)
+  createdById String
+  createdBy   User      @relation(fields: [createdById], references: [id])
+  createdAt   DateTime  @default(now())
+
+  @@index([active, startsAt, endsAt])
+  @@index([channelId, active])
+}
+
+// ---------- Transcription & Detection -----------------------------------
+
+model Transcript {
+  id         String    @id @default(cuid())
+  segmentId  String
+  segment    RecordingSegment @relation(fields: [segmentId], references: [id], onDelete: Cascade)
+  language   String    // "en", "ur", "ar"
+  text       String    // full text
+  words      Json      // [{ t: startMs, d: durMs, w: "word" }, ...]
+  model      String    // "faster-whisper-small", etc.
+  createdAt  DateTime  @default(now())
+
+  @@index([segmentId])
+  @@index([language])
+  // Full-text-search on `text` is added in a follow-on migration with tsvector.
+}
+
+enum DetectionKind {
+  FACE
+  LOGO
+  TEXT
+  SCENE
+  AD_FINGERPRINT
+  OBJECT
+}
+
+model Detection {
+  id         String        @id @default(cuid())
+  segmentId  String
+  segment    RecordingSegment @relation(fields: [segmentId], references: [id], onDelete: Cascade)
+  kind       DetectionKind
+  payload    Json          // varies by kind; e.g. { bbox, name, confidence }
+  confidence Float
+  tMs        Int           // offset from segment start
+  createdAt  DateTime      @default(now())
+
+  @@index([segmentId, kind])
+  @@index([kind, confidence])
+}
+
+// ---------- Clips -------------------------------------------------------
+
+enum ClipFormat {
+  MP4
+  MOV
+  MKV
+  WEBM
+}
+
+enum ClipStatus {
+  QUEUED
+  RENDERING
+  READY
+  FAILED
+}
+
+model Clip {
+  id             String     @id @default(cuid())
+  channelId      String
+  channel        Channel    @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  startAt        DateTime   // absolute time
+  endAt          DateTime
+  title          String
+  notes          String?
+  watermarkText  String?
+  format         ClipFormat @default(MP4)
+  resolution     String     @default("1920x1080")
+  status         ClipStatus @default(QUEUED)
+  path           String?    // filled once READY
+  sizeBytes      BigInt?
+  sha256         String?
+  createdById    String
+  createdBy      User       @relation(fields: [createdById], references: [id])
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  @@index([channelId, createdAt])
+  @@index([createdById, createdAt])
+  @@index([status])
+}
+
+// ---------- Alerts + Keywords -------------------------------------------
+
+enum AlertKind {
+  KEYWORD
+  SOURCE_DOWN
+  SOURCE_SWITCH
+  DETECTION
+  DISK_LOW
+}
+
+model Alert {
+  id           String    @id @default(cuid())
+  channelId    String?
+  channel      Channel?  @relation(fields: [channelId], references: [id], onDelete: SetNull)
+  kind         AlertKind
+  severity     Int       @default(2)   // 1 info, 2 warn, 3 crit
+  matchedText  String?
+  tMs          Int?
+  payload      Json?
+  ackByUserId  String?
+  ackAt        DateTime?
+  createdAt    DateTime  @default(now())
+
+  @@index([channelId, createdAt])
+  @@index([kind, createdAt])
+  @@index([ackAt])
+}
+
+model Keyword {
+  id        String   @id @default(cuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  text      String
+  language  String   @default("en")
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  @@index([active])
+  @@index([text])
+}
+
+// ---------- Settings ----------------------------------------------------
+
+model Setting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+}
+
+// ======================================================================
+// AI features — ticker OCR, semantic grouping, collages, unified job queue
+// ======================================================================
+
+/// Kind of on-screen overlay captured by the OCR worker.
+///  - TICKER         : bottom horizontal scroller
+///  - FLASHER_LEFT   : left-middle breaking-news box
+///  - FLASHER_RIGHT  : right-middle breaking-news box
+enum TickerKind {
+  TICKER
+  FLASHER_LEFT
+  FLASHER_RIGHT
+}
+
+/// A single on-screen ticker/flasher appearance for a channel.
+/// `startedAt`/`endedAt` collapse consecutive frames where the OCR'd text was
+/// effectively identical into one event. `imagePath` points to the cropped
+/// strip PNG used by the collage compositor.
+model TickerEvent {
+  id             String    @id @default(cuid())
+  channelId      String
+  channel        Channel   @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  kind           TickerKind @default(TICKER)
+  startedAt      DateTime
+  endedAt        DateTime
+  durationMs     Int
+  text           String
+  textNormalized String    // lowercased, punctuation-stripped for dedup
+  language       String    // "en" | "ur" | "hi" | "zh" | ...
+  confidence     Float     // OCR confidence 0..1
+  cropRect       Json      // { x, y, w, h } in fractions
+  imagePath      String    // cropped strip PNG (absolute path)
+  tickerGroupId  String?
+  tickerGroup    TickerGroup? @relation(fields: [tickerGroupId], references: [id], onDelete: SetNull)
+  createdAt      DateTime  @default(now())
+
+  @@index([channelId, kind, startedAt])
+  @@index([language, startedAt])
+  @@index([tickerGroupId])
+  @@index([textNormalized])
+  @@index([kind, startedAt])
+}
+
+/// A semantic cluster of TickerEvents whose text carries the same meaning
+/// (possibly across languages). Refreshed by the ticker-grouper worker.
+model TickerGroup {
+  id               String    @id @default(cuid())
+  kind             TickerKind @default(TICKER)
+  canonicalText    String    // representative text for the cluster
+  language         String    // dominant language of the cluster
+  firstSeenAt      DateTime
+  lastSeenAt       DateTime
+  occurrenceCount  Int       @default(0)
+  channelCount     Int       @default(0)
+  channels         String[]  // channel slugs seen; denorm for filtering
+  latestCollageId  String?   @unique
+  latestCollage    Collage?  @relation("TickerGroupLatestCollage", fields: [latestCollageId], references: [id], onDelete: SetNull)
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  events           TickerEvent[]
+  collages         Collage[]     @relation("TickerGroupCollages")
+
+  @@index([kind, lastSeenAt])
+  @@index([language])
+}
+
+enum CollageKind {
+  AUTO       // scheduled by ticker-grouper when a group updates
+  MANUAL     // operator triggered from the UI
+}
+
+model Collage {
+  id             String       @id @default(cuid())
+  kind           CollageKind  @default(AUTO)
+  tickerGroupId  String?
+  tickerGroup    TickerGroup? @relation("TickerGroupCollages", fields: [tickerGroupId], references: [id], onDelete: SetNull)
+  imagePath      String
+  sizeBytes      BigInt
+  rowCount       Int
+  eventIds       String[]     // TickerEvent.id list used
+  createdById    String?
+  createdBy      User?        @relation(fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt      DateTime     @default(now())
+
+  latestForGroup TickerGroup? @relation("TickerGroupLatestCollage")
+
+  @@index([tickerGroupId, createdAt])
+  @@index([createdAt])
+}
+
+/// Unified AI job queue tracker.
+/// Every AI unit of work (transcribe a segment, OCR a ticker sample, cluster
+/// ticker events, render a collage) writes a row here so the UI can show
+/// queued/running/done/failed state + a progress %.
+enum AIJobKind {
+  TRANSCRIBE_SEGMENT
+  TRANSCRIBE_CLIP
+  TRANSCRIBE_UPLOAD   // voice-note uploaded from the DEMP GPT chat
+  OCR_TICKER
+  GROUP_TICKERS
+  RENDER_COLLAGE
+  GPT_ANSWER          // reserved for background RAG jobs; not wired yet
+}
+enum AIJobStatus {
+  QUEUED
+  RUNNING
+  DONE
+  FAILED
+  CANCELLED
+}
+enum AIJobPriority {
+  LOW
+  NORMAL
+  HIGH
+}
+
+model AIJob {
+  id             String        @id @default(cuid())
+  kind           AIJobKind
+  targetType     String?       // "RecordingSegment" | "Clip" | "Channel" | ...
+  targetId       String?
+  channelId      String?       // denorm for filtering on AI Health page
+  priority       AIJobPriority @default(NORMAL)
+  status         AIJobStatus   @default(QUEUED)
+  progress       Int           @default(0)   // 0..100
+  message        String?
+  error          String?
+  requestedById  String?
+  requestedBy    User?         @relation(fields: [requestedById], references: [id], onDelete: SetNull)
+  startedAt      DateTime?
+  finishedAt     DateTime?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  @@index([status, priority, createdAt])
+  @@index([kind, status])
+  @@index([channelId, kind, createdAt])
+  @@index([targetType, targetId])
+}
+
+/// A chat conversation with DEMP GPT.
+model Conversation {
+  id         String    @id @default(cuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title      String    @default("New chat")
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  messages   Message[]
+
+  @@index([userId, updatedAt])
+}
+
+enum MessageRole {
+  USER
+  ASSISTANT
+  SYSTEM
+}
+
+/// A single message in a Conversation. `citations` links to the DB rows
+/// (transcripts, ticker events, alerts, …) the assistant grounded its answer
+/// on so the operator can jump straight to the evidence.
+model Message {
+  id             String       @id @default(cuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  role           MessageRole
+  content        String
+  citations      Json?        // [{sourceType, sourceId, channelId?, snippet, at?}, ...]
+  tokensPrompt   Int?
+  tokensCompletion Int?
+  modelName      String?
+  createdAt      DateTime     @default(now())
+
+  @@index([conversationId, createdAt])
+}
+
+/// Rolling per-source health sample written by the failover controller once
+/// per tick. Keeps ~72h of ticks; enables the failover-stats dashboard graphs
+/// (line chart per source, sparklines in KPI cards).
+model SourceHealthTick {
+  id         String   @id @default(cuid())
+  channelId  String
+  sourceId   String
+  at         DateTime @default(now())
+  score      Float
+  bitrateBps Int
+  decodeErrors Int
+  isActive   Boolean  @default(false)  // was this the currently-active source at this tick?
+
+  @@index([channelId, at])
+  @@index([sourceId, at])
+  @@index([at])
+}
+
+/// A single "did this AI run come out right?" record so the UI can report a
+/// rolling success percentage per feature and per channel.
+model AIFeedback {
+  id           String   @id @default(cuid())
+  kind         AIJobKind
+  channelId    String?
+  targetType   String?
+  targetId     String?
+  ranAt        DateTime @default(now())
+  success      Boolean
+  confidence   Float?
+  errorPct     Float?    // when success=false, how far off (0..100)
+  message      String?
+
+  @@index([kind, ranAt])
+  @@index([channelId, kind, ranAt])
+}

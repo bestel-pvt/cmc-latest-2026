@@ -1,0 +1,21 @@
+[Unit]
+Description=DEMP API (Fastify)
+After=docker.service network-online.target
+Requires=docker.service
+PartOf=demp.target
+
+[Service]
+Type=simple
+User=demp
+Group=demp
+WorkingDirectory=/opt/demp
+Environment=NODE_ENV=production
+EnvironmentFile=/opt/demp/.env
+ExecStart=/usr/bin/pnpm --filter @demp/api start
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=demp.target

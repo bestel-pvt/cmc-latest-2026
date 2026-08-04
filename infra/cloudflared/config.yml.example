@@ -1,0 +1,30 @@
+# =====================================================================
+# Cloudflare Tunnel config template.
+#
+# 1) On the Ubuntu server:
+#     curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+#     sudo dpkg -i cloudflared.deb
+#     sudo cloudflared tunnel login              # opens a browser-auth URL you visit from any device
+#     sudo cloudflared tunnel create demp
+#     sudo cloudflared tunnel route dns demp <hostname.example.com>
+#
+# 2) Copy this file to /etc/cloudflared/config.yml, filling in the
+#    tunnel UUID + your hostname + your Cloudflare account.
+#
+# 3) sudo cloudflared service install
+#    sudo systemctl enable --now cloudflared
+# =====================================================================
+
+tunnel: REPLACE-WITH-TUNNEL-UUID
+credentials-file: /etc/cloudflared/REPLACE-WITH-TUNNEL-UUID.json
+
+ingress:
+  # Public web UI + API — nginx (:8080) proxies /api → :4001 and everything else → Next.js (:3001)
+  - hostname: demp.example.com
+    service: http://localhost:8080
+
+  # Optional: expose the HLS output directly for LAN-consumer players (VLC etc.)
+  # - hostname: hls.demp.example.com
+  #   service: http://localhost:8888
+
+  - service: http_status:404

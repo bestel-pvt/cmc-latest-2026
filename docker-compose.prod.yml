@@ -1,0 +1,69 @@
+# =====================================================================
+# DEMP — production Docker Compose overrides
+#
+# Layout: infrastructure runs in Docker (Postgres, Redis, MediaMTX, Ollama);
+# the Node + Python application services run natively on the host under
+# systemd so they can spawn FFmpeg on the host with zero container overhead
+# and MediaMTX gets host networking for UDP multicast.
+#
+# Usage on the Ubuntu server:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# All persistent data lives under /data/demp/ (bind-mounted).
+# =====================================================================
+
+services:
+  postgres:
+    restart: always
+    ports: []          # closed to the world — API + services connect via 127.0.0.1
+    volumes:
+      - /data/demp/postgres:/var/lib/postgresql/data/pgdata
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-demp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}
+      POSTGRES_DB: ${POSTGRES_DB:-demp}
+      PGDATA: /var/lib/postgresql/data/pgdata
+
+  redis:
+    restart: always
+    ports: []
+    volumes:
+      - /data/demp/redis:/data
+
+  # MediaMTX needs host networking for UDP multicast joins on Linux.
+  # On the Ubuntu server this is fine; on Docker Desktop (Windows/Mac) fall
+  # back to the port-mapping mode from docker-compose.yml.
+  mediamtx:
+    restart: always
+    network_mode: host
+    # `ports` is ignored under host networking; keep the config file mount.
+    volumes:
+      - ./infra/mediamtx/mediamtx.yml:/mediamtx.yml:ro
+      - /data/demp/recordings:/recordings
+
+  # Local LLM for DEMP GPT. Pull the model once:
+  #   docker exec demp_ollama ollama pull qwen2.5:3b-instruct
+  ollama:
+    restart: always
+    # 11434 has been observed clashing on some hosts (phantom Docker NAT).
+    # We publish on 11435 externally; container still listens on 11434 internally.
+    ports:
+      - "127.0.0.1:11435:11434"
+    volumes:
+      - /data/demp/ollama:/root/.ollama
+
+  # nginx becomes the public entry-point; terminates TLS via Cloudflare Tunnel.
+  nginx:
+    restart: always
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./infra/nginx/nginx.prod.conf:/etc/nginx/nginx.conf:ro
+
+volumes:
+  # Named volumes from base compose are overridden with bind mounts above,
+  # so the docker-managed volumes below stay empty on prod. Declared to
+  # satisfy compose's top-level `volumes:` requirement.
+  demp_pg_data:
+  demp_redis_data:
+  demp_ollama_models:

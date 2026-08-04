@@ -1,0 +1,59 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root { color-scheme: light; font-size: 16px; }
+  @media (min-width: 1440px) { :root { font-size: 17px; } }
+  html, body { height: 100%; }
+  body {
+    @apply bg-bg text-txt antialiased font-sans;
+    font-size: 0.9375rem;      /* 15px base */
+    line-height: 1.5;
+    background:
+      radial-gradient(1200px 620px at 92% -10%, rgba(22,101,52,.08),  transparent 55%),
+      radial-gradient(1000px 720px at -12% 18%, rgba(37,99,235,.05),  transparent 52%),
+      radial-gradient(900px  700px at 110% 108%,rgba(8,145,178,.04),  transparent 50%),
+      linear-gradient(176deg,#F7F9FD 0%,#F1F4FA 42%,#EDF1F8 100%);
+    background-attachment: fixed;
+  }
+  * { border-color: rgba(15,23,42,0.06); }
+  ::selection { background: rgba(22,101,52,0.28); color: #0F172A; }
+
+  h1,h2,h3,h4 { @apply font-display tracking-tight; }
+
+  /* Urdu / Arabic content: use Noto Nastaliq for legible right-to-left
+     script. Applied automatically when the browser's Unicode-range
+     matching kicks in, but authors can also mark strings explicitly
+     with `dir="rtl"` or the `.font-urdu` utility class. */
+  :lang(ur), :lang(ar), [dir="rtl"] {
+    font-family: 'Noto Nastaliq Urdu', 'Manrope', ui-sans-serif, sans-serif;
+    line-height: 2.2;
+  }
+  .font-urdu {
+    font-family: 'Noto Nastaliq Urdu', 'Manrope', ui-sans-serif, sans-serif;
+    line-height: 2.2;
+  }
+}
+
+@layer components {
+  .card {
+    @apply bg-card border border-border rounded-xl shadow-soft;
+  }
+  .card-glow { @apply relative overflow-hidden; }
+  .card-glow::before {
+    content:'';
+    position:absolute; inset:0;
+    background: radial-gradient(1200px 400px at 0% 0%, rgba(22,101,52,.06), transparent 60%);
+    pointer-events:none;
+  }
+  .kbd {
+    @apply inline-flex items-center justify-center px-1.5 h-5 rounded-md
+           text-[10px] font-mono border border-border bg-panel2 text-muted;
+  }
+  .live-dot { @apply inline-block w-2 h-2 rounded-full bg-accent-red animate-pulse-dot; }
+  .scrollbar-thin::-webkit-scrollbar { width: 8px; height: 8px; }
+  .scrollbar-thin::-webkit-scrollbar-thumb { background: rgba(15,23,42,.15); border-radius: 4px; }
+  .scrollbar-thin::-webkit-scrollbar-thumb:hover { background: rgba(15,23,42,.25); }
+  .scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
+}

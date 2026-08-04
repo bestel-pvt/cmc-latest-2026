@@ -1,0 +1,20 @@
+[Unit]
+Description=DEMP Ticker Grouper + Collage Renderer
+After=network-online.target
+PartOf=demp.target
+
+[Service]
+Type=simple
+User=demp
+Group=demp
+WorkingDirectory=/opt/demp
+Environment=NODE_ENV=production
+EnvironmentFile=/opt/demp/.env
+ExecStart=/opt/demp/services/ticker-grouper/.venv/bin/python /opt/demp/services/ticker-grouper/worker.py
+Restart=on-failure
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=demp.target

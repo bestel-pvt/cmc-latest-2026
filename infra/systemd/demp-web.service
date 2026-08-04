@@ -1,0 +1,20 @@
+[Unit]
+Description=DEMP Web (Next.js)
+After=network-online.target demp-api.service
+PartOf=demp.target
+
+[Service]
+Type=simple
+User=demp
+Group=demp
+WorkingDirectory=/opt/demp
+Environment=NODE_ENV=production
+EnvironmentFile=/opt/demp/.env
+ExecStart=/usr/bin/pnpm --filter @demp/web start
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=demp.target

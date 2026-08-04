@@ -1,0 +1,10 @@
+# VLC binaries — bundled at build time (135 MB); download separately with:
+#   scripts/fetch-vlc.py  (or manually copy from a VLC 3.x 64-bit install)
+vendor/vlc/
+
+# Build artefacts
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc

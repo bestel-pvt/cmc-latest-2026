@@ -1,0 +1,22 @@
+[Unit]
+Description=DEMP Failover Controller (per-source health scoring + switching)
+After=network-online.target docker.service
+Requires=docker.service
+PartOf=demp.target
+
+[Service]
+Type=simple
+User=demp
+Group=demp
+WorkingDirectory=/opt/demp
+Environment=NODE_ENV=production
+EnvironmentFile=/opt/demp/.env
+ExecStart=/usr/bin/pnpm --filter @demp/failover-controller start
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=demp.target

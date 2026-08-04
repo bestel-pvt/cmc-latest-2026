@@ -1,0 +1,32 @@
+{
+  "name": "demp",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@9.15.9",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "turbo run dev --parallel",
+    "build": "turbo run build",
+    "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck",
+    "db:generate": "pnpm --filter @cmc/db exec prisma generate",
+    "db:migrate": "pnpm --filter @cmc/db exec prisma migrate dev",
+    "db:migrate:deploy": "pnpm --filter @cmc/db exec prisma migrate deploy",
+    "db:studio": "pnpm --filter @cmc/db exec prisma studio",
+    "db:seed": "pnpm --filter @cmc/db exec tsx prisma/seed.ts",
+    "db:seed:demo": "pnpm --filter @cmc/db exec tsx prisma/seed-ai-demo.ts",
+    "db:seed:prod": "pnpm --filter @cmc/db exec tsx prisma/seed-production-channels.ts",
+    "docker:up": "docker compose up -d",
+    "docker:down": "docker compose down",
+    "docker:logs": "docker compose logs -f"
+  },
+  "devDependencies": {
+    "turbo": "^2.3.3",
+    "typescript": "^5.6.3",
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "prettier": "^3.4.2"
+  }
+}

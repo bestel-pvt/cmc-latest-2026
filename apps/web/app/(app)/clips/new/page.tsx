@@ -1,0 +1,530 @@
+'use client';
+
+/**
+ * Clip Editor — single-view HLS player + timeline with in/out markers.
+ *
+ * Loads the WHOLE recording session (start → stop) as an HLS stream so
+ * the operator can start playing in ~1 s no matter how long the
+ * session is, and seek instantly to any point (hls.js pulls only the
+ * segments it needs). Mark in / mark out on the timeline; export sends
+ * the resolved absolute timestamps to /api/clips.
+ */
+
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
+import { useMutation, useQuery } from '@tanstack/react-query';
+import {
+  ArrowLeft, Play, Pause, ChevronsLeft, ChevronsRight,
+  Rewind, FastForward, Download, Save, Loader2, Volume2, VolumeX,
+  Split, ArrowRightToLine, ArrowLeftToLine,
+} from 'lucide-react';
+import Link from 'next/link';
+import Hls from 'hls.js';
+import WaveSurfer from 'wavesurfer.js';
+import { toast } from 'sonner';
+import { Card } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Badge } from '@/components/ui/badge';
+import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '@/components/ui/select';
+import { api } from '@/lib/api';
+import { CLIP_FORMATS, CLIP_RESOLUTIONS } from '@cmc/shared';
+import { fmtTimeCode } from '@/lib/utils';
+import { useAuth } from '@/lib/auth';
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? '';
+
+interface Channel { id: string; name: string; slug: string }
+interface Segment { id: string; startedAt: string; durationMs: number; path: string; channelId: string }
+
+export default function NewClipPage() {
+  const router = useRouter();
+  const sp = useSearchParams();
+  const user = useAuth((s) => s.user);
+  const channelId = sp.get('channelId') ?? '';
+  // Two entry paths: (a) recording session start/end, (b) single segmentId.
+  const sessionStart = sp.get('sessionStart');
+  const sessionEnd = sp.get('sessionEnd');
+  const segmentId = sp.get('segmentId');
+
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const waveRef = useRef<HTMLDivElement>(null);
+  const wsRef = useRef<WaveSurfer | null>(null);
+
+  const [duration, setDuration] = useState(0);
+  const [current, setCurrent] = useState(0);
+  const [markIn, setMarkIn] = useState<number | null>(null);
+  const [markOut, setMarkOut] = useState<number | null>(null);
+  const [playing, setPlaying] = useState(false);
+  const [muted, setMuted] = useState(true);
+
+  const [title, setTitle] = useState('');
+  const [notes, setNotes] = useState('');
+  const [format, setFormat] = useState<'MP4' | 'MOV' | 'MKV' | 'WEBM'>('MP4');
+  const [resolution, setResolution] = useState('1920x1080');
+
+  // If the operator arrived from a session ("Create clip" on the
+  // Recordings page), we already have startedAt/endedAt. If they arrived
+  // from a single segment link, look it up to get channelId + startedAt
+  // and treat it as a 1-segment window.
+  const { data: segment } = useQuery<Segment>({
+    queryKey: ['clipseg', segmentId],
+    queryFn: () => api<Segment>(`/api/recordings/${segmentId}`),
+    enabled: !!segmentId && (!sessionStart || !sessionEnd),
+  });
+  const { data: channels } = useQuery<Channel[]>({
+    queryKey: ['channels.for-clip'],
+    queryFn: () => api<Channel[]>('/api/channels'),
+  });
+  const channel = useMemo(() => channels?.find((c) => c.id === channelId), [channels, channelId]);
+
+  const effectiveStart = sessionStart ?? segment?.startedAt ?? null;
+  const effectiveEnd = sessionEnd ?? (segment
+    ? new Date(new Date(segment.startedAt).getTime() + segment.durationMs).toISOString()
+    : null);
+
+  // Attach hls.js pointing at the session playlist. Restart the player
+  // whenever channel/session window changes.
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !channelId || !effectiveStart || !effectiveEnd) return;
+    const token = typeof window !== 'undefined' ? localStorage.getItem('demp.accessToken') : null;
+    const p = new URLSearchParams();
+    p.set('channelId', channelId);
+    p.set('from', effectiveStart);
+    p.set('to',   effectiveEnd);
+    const src = `${API_BASE}/api/recordings/session.m3u8?${p}`;
+
+    let hls: Hls | null = null;
+    if (Hls.isSupported()) {
+      hls = new Hls({
+        xhrSetup: (xhr) => { if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`); },
+        // See recordings/page.tsx for the rationale — 6 s slices +
+        // rolling 12 s buffer = instant seek to any point of a
+        // multi-hour session.
+        maxBufferLength: 12,
+        maxMaxBufferLength: 24,
+        backBufferLength: 12,
+        maxBufferSize: 8 * 1024 * 1024,
+        startFragPrefetch: true,
+        lowLatencyMode: false,
+      });
+      hls.on(Hls.Events.ERROR, (_e, data) => {
+        if (data.fatal) toast.error(`Playback: ${data.details}`);
+      });
+      hls.loadSource(src);
+      hls.attachMedia(video);
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = src;
+    } else {
+      toast.error('This browser cannot play HLS.');
+    }
+    return () => { hls?.destroy(); };
+  }, [channelId, effectiveStart, effectiveEnd]);
+
+  // Waveform (peaks fetched from the API — server pre-computes them
+  // from the session's segments so we don't need to send raw audio to
+  // the browser).
+  useEffect(() => {
+    if (!waveRef.current || !channelId || !effectiveStart || !effectiveEnd) return;
+    let cancelled = false;
+    const token = typeof window !== 'undefined' ? localStorage.getItem('demp.accessToken') : null;
+    const p = new URLSearchParams();
+    p.set('channelId', channelId);
+    p.set('from', effectiveStart);
+    p.set('to',   effectiveEnd);
+    (async () => {
+      try {
+        const r = await fetch(`${API_BASE}/api/recordings/session-peaks.json?${p}`, {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        });
+        if (!r.ok) throw new Error(`peaks HTTP ${r.status}`);
+        const { peaks, duration: dur } = await r.json() as { peaks: number[]; duration: number };
+        if (cancelled || !waveRef.current) return;
+        wsRef.current?.destroy();
+        const ws = WaveSurfer.create({
+          container: waveRef.current,
+          waveColor: 'rgba(100, 116, 139, 0.35)',
+          progressColor: '#15803D',
+          cursorColor: '#E11D48',
+          cursorWidth: 2,
+          height: 64,
+          barWidth: 2,
+          barGap: 1,
+          barRadius: 2,
+          normalize: true,
+          interact: true,
+          peaks: [peaks],
+          duration: dur,
+          media: videoRef.current ?? undefined,
+        });
+        wsRef.current = ws;
+      } catch (e) {
+        // Fallback: no waveform, still render the flat click-to-seek strip below.
+        console.warn('waveform load failed:', e);
+      }
+    })();
+    return () => { cancelled = true; wsRef.current?.destroy(); wsRef.current = null; };
+  }, [channelId, effectiveStart, effectiveEnd]);
+
+  // Wire video events
+  useEffect(() => {
+    const v = videoRef.current; if (!v) return;
+    const onMeta = () => setDuration(v.duration || 0);
+    const onTime = () => setCurrent(v.currentTime);
+    const onPlay = () => setPlaying(true);
+    const onPause = () => setPlaying(false);
+    v.addEventListener('loadedmetadata', onMeta);
+    v.addEventListener('timeupdate', onTime);
+    v.addEventListener('play', onPlay);
+    v.addEventListener('pause', onPause);
+    return () => {
+      v.removeEventListener('loadedmetadata', onMeta);
+      v.removeEventListener('timeupdate', onTime);
+      v.removeEventListener('play', onPlay);
+      v.removeEventListener('pause', onPause);
+    };
+  }, []);
+
+  // Fallback total when the browser hasn't reported duration yet
+  const totalSeconds = duration
+    || (effectiveStart && effectiveEnd
+      ? (new Date(effectiveEnd).getTime() - new Date(effectiveStart).getTime()) / 1000
+      : 0);
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement).tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+      const v = videoRef.current; if (!v) return;
+      if (e.key === ' ') { e.preventDefault(); v.paused ? v.play() : v.pause(); }
+      if (e.key === 'i' || e.key === 'I') setMarkIn(v.currentTime);
+      if (e.key === 'o' || e.key === 'O') setMarkOut(v.currentTime);
+      if (e.key === 'k') v.pause();
+      if (e.key === 'ArrowLeft')  v.currentTime = Math.max(0, v.currentTime - (e.shiftKey ? 5 : 0.5));
+      if (e.key === 'ArrowRight') v.currentTime = Math.min(totalSeconds, v.currentTime + (e.shiftKey ? 5 : 0.5));
+      if (e.key === 'Home') v.currentTime = 0;
+      if (e.key === 'End')  v.currentTime = totalSeconds;
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [totalSeconds]);
+
+  const startAtISO = useMemo(() => {
+    if (!effectiveStart || markIn === null) return null;
+    return new Date(new Date(effectiveStart).getTime() + markIn * 1000).toISOString();
+  }, [effectiveStart, markIn]);
+
+  const endAtISO = useMemo(() => {
+    if (!effectiveStart || markOut === null) return null;
+    return new Date(new Date(effectiveStart).getTime() + markOut * 1000).toISOString();
+  }, [effectiveStart, markOut]);
+
+  const canExport = !!(title && channelId && startAtISO && endAtISO && markOut !== null && markIn !== null && markOut > markIn);
+
+  const exportMut = useMutation({
+    mutationFn: () => api('/api/clips', {
+      method: 'POST',
+      body: {
+        channelId, title, notes,
+        startAt: startAtISO, endAt: endAtISO,
+        format, resolution,
+        watermarkText: `${user?.email ?? 'unknown'} · ${new Date().toISOString()}`,
+      },
+    }),
+    onSuccess: () => { toast.success('Clip queued'); router.push('/clips'); },
+    onError: (e) => toast.error(e instanceof Error ? e.message : 'Export failed'),
+  });
+
+  const inPct  = markIn !== null && totalSeconds ? (markIn / totalSeconds) * 100 : null;
+  const outPct = markOut !== null && totalSeconds ? (markOut / totalSeconds) * 100 : null;
+  const curPct = totalSeconds ? (current / totalSeconds) * 100 : 0;
+
+  // Landing view when the URL has neither ?segmentId= nor ?sessionStart=
+  if (!segmentId && !(sessionStart && sessionEnd)) {
+    return <RecordingPicker />;
+  }
+
+  return (
+    <div className="max-w-[1400px] mx-auto space-y-4">
+      {/* top bar */}
+      <div className="flex items-center gap-3">
+        <Link href="/clips" className="text-muted hover:text-txt"><ArrowLeft className="h-4 w-4" /></Link>
+        <div className="flex-1">
+          <h1 className="font-display text-2xl font-bold tracking-tight">Clip Editor</h1>
+          <p className="text-xs text-muted mt-0.5">
+            {channel?.name ?? 'Loading channel…'} · {effectiveStart ? new Date(effectiveStart).toLocaleString() : ''}
+          </p>
+        </div>
+        <Button variant="secondary" onClick={() => toast.info('Drafts land in Phase 2.')}>
+          <Save className="h-4 w-4" /> Save draft
+        </Button>
+        <Button variant="gradient" onClick={() => exportMut.mutate()} disabled={!canExport || exportMut.isPending}>
+          {exportMut.isPending ? <Loader2 className="animate-spin h-4 w-4" /> : <Download className="h-4 w-4" />}
+          Export {format}
+        </Button>
+      </div>
+
+      {/* single video view + inspector */}
+      <div className="grid grid-cols-1 xl:grid-cols-[1fr_340px] gap-4">
+        <Card className="p-3">
+          <div className="relative aspect-video rounded-md overflow-hidden bg-ink border border-border">
+            <video
+              ref={videoRef}
+              className="absolute inset-0 h-full w-full"
+              playsInline
+              muted={muted}
+              onClick={() => { const v = videoRef.current; if (!v) return; v.paused ? v.play() : v.pause(); }}
+            />
+          </div>
+        </Card>
+
+        <Card className="p-4 space-y-4">
+          <div>
+            <Label>Title</Label>
+            <Input required value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Breaking · headline moment" />
+          </div>
+          <div>
+            <Label>Notes</Label>
+            <textarea
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+              rows={3}
+              className="mt-1.5 w-full rounded-md border border-border bg-panel2/50 p-2 text-sm resize-none"
+            />
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <Label>Format</Label>
+              <Select value={format} onValueChange={(v) => setFormat(v as typeof format)}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>{CLIP_FORMATS.map((f) => <SelectItem key={f} value={f}>{f}</SelectItem>)}</SelectContent>
+              </Select>
+            </div>
+            <div>
+              <Label>Resolution</Label>
+              <Select value={resolution} onValueChange={setResolution}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>{CLIP_RESOLUTIONS.map((r) => <SelectItem key={r} value={r}>{r}</SelectItem>)}</SelectContent>
+              </Select>
+            </div>
+          </div>
+          <div className="pt-2 border-t border-border">
+            <div className="text-[10px] uppercase tracking-widest text-muted-2 mb-2">Watermark</div>
+            <div className="font-mono text-[11px] text-muted break-all">{user?.email} · {new Date().toISOString().slice(0, 19)}Z</div>
+            <p className="text-[10px] text-muted-2 mt-1">Burned into the exported file. Cannot be disabled.</p>
+          </div>
+          <div className="pt-2 border-t border-border">
+            <div className="text-[10px] uppercase tracking-widest text-muted-2 mb-1">Clip window</div>
+            <div className="font-mono text-[11px]">
+              <div>in  <span className="text-accent-green">{markIn === null ? '—' : fmtTimeCode(markIn)}</span></div>
+              <div>out <span className="text-accent-red">{markOut === null ? '—' : fmtTimeCode(markOut)}</span></div>
+              <div className="text-muted-2 mt-0.5">
+                length {markIn !== null && markOut !== null && markOut > markIn ? fmtTimeCode(markOut - markIn) : '—'}
+              </div>
+            </div>
+          </div>
+        </Card>
+      </div>
+
+      {/* timeline + transport */}
+      <Card className="p-3 space-y-3">
+        <div className="flex items-center gap-1">
+          <Button variant="ghost" size="icon" onClick={() => { const v = videoRef.current!; v.currentTime = 0; }} title="Start (Home)"><ChevronsLeft /></Button>
+          <Button variant="ghost" size="icon" onClick={() => { const v = videoRef.current!; v.currentTime = Math.max(0, v.currentTime - 5); }} title="- 5s"><Rewind /></Button>
+          <Button variant="secondary" size="icon" onClick={() => { const v = videoRef.current!; v.paused ? v.play() : v.pause(); }} title="Play/Pause (Space)">
+            {playing ? <Pause /> : <Play />}
+          </Button>
+          <Button variant="ghost" size="icon" onClick={() => { const v = videoRef.current!; v.currentTime = Math.min(totalSeconds, v.currentTime + 5); }} title="+ 5s"><FastForward /></Button>
+          <Button variant="ghost" size="icon" onClick={() => { const v = videoRef.current!; v.currentTime = totalSeconds; }} title="End"><ChevronsRight /></Button>
+
+          <div className="mx-3 h-6 w-px bg-border" />
+
+          <Button variant="secondary" size="sm" onClick={() => { const v = videoRef.current!; setMarkIn(v.currentTime); }} title="Mark in (I)">
+            <ArrowLeftToLine className="h-4 w-4" /> Mark in
+          </Button>
+          <Button variant="secondary" size="sm" onClick={() => { const v = videoRef.current!; setMarkOut(v.currentTime); }} title="Mark out (O)">
+            Mark out <ArrowRightToLine className="h-4 w-4" />
+          </Button>
+          <Button variant="ghost" size="sm" onClick={() => { setMarkIn(null); setMarkOut(null); }}>
+            <Split className="h-4 w-4" /> Clear
+          </Button>
+
+          <div className="ml-auto flex items-center gap-3 pr-2 font-mono text-xs">
+            <Button variant="ghost" size="icon" onClick={() => setMuted((m) => { const v = videoRef.current; if (v) v.muted = !m; return !m; })}>
+              {muted ? <VolumeX /> : <Volume2 />}
+            </Button>
+            <div className="text-muted">
+              <span className="text-txt">{fmtTimeCode(current)}</span> / {fmtTimeCode(totalSeconds)}
+            </div>
+          </div>
+        </div>
+
+        {/* Waveform + in/out overlay. WaveSurfer handles the click-to-seek
+            interaction; we paint the in/out shading and marker triangles
+            on top with pointer-events-none so it stays clickable. */}
+        <div className="relative rounded-md border border-border bg-panel2/40 overflow-hidden">
+          <div ref={waveRef} className="h-16" />
+          {inPct !== null  && <div className="pointer-events-none absolute inset-y-0 left-0 bg-ink/60" style={{ width: `${inPct}%` }} />}
+          {outPct !== null && <div className="pointer-events-none absolute inset-y-0 right-0 bg-ink/60" style={{ width: `${100 - outPct}%` }} />}
+          <div className="pointer-events-none absolute inset-y-0 border-l-2 border-brand" style={{ left: `${curPct}%` }} />
+          {inPct !== null && (
+            <div className="pointer-events-none absolute inset-y-0 border-l-2 border-accent-green" style={{ left: `${inPct}%` }}>
+              <div className="absolute top-1 -left-2 h-2.5 w-2.5 rotate-45 bg-accent-green" />
+            </div>
+          )}
+          {outPct !== null && (
+            <div className="pointer-events-none absolute inset-y-0 border-l-2 border-accent-red" style={{ left: `${outPct}%` }}>
+              <div className="absolute top-1 -left-2 h-2.5 w-2.5 rotate-45 bg-accent-red" />
+            </div>
+          )}
+        </div>
+
+        <div className="flex items-center gap-3 text-[10px] text-muted-2 uppercase tracking-widest">
+          <span><span className="kbd">Space</span> play/pause</span>
+          <span><span className="kbd">I</span>/<span className="kbd">O</span> in/out</span>
+          <span><span className="kbd">Shift+←/→</span> ± 5s</span>
+          <span><span className="kbd">←/→</span> ± 0.5s</span>
+          <span><span className="kbd">Home</span>/<span className="kbd">End</span> jump</span>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+/**
+ * Landing view when /clips/new has no context — pick a channel + date
+ * + specific recording session before jumping into the editor.
+ */
+function RecordingPicker() {
+  const router = useRouter();
+  const today = new Date().toISOString().slice(0, 10);
+  const [channelId, setChannelId] = useState<string>('all');
+  const [from, setFrom] = useState<string>(() => {
+    const d = new Date(); d.setUTCDate(d.getUTCDate() - 6);
+    return d.toISOString().slice(0, 10);
+  });
+  const [to, setTo] = useState<string>(today);
+  const [q, setQ] = useState('');
+
+  interface PickChannel { id: string; name: string; slug: string }
+  interface Session {
+    id: string; channelId: string; startedAt: string; endedAt: string;
+    durationMs: number; sizeBytes: string; segmentCount: number;
+    firstSegmentId: string;
+    channel: { id: string; name: string; slug: string };
+  }
+
+  const { data: channels } = useQuery<PickChannel[]>({
+    queryKey: ['channels.picker'],
+    queryFn: () => api<PickChannel[]>('/api/channels'),
+    staleTime: 60_000,
+  });
+  const { data: sessions } = useQuery<Session[]>({
+    queryKey: ['picker.sessions', channelId, from, to],
+    queryFn: () => {
+      const p = new URLSearchParams();
+      p.set('from', new Date(from + 'T00:00:00Z').toISOString());
+      p.set('to',   new Date(to   + 'T23:59:59Z').toISOString());
+      if (channelId !== 'all') p.set('channelId', channelId);
+      p.set('limit', '500');
+      return api<Session[]>(`/api/recordings/sessions?${p}`);
+    },
+  });
+
+  const filtered = useMemo(() => {
+    if (!q.trim()) return sessions ?? [];
+    const needle = q.toLowerCase();
+    return (sessions ?? []).filter((s) =>
+      s.channel.name.toLowerCase().includes(needle) ||
+      s.channel.slug.toLowerCase().includes(needle));
+  }, [sessions, q]);
+
+  return (
+    <div className="max-w-[1300px] mx-auto space-y-4">
+      <div className="flex items-center gap-3">
+        <Link href="/clips" className="text-muted hover:text-txt"><ArrowLeft className="h-4 w-4" /></Link>
+        <div className="flex-1">
+          <h1 className="font-display text-2xl font-bold tracking-tight">New Clip</h1>
+          <p className="text-xs text-muted mt-0.5">Pick a recording, mark in/out, export with PAK NAVY watermark burned in.</p>
+        </div>
+      </div>
+
+      <Card className="p-3">
+        <div className="flex items-center gap-2 flex-wrap text-xs">
+          <div className="relative flex-1 min-w-[240px]">
+            <input value={q} onChange={(e) => setQ(e.target.value)}
+              placeholder="Search channel"
+              className="w-full h-9 pl-3 rounded-md border border-line bg-white text-sm" />
+          </div>
+          <Select value={channelId} onValueChange={setChannelId}>
+            <SelectTrigger className="w-52 h-9"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All channels</SelectItem>
+              {(channels ?? []).map((c) => <SelectItem key={c.id} value={c.id}>{c.name}</SelectItem>)}
+            </SelectContent>
+          </Select>
+          <label className="flex items-center gap-2">
+            <span className="text-muted-2 uppercase tracking-widest text-[10px]">From</span>
+            <input type="date" value={from} max={to} onChange={(e) => setFrom(e.target.value)}
+              className="h-9 px-2 rounded-md border border-line bg-white font-mono" />
+          </label>
+          <label className="flex items-center gap-2">
+            <span className="text-muted-2 uppercase tracking-widest text-[10px]">To</span>
+            <input type="date" value={to} min={from} max={today} onChange={(e) => setTo(e.target.value)}
+              className="h-9 px-2 rounded-md border border-line bg-white font-mono" />
+          </label>
+          <div className="text-muted-2 ml-auto whitespace-nowrap">{filtered.length} recordings</div>
+        </div>
+      </Card>
+
+      <Card className="overflow-hidden">
+        {filtered.length === 0 ? (
+          <div className="p-10 text-center text-sm text-muted">No recordings match. Widen the date range or clear filters.</div>
+        ) : (
+          <div className="overflow-x-auto scrollbar-thin">
+            <table className="w-full text-sm">
+              <thead className="bg-panel2/50 text-[10px] uppercase tracking-widest text-muted-2">
+                <tr>
+                  <th className="text-left px-4 py-2">Channel</th>
+                  <th className="text-left px-4 py-2">Started</th>
+                  <th className="text-left px-4 py-2">Duration</th>
+                  <th className="text-left px-4 py-2">Segments</th>
+                  <th className="px-4 py-2 w-32"></th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-line">
+                {filtered.map((s) => {
+                  const started = new Date(s.startedAt);
+                  return (
+                    <tr key={s.id} className="hover:bg-panel/40">
+                      <td className="px-4 py-2.5 font-medium">{s.channel.name}</td>
+                      <td className="px-4 py-2.5 font-mono text-xs">
+                        {started.toLocaleString(undefined, { hour12: false })}
+                      </td>
+                      <td className="px-4 py-2.5 font-mono text-xs">{fmtTimeCode(s.durationMs / 1000)}</td>
+                      <td className="px-4 py-2.5 font-mono text-xs text-muted-2">{s.segmentCount}</td>
+                      <td className="px-4 py-2.5">
+                        <Button size="sm" variant="gradient"
+                          onClick={() => router.push(
+                            `/clips/new?channelId=${s.channelId}` +
+                            `&sessionStart=${encodeURIComponent(s.startedAt)}` +
+                            `&sessionEnd=${encodeURIComponent(s.endedAt)}`,
+                          )}
+                        >
+                          Open editor →
+                        </Button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}

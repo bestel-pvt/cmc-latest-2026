@@ -1,0 +1,44 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "globalDependencies": [".env"],
+  "globalEnv": [
+    "DATABASE_URL",
+    "REDIS_URL",
+    "JWT_SECRET",
+    "JWT_REFRESH_SECRET",
+    "API_URL",
+    "API_PORT",
+    "WEB_PORT",
+    "NEXT_PUBLIC_API_URL",
+    "NEXT_PUBLIC_WS_URL",
+    "MEDIAMTX_API_URL",
+    "MEDIAMTX_HLS_URL",
+    "MEDIAMTX_METRICS_URL",
+    "MEDIAMTX_CONFIG_PATH",
+    "RECORDINGS_DIR",
+    "CLIPS_DIR",
+    "MANIFEST_SIGNING_KEY",
+    "RETENTION_DAYS",
+    "AIR_GAP_MODE",
+    "WHISPER_MODEL",
+    "WHISPER_DEVICE",
+    "WHISPER_MODELS_DIR"
+  ],
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**", ".next/**", "!.next/cache/**"]
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "lint": {},
+    "typecheck": {
+      "dependsOn": ["^build"]
+    },
+    "clean": {
+      "cache": false
+    }
+  }
+}

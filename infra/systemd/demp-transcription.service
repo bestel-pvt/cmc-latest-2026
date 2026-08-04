@@ -1,0 +1,20 @@
+[Unit]
+Description=DEMP Transcription Worker (faster-whisper, queue-driven)
+After=network-online.target
+PartOf=demp.target
+
+[Service]
+Type=simple
+User=demp
+Group=demp
+WorkingDirectory=/opt/demp
+Environment=NODE_ENV=production
+EnvironmentFile=/opt/demp/.env
+ExecStart=/opt/demp/services/transcription/.venv/bin/python /opt/demp/services/transcription/worker.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=demp.target

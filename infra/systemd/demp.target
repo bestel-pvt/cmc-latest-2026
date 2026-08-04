@@ -1,0 +1,7 @@
+[Unit]
+Description=DEMP Broadcast Monitoring Platform (all services)
+Wants=demp-api.service demp-web.service demp-recording.service demp-janitor.service demp-failover-controller.service demp-ai-scheduler.service demp-ticker-detect.service demp-ticker-grouper.service demp-transcription.service
+After=docker.service
+
+[Install]
+WantedBy=multi-user.target

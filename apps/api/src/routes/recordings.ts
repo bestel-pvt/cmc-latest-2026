@@ -1,0 +1,608 @@
+import type { FastifyPluginAsync } from 'fastify';
+import { createReadStream, statSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+const routes: FastifyPluginAsync = async (app) => {
+  app.addHook('preHandler', app.authenticate);
+
+  app.get('/', async (req) => {
+    const q = (req.query as { channelId?: string; from?: string; to?: string; limit?: string }) ?? {};
+    const from = q.from ? new Date(q.from) : new Date(Date.now() - 30 * 24 * 3600 * 1000);
+    const to   = q.to   ? new Date(q.to)   : new Date();
+
+    return app.prisma.recordingSegment.findMany({
+      where: {
+        ...(q.channelId ? { channelId: q.channelId } : {}),
+        startedAt: { gte: from, lte: to },
+      },
+      include: { channel: { select: { id: true, name: true, slug: true } } },
+      orderBy: { startedAt: 'desc' },
+      take: q.limit ? Math.min(Number(q.limit), 5000) : 500,
+    });
+  });
+
+  /**
+   * Group contiguous 60 s segments into logical "sessions" (one row per
+   * recording that the operator started/stopped, not one per segment).
+   * A gap ≥ 3 minutes ends a session. Response shape suits the
+   * Recordings page's default all-channels list.
+   */
+  app.get('/sessions', async (req) => {
+    const q = (req.query as { channelId?: string; from?: string; to?: string; limit?: string }) ?? {};
+    const from = q.from ? new Date(q.from) : new Date(Date.now() - 30 * 24 * 3600 * 1000);
+    const to   = q.to   ? new Date(q.to)   : new Date();
+    const segments = await app.prisma.recordingSegment.findMany({
+      where: {
+        ...(q.channelId ? { channelId: q.channelId } : {}),
+        startedAt: { gte: from, lte: to },
+      },
+      include: { channel: { select: { id: true, name: true, slug: true } } },
+      orderBy: [{ channelId: 'asc' }, { startedAt: 'asc' }],
+    });
+    // Bucket into sessions by (channelId, gap ≥ 3 min)
+    const GAP_MS = 3 * 60 * 1000;
+    interface Session {
+      id: string;
+      channelId: string; channel: { id: string; name: string; slug: string };
+      startedAt: Date; endedAt: Date;
+      durationMs: number; sizeBytes: bigint;
+      segmentCount: number;
+      firstSegmentId: string; lastSegmentId: string;
+    }
+    const sessions: Session[] = [];
+    let cur: Session | null = null;
+    for (const s of segments) {
+      const end = new Date(s.startedAt.getTime() + s.durationMs);
+      if (!cur || cur.channelId !== s.channelId ||
+          (s.startedAt.getTime() - cur.endedAt.getTime()) > GAP_MS) {
+        cur = {
+          id: `sess-${s.id}`,
+          channelId: s.channelId, channel: s.channel,
+          startedAt: s.startedAt, endedAt: end,
+          durationMs: s.durationMs, sizeBytes: BigInt(s.sizeBytes ?? 0n),
+          segmentCount: 1,
+          firstSegmentId: s.id, lastSegmentId: s.id,
+        };
+        sessions.push(cur);
+      } else {
+        cur.endedAt = end;
+        cur.durationMs = cur.endedAt.getTime() - cur.startedAt.getTime();
+        cur.sizeBytes = cur.sizeBytes + BigInt(s.sizeBytes ?? 0n);
+        cur.segmentCount += 1;
+        cur.lastSegmentId = s.id;
+      }
+    }
+    sessions.sort((a, b) => b.startedAt.getTime() - a.startedAt.getTime());
+    const limit = q.limit ? Math.min(Number(q.limit), 2000) : 500;
+    return sessions.slice(0, limit);
+  });
+
+  // Days with recordings (calendar heatmap)
+  app.get('/days', async (req, reply) => {
+    const { channelId, year, month } = (req.query as { channelId?: string; year?: string; month?: string }) ?? {};
+    if (!channelId || !year || !month) return reply.badRequest();
+    const start = new Date(Date.UTC(Number(year), Number(month) - 1, 1));
+    const end   = new Date(Date.UTC(Number(year), Number(month),     1));
+    const rows = await app.prisma.$queryRaw<Array<{ day: Date; count: bigint }>>`
+      SELECT date_trunc('day', "startedAt") AS day, COUNT(*)::bigint AS count
+      FROM "RecordingSegment"
+      WHERE "channelId" = ${channelId} AND "startedAt" >= ${start} AND "startedAt" < ${end}
+      GROUP BY 1 ORDER BY 1`;
+    return rows.map((r) => ({ day: r.day, count: Number(r.count) }));
+  });
+
+  app.get('/:id', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const seg = await app.prisma.recordingSegment.findUnique({ where: { id } });
+    if (!seg) return reply.notFound();
+    return seg;
+  });
+
+  /**
+   * Concatenate every segment overlapping [from, to] for a channel into
+   * ONE playable MP4 and stream it back. The whole session shows as a
+   * single video with a proper scrubber — no visible "segments" in the UI.
+   *
+   * Caching: the concatenated file is written to /tmp/demp-sessions and
+   * keyed by (channelId, from, to). First request builds it with
+   * `ffmpeg -f concat -c copy` (fast — stream copy, ~1 s per hour of
+   * content); subsequent requests stream from the cache.
+   */
+  const SESSION_CACHE = join(tmpdir(), 'demp-sessions');
+  mkdirSync(SESSION_CACHE, { recursive: true });
+
+  const buildLocks = new Map<string, Promise<string | null>>();
+
+  /** Quick "does this MP4 have a readable moov atom" probe. Recorder
+   * kills / crashes leave zero-length or moov-less files; the concat
+   * demuxer stops dead on those, so we skip them. */
+  async function isPlayable(path: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      const ff = spawn('ffprobe', [
+        '-v', 'error', '-select_streams', 'v:0',
+        '-show_entries', 'stream=codec_name,duration', '-of', 'csv', path,
+      ], { stdio: ['ignore', 'pipe', 'ignore'] });
+      let out = '';
+      ff.stdout.on('data', (b) => { out += b.toString(); });
+      ff.on('exit', (code) => resolve(code === 0 && out.trim().length > 0));
+      ff.on('error', () => resolve(false));
+    });
+  }
+
+  async function buildSessionMp4(channelId: string, from: Date, to: Date): Promise<string | null> {
+    // Ensure cache dir exists on every call — a manual /tmp cleanup
+    // (or a systemd tmpfiles reboot) can wipe it out from under us.
+    mkdirSync(SESSION_CACHE, { recursive: true });
+
+    const key = createHash('sha1').update(`${channelId}:${from.getTime()}:${to.getTime()}`).digest('hex').slice(0, 20);
+    const outPath = join(SESSION_CACHE, `${key}.mp4`);
+    if (existsSync(outPath) && statSync(outPath).size > 1024) return outPath;
+    if (buildLocks.has(key)) return buildLocks.get(key)!;
+
+    const p = (async (): Promise<string | null> => {
+      const segments = await app.prisma.recordingSegment.findMany({
+        where: {
+          channelId,
+          startedAt: { gte: new Date(from.getTime() - 5 * 60 * 1000), lte: to },
+        },
+        orderBy: { startedAt: 'asc' },
+      });
+      const covering = segments.filter((s) => {
+        const end = new Date(s.startedAt.getTime() + s.durationMs);
+        return end > from && s.startedAt < to;
+      });
+      if (covering.length === 0) return null;
+
+      // Filter out corrupt / half-written segments — concat demuxer
+      // bails on the first bad file and stops before the rest.
+      const playable: string[] = [];
+      for (const s of covering) {
+        if (!existsSync(s.path)) continue;
+        if (statSync(s.path).size < 4096) continue;
+        if (await isPlayable(s.path)) playable.push(s.path);
+      }
+      if (playable.length === 0) return null;
+
+      const listPath = join(SESSION_CACHE, `${key}.txt`);
+      const lines = playable.map((path) => `file '${path.replace(/'/g, "'\\''")}'`).join('\n');
+      writeFileSync(listPath, lines);
+
+      await new Promise<void>((resolve, reject) => {
+        const ff = spawn('ffmpeg', [
+          '-hide_banner', '-loglevel', 'error', '-y',
+          '-err_detect', 'ignore_err',
+          '-f', 'concat', '-safe', '0', '-i', listPath,
+          '-c', 'copy',
+          '-movflags', '+faststart',
+          outPath,
+        ], { stdio: ['ignore', 'pipe', 'pipe'] });
+        let tail = '';
+        ff.stderr.on('data', (b) => { tail += b.toString(); });
+        ff.on('exit', (code) => code === 0 ? resolve() : reject(new Error(`ffmpeg exit ${code}: ${tail.slice(-300)}`)));
+        ff.on('error', reject);
+      });
+      return outPath;
+    })().finally(() => setTimeout(() => buildLocks.delete(key), 1000));
+
+    buildLocks.set(key, p);
+    return p;
+  }
+
+  /**
+   * HLS playlist for a recording session. Each 60-s MP4 segment shows
+   * up as one HLS entry pointing at /segment-ts/:id which remuxes it
+   * to MPEG-TS on demand (and caches). hls.js sees a normal VOD
+   * playlist — first byte arrives in ~200 ms, seek jumps directly to
+   * the target segment, no whole-file wait ever again.
+   */
+  app.get('/session.m3u8', async (req, reply) => {
+    const q = (req.query as { channelId?: string; from?: string; to?: string }) ?? {};
+    if (!q.channelId || !q.from || !q.to) return reply.badRequest('channelId, from, to required');
+    const from = new Date(q.from);
+    const to   = new Date(q.to);
+
+    const segments = await app.prisma.recordingSegment.findMany({
+      where: {
+        channelId: q.channelId,
+        startedAt: { gte: new Date(from.getTime() - 5 * 60 * 1000), lte: to },
+      },
+      orderBy: { startedAt: 'asc' },
+    });
+    const covering = segments.filter((s) => {
+      const end = new Date(s.startedAt.getTime() + s.durationMs);
+      return end > from && s.startedAt < to;
+    });
+    if (covering.length === 0) return reply.notFound('no segments cover this range');
+
+    // Filter out zero-length / stub files up front — the remux step
+    // would fail and hls.js has no clean way to skip a segment.
+    const playable = covering.filter((s) => {
+      try { return statSync(s.path).size >= 4096; } catch { return false; }
+    });
+    if (playable.length === 0) return reply.notFound('no playable segments in range');
+
+    // Each 60-s recorded MP4 is exposed as ~10 sub-segments of ~6 s
+    // (SUB_DURATION). Playlist lists every sub-segment across the
+    // session, so hls.js loads ONLY the sub-segment(s) around the
+    // current playhead — jumping to minute 47 of a 5-hour session
+    // downloads ~6 s / ~1.5 MB of TS, not the full 60 s / 15 MB
+    // containing segment. Combined with hls.js maxBufferLength=12 s
+    // on the client, we hold two chunks ahead + one back, no more,
+    // regardless of session length.
+    const SUB_DURATION = 6;
+    const lines: string[] = [
+      '#EXTM3U',
+      '#EXT-X-VERSION:6',
+      `#EXT-X-TARGETDURATION:${SUB_DURATION + 1}`,
+      '#EXT-X-PLAYLIST-TYPE:VOD',
+      '#EXT-X-INDEPENDENT-SEGMENTS',
+    ];
+    // For each segment we need the ACTUAL slice count that ffmpeg's
+    // segment muxer produced (or will produce). Estimating with
+    // ceil(dur/6) is wrong when the tail is short — ffmpeg emits N
+    // slices where N = number of keyframes at 6 s boundaries, which
+    // for a 60 s file with 1 s GOP can be 9, 10, or 11 depending on
+    // alignment. Using an inflated estimate causes 404s at playback
+    // (which stalls hls.js).
+    //
+    // Strategy: (a) if we already split this segment, read the actual
+    // count from disk; (b) otherwise use a SAFE UNDERSTATE
+    // (floor(dur/6) - 1, clamped to ≥1). We'd rather cut ~6 s off the
+    // trailing edge of a segment than have hls.js hit a 404. The next
+    // segment starts right after via #EXT-X-DISCONTINUITY anyway.
+    for (let i = 0; i < playable.length; i++) {
+      const s = playable[i];
+      if (i > 0) lines.push('#EXT-X-DISCONTINUITY');
+      const durS = s.durationMs / 1000;
+      const dir = join(HLS_CACHE, s.id);
+      let nSub: number;
+      if (existsSync(join(dir, '.ready'))) {
+        // Count actual .ts files produced by ffmpeg.
+        try {
+          const { readdirSync } = require('fs');
+          nSub = readdirSync(dir).filter((f: string) => f.endsWith('.ts')).length;
+        } catch {
+          nSub = Math.max(1, Math.floor(durS / SUB_DURATION));
+        }
+      } else {
+        nSub = Math.max(1, Math.floor(durS / SUB_DURATION));
+      }
+      for (let k = 0; k < nSub; k++) {
+        const remaining = durS - k * SUB_DURATION;
+        const thisDur = Math.min(SUB_DURATION, Math.max(1, remaining));
+        lines.push(`#EXTINF:${thisDur.toFixed(3)},`);
+        lines.push(`/api/recordings/segment-hls/${s.id}/${k}.ts`);
+      }
+    }
+    lines.push('#EXT-X-ENDLIST');
+
+    // Pre-warm sub-segment #0 of the first playable segment. First
+    // slice extraction shells out to ffmpeg segment-muxer which also
+    // writes ALL the other slices of that 60-s file at once — so a
+    // single pre-warm covers the whole first minute of playback with
+    // ~200 ms of server work. Fire-and-forget.
+    if (playable.length > 0) {
+      segmentToHlsSlices(playable[0]).catch(() => {});
+    }
+
+    reply
+      .header('Content-Type', 'application/vnd.apple.mpegurl')
+      .header('Cache-Control', 'no-cache');
+    return lines.join('\n');
+  });
+
+  /**
+   * MP4 → 6-second MPEG-TS slices via ffmpeg's segment muxer. Splits
+   * ALL slices of the 60-s file in a single ffmpeg invocation
+   * (~200 ms on the R740xd) — cheaper than firing ffmpeg 10 times.
+   * Result cached in /tmp/demp-hls/<segId>/{0,1,2,...}.ts.
+   */
+  const HLS_CACHE = join(tmpdir(), 'demp-hls');
+  mkdirSync(HLS_CACHE, { recursive: true });
+  const hlsLocks = new Map<string, Promise<void>>();
+
+  async function segmentToHlsSlices(seg: { id: string; path: string }): Promise<void> {
+    mkdirSync(HLS_CACHE, { recursive: true });
+    const outDir = join(HLS_CACHE, seg.id);
+    const readyMarker = join(outDir, '.ready');
+    if (existsSync(readyMarker)) return;
+    if (hlsLocks.has(seg.id)) return hlsLocks.get(seg.id)!;
+
+    const p = (async () => {
+      mkdirSync(outDir, { recursive: true });
+      await new Promise<void>((resolve, reject) => {
+        const ff = spawn('ffmpeg', [
+          '-hide_banner', '-loglevel', 'error', '-y',
+          '-i', seg.path,
+          '-c', 'copy',
+          '-bsf:v', 'h264_mp4toannexb',
+          '-f', 'segment',
+          '-segment_time', '6',
+          '-segment_format', 'mpegts',
+          '-reset_timestamps', '1',
+          join(outDir, '%d.ts'),
+        ], { stdio: ['ignore', 'pipe', 'pipe'] });
+        let tail = '';
+        ff.stderr.on('data', (b) => { tail += b.toString(); });
+        ff.on('exit', (code) => code === 0 ? resolve() : reject(new Error(`ffmpeg exit ${code}: ${tail.slice(-200)}`)));
+        ff.on('error', reject);
+      });
+      // Sentinel file signals "all slices done writing".
+      writeFileSync(readyMarker, '');
+    })().finally(() => setTimeout(() => hlsLocks.delete(seg.id), 500));
+
+    hlsLocks.set(seg.id, p);
+    return p;
+  }
+
+  app.get('/segment-hls/:id/:slice.ts', async (req, reply) => {
+    const { id, slice } = req.params as { id: string; slice: string };
+    const sliceIdx = Number.parseInt(slice, 10);
+    if (!Number.isFinite(sliceIdx) || sliceIdx < 0) return reply.badRequest('bad slice index');
+
+    const seg = await app.prisma.recordingSegment.findUnique({ where: { id } });
+    if (!seg) return reply.notFound();
+    if (!existsSync(seg.path)) return reply.notFound('source missing');
+
+    try {
+      await segmentToHlsSlices({ id: seg.id, path: seg.path });
+    } catch (e) {
+      return reply.code(500).send({ error: 'slice failed', detail: e instanceof Error ? e.message : String(e) });
+    }
+    let filePath = join(HLS_CACHE, seg.id, `${sliceIdx}.ts`);
+    if (!existsSync(filePath)) {
+      // Off-by-one at the tail of a segment — ffmpeg produced fewer
+      // slices than the playlist advertised. Serve the last existing
+      // slice so hls.js doesn't stall. (Playlist generator now
+      // understates rather than overstates, so this path should be
+      // rare, but keep the safety net.)
+      try {
+        const { readdirSync } = require('fs');
+        const slices = readdirSync(join(HLS_CACHE, seg.id))
+          .filter((f: string) => f.endsWith('.ts'))
+          .map((f: string) => Number.parseInt(f, 10))
+          .filter((n: number) => Number.isFinite(n))
+          .sort((a: number, b: number) => a - b);
+        if (slices.length === 0) return reply.notFound('slice out of range');
+        const last = slices[slices.length - 1];
+        filePath = join(HLS_CACHE, seg.id, `${last}.ts`);
+      } catch {
+        return reply.notFound('slice out of range');
+      }
+    }
+
+    // Pre-warm the NEXT segment's slices while the client is still
+    // decoding this one — keeps the pipeline hot across the boundary.
+    if (sliceIdx === 0) {
+      const nextSeg = await app.prisma.recordingSegment.findFirst({
+        where: { channelId: seg.channelId, startedAt: { gt: seg.startedAt } },
+        orderBy: { startedAt: 'asc' },
+      });
+      if (nextSeg && existsSync(nextSeg.path)) {
+        segmentToHlsSlices({ id: nextSeg.id, path: nextSeg.path }).catch(() => {});
+      }
+    }
+
+    const st = statSync(filePath);
+    reply
+      .header('Content-Type', 'video/mp2t')
+      .header('Content-Length', st.size)
+      .header('Cache-Control', 'public, max-age=3600');
+    return reply.send(createReadStream(filePath));
+  });
+
+  /**
+   * MP4 → MPEG-TS remux for a single segment. Stream-copy + Annex-B
+   * bitstream filter (~100 ms per 60 s segment on the R740xd). Result
+   * is cached on disk keyed by segment id.
+   */
+  const TS_CACHE = join(tmpdir(), 'demp-ts');
+  mkdirSync(TS_CACHE, { recursive: true });
+  const tsLocks = new Map<string, Promise<string | null>>();
+
+  async function segmentToTs(seg: { id: string; path: string }): Promise<string | null> {
+    mkdirSync(TS_CACHE, { recursive: true });
+    const outPath = join(TS_CACHE, `${seg.id}.ts`);
+    if (existsSync(outPath) && statSync(outPath).size > 0) return outPath;
+    if (tsLocks.has(seg.id)) return tsLocks.get(seg.id)!;
+
+    const p = (async () => {
+      await new Promise<void>((resolve, reject) => {
+        const ff = spawn('ffmpeg', [
+          '-hide_banner', '-loglevel', 'error', '-y',
+          '-i', seg.path,
+          '-c', 'copy',
+          '-bsf:v', 'h264_mp4toannexb',
+          '-f', 'mpegts',
+          outPath,
+        ], { stdio: ['ignore', 'pipe', 'pipe'] });
+        let tail = '';
+        ff.stderr.on('data', (b) => { tail += b.toString(); });
+        ff.on('exit', (code) => code === 0 ? resolve() : reject(new Error(`ffmpeg exit ${code}: ${tail.slice(-200)}`)));
+        ff.on('error', reject);
+      });
+      return outPath;
+    })().finally(() => setTimeout(() => tsLocks.delete(seg.id), 500));
+
+    tsLocks.set(seg.id, p);
+    return p;
+  }
+
+  app.get('/segment-ts/:id', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const seg = await app.prisma.recordingSegment.findUnique({ where: { id } });
+    if (!seg) return reply.notFound();
+    if (!existsSync(seg.path)) return reply.notFound('source missing');
+
+    let tsPath: string | null;
+    try {
+      tsPath = await segmentToTs({ id: seg.id, path: seg.path });
+    } catch (e) {
+      return reply.code(500).send({ error: 'remux failed', detail: e instanceof Error ? e.message : String(e) });
+    }
+    if (!tsPath) return reply.notFound('remux produced nothing');
+
+    const st = statSync(tsPath);
+    reply
+      .header('Content-Type', 'video/mp2t')
+      .header('Content-Length', st.size)
+      .header('Cache-Control', 'public, max-age=3600');
+    return reply.send(createReadStream(tsPath));
+  });
+
+  /**
+   * Audio-waveform peaks for a session — WaveSurfer.js consumes the
+   * `peaks` array directly. We ffprobe each segment to raw s16le mono
+   * at 4 kHz (~8 KB per 60-s segment), stitch, then bucket into N
+   * max-absolute peaks. The whole result is small enough (~40 KB for
+   * a 1-hour session at buckets=2000) to send inline and cache.
+   */
+  const PEAKS_CACHE = join(tmpdir(), 'demp-peaks');
+  mkdirSync(PEAKS_CACHE, { recursive: true });
+
+  app.get('/session-peaks.json', async (req, reply) => {
+    const q = (req.query as { channelId?: string; from?: string; to?: string; buckets?: string }) ?? {};
+    if (!q.channelId || !q.from || !q.to) return reply.badRequest('channelId, from, to required');
+    const from = new Date(q.from);
+    const to   = new Date(q.to);
+    const buckets = Math.min(4000, Math.max(200, Number(q.buckets) || 1500));
+
+    const key = createHash('sha1').update(`${q.channelId}:${from.getTime()}:${to.getTime()}:${buckets}`).digest('hex').slice(0, 20);
+    const cachePath = join(PEAKS_CACHE, `${key}.json`);
+    if (existsSync(cachePath) && statSync(cachePath).size > 0) {
+      reply.header('Content-Type', 'application/json').header('Cache-Control', 'public, max-age=3600');
+      return reply.send(createReadStream(cachePath));
+    }
+
+    const segments = await app.prisma.recordingSegment.findMany({
+      where: {
+        channelId: q.channelId,
+        startedAt: { gte: new Date(from.getTime() - 5 * 60 * 1000), lte: to },
+      },
+      orderBy: { startedAt: 'asc' },
+    });
+    const covering = segments.filter((s) => {
+      const end = new Date(s.startedAt.getTime() + s.durationMs);
+      return end > from && s.startedAt < to;
+    });
+    if (covering.length === 0) return reply.notFound();
+
+    const playable = covering.filter((s) => {
+      try { return statSync(s.path).size >= 4096; } catch { return false; }
+    });
+    if (playable.length === 0) return reply.notFound();
+
+    // Decode each segment's audio → raw s16le mono at 4 kHz, collect
+    // into one big Int16Array.
+    const totalDurMs = playable.reduce((n, s) => n + s.durationMs, 0);
+    const sr = 4000;
+    const expectedSamples = Math.floor((totalDurMs / 1000) * sr);
+    const buf = new Int16Array(expectedSamples);
+    let offset = 0;
+
+    for (const s of playable) {
+      const wav = await new Promise<Buffer>((resolve, reject) => {
+        const chunks: Buffer[] = [];
+        const ff = spawn('ffmpeg', [
+          '-hide_banner', '-loglevel', 'error', '-nostdin',
+          '-i', s.path,
+          '-vn', '-ac', '1', '-ar', String(sr),
+          '-f', 's16le', '-',
+        ], { stdio: ['ignore', 'pipe', 'pipe'] });
+        ff.stdout.on('data', (b) => chunks.push(b));
+        ff.on('exit', (code) => code === 0
+          ? resolve(Buffer.concat(chunks))
+          : reject(new Error(`ffmpeg exit ${code}`)));
+        ff.on('error', reject);
+      }).catch(() => Buffer.alloc(0));
+      const samples = new Int16Array(wav.buffer, wav.byteOffset, wav.byteLength / 2);
+      const room = Math.min(samples.length, buf.length - offset);
+      buf.set(samples.subarray(0, room), offset);
+      offset += room;
+    }
+
+    // Downsample to `buckets` peaks (max abs value per bucket → normalised 0-1).
+    const bucketSize = Math.max(1, Math.floor(offset / buckets));
+    const peaks: number[] = new Array(buckets);
+    for (let b = 0; b < buckets; b++) {
+      let peak = 0;
+      const start = b * bucketSize;
+      const end = Math.min(offset, start + bucketSize);
+      for (let i = start; i < end; i++) {
+        const v = Math.abs(buf[i]);
+        if (v > peak) peak = v;
+      }
+      peaks[b] = Number((peak / 32768).toFixed(3));
+    }
+
+    const body = JSON.stringify({ sampleRate: sr, buckets, duration: totalDurMs / 1000, peaks });
+    // Best-effort write, ignore ENOENT if tmp was cleaned mid-request.
+    try { require('fs').writeFileSync(cachePath, body); } catch {}
+    reply.header('Content-Type', 'application/json').header('Cache-Control', 'public, max-age=3600');
+    return reply.send(body);
+  });
+
+  app.get('/session-media', async (req, reply) => {
+    const q = (req.query as { channelId?: string; from?: string; to?: string }) ?? {};
+    if (!q.channelId || !q.from || !q.to) return reply.badRequest('channelId, from, to required');
+    const from = new Date(q.from);
+    const to   = new Date(q.to);
+    let outPath: string | null;
+    try {
+      outPath = await buildSessionMp4(q.channelId, from, to);
+    } catch (e) {
+      return reply.code(500).send({ error: 'render failed', detail: e instanceof Error ? e.message : String(e) });
+    }
+    if (!outPath) return reply.notFound('no segments cover this range');
+
+    const stat = statSync(outPath);
+    const range = (req.headers.range as string | undefined) ?? '';
+    if (range) {
+      const [startStr, endStr] = range.replace(/bytes=/, '').split('-');
+      const start = Number(startStr);
+      const end = endStr ? Number(endStr) : stat.size - 1;
+      reply
+        .code(206)
+        .header('Content-Range', `bytes ${start}-${end}/${stat.size}`)
+        .header('Accept-Ranges', 'bytes')
+        .header('Content-Length', end - start + 1)
+        .header('Content-Type', 'video/mp4');
+      return reply.send(createReadStream(outPath, { start, end }));
+    }
+    reply
+      .header('Content-Length', stat.size)
+      .header('Content-Type', 'video/mp4')
+      .header('Accept-Ranges', 'bytes');
+    return reply.send(createReadStream(outPath));
+  });
+
+  // Stream the media file itself. Range-request friendly.
+  app.get('/:id/stream', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const seg = await app.prisma.recordingSegment.findUnique({ where: { id } });
+    if (!seg) return reply.notFound();
+    if (!existsSync(seg.path)) return reply.notFound('file missing');
+
+    const stat = statSync(seg.path);
+    const range = (req.headers.range as string | undefined) ?? '';
+    if (range) {
+      const [startStr, endStr] = range.replace(/bytes=/, '').split('-');
+      const start = Number(startStr);
+      const end = endStr ? Number(endStr) : stat.size - 1;
+      reply
+        .code(206)
+        .header('Content-Range', `bytes ${start}-${end}/${stat.size}`)
+        .header('Accept-Ranges', 'bytes')
+        .header('Content-Length', end - start + 1)
+        .header('Content-Type', 'video/mp4');
+      return reply.send(createReadStream(seg.path, { start, end }));
+    }
+    reply.header('Content-Length', stat.size).header('Content-Type', 'video/mp4');
+    return reply.send(createReadStream(seg.path));
+  });
+};
+
+export default routes;

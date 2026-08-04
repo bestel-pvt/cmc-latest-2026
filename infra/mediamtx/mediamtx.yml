@@ -1,0 +1,57 @@
+# =====================================================================
+# MediaMTX config for DEMP (single shard, dev)
+# This file is a template — the API service will regenerate it whenever
+# channels/sources change, then trigger a hot reload via the API.
+# =====================================================================
+
+logLevel: info
+logDestinations: [stdout]
+
+# HTTP API for path management + hot-reload
+api: yes
+apiAddress: :9997
+
+# Prometheus metrics — the failover controller scrapes this
+metrics: yes
+metricsAddress: :9998
+
+# HLS (Low-Latency HLS for browser playback)
+hls: yes
+hlsAddress: :8888
+hlsAlwaysRemux: yes
+hlsVariant: lowLatency
+hlsSegmentCount: 7
+hlsSegmentDuration: 1s
+hlsPartDuration: 200ms
+hlsSegmentMaxSize: 50M
+hlsAllowOrigin: '*'
+
+# WebRTC
+webrtc: yes
+webrtcAddress: :8889
+webrtcAllowOrigin: '*'
+webrtcICEServers2: []
+
+# RTSP (for downstream tools)
+rtsp: yes
+rtspAddress: :8554
+protocols: [tcp, udp]
+
+# RTMP (republish support)
+rtmp: yes
+rtmpAddress: :1935
+
+# SRT
+srt: yes
+srtAddress: :8890
+
+# ---------- Paths ----------
+# The paths block below is a placeholder. In production the DEMP API rewrites
+# this file per channel from the DB and sends a POST to /v3/config/reload.
+# During local dev before any channel is added, an "all" fallback keeps
+# MediaMTX quiet without exposing the OPTIONS/POST publish endpoint.
+paths:
+  all_others:
+    source: publisher
+    publishUser: demp
+    publishPass: demp

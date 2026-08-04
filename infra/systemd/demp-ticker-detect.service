@@ -1,0 +1,21 @@
+[Unit]
+Description=DEMP Ticker + Flasher OCR Monitor
+After=network-online.target
+PartOf=demp.target
+
+[Service]
+Type=simple
+User=demp
+Group=demp
+WorkingDirectory=/opt/demp
+Environment=NODE_ENV=production
+EnvironmentFile=/opt/demp/.env
+ExecStart=/opt/demp/services/ticker-detect/.venv/bin/python /opt/demp/services/ticker-detect/worker.py
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=demp.target

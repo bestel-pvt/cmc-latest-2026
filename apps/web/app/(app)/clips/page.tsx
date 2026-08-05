@@ -3,12 +3,15 @@
 import Link from 'next/link';
 import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
+import { toast } from 'sonner';
 import { Plus, Download, Loader2, Film } from 'lucide-react';
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { api } from '@/lib/api';
 import { fmtBytes } from '@/lib/utils';
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? '';
 
 interface Clip {
   id: string; title: string; status: 'QUEUED' | 'RENDERING' | 'READY' | 'FAILED';
@@ -25,6 +28,33 @@ export default function ClipsPage() {
     return d.toISOString().slice(0, 10);
   });
   const [to, setTo] = useState<string>(today);
+  const [downloadingId, setDownloadingId] = useState<string | null>(null);
+
+  async function downloadClip(c: Clip) {
+    if (downloadingId) return;
+    setDownloadingId(c.id);
+    try {
+      const token = typeof window !== 'undefined' ? localStorage.getItem('demp.accessToken') : null;
+      const r = await fetch(`${API_BASE}/api/clips/${c.id}/download`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!r.ok) {
+        const body = await r.text().catch(() => '');
+        throw new Error(r.status === 401 ? 'Session expired — please sign in again.' : `HTTP ${r.status}${body ? ` — ${body.slice(0, 100)}` : ''}`);
+      }
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${c.title.replace(/[^a-z0-9-_]+/gi, '_')}.${c.format.toLowerCase()}`;
+      document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+      toast.success('Clip downloaded');
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Download failed');
+    } finally {
+      setDownloadingId(null);
+    }
+  }
 
   const { data: clips } = useQuery<Clip[]>({
     queryKey: ['clips', from, to],
@@ -118,9 +148,17 @@ export default function ClipsPage() {
                       <td className="px-4 py-3 text-xs text-muted">{c.createdBy.name}</td>
                       <td className="px-4 py-3">
                         {c.status === 'READY' ? (
-                          <a href={`/api/clips/${c.id}/download`}>
-                            <Button variant="secondary" size="sm"><Download className="h-3.5 w-3.5" /></Button>
-                          </a>
+                          <Button
+                            variant="secondary"
+                            size="sm"
+                            onClick={() => downloadClip(c)}
+                            disabled={downloadingId === c.id}
+                            title="Download clip"
+                          >
+                            {downloadingId === c.id
+                              ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                              : <Download className="h-3.5 w-3.5" />}
+                          </Button>
                         ) : null}
                       </td>
                     </tr>

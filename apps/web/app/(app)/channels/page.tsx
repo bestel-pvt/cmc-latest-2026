@@ -14,6 +14,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog';
 import { Label } from '@/components/ui/label';
 import { HealthMeter } from '@/components/health-meter';
+import { AuthImg } from '@/components/auth-img';
 import { api } from '@/lib/api';
 import { CHANNEL_CATEGORIES, CHANNEL_LANGUAGES } from '@cmc/shared';
 import { toast } from 'sonner';
@@ -21,6 +22,7 @@ import { toast } from 'sonner';
 interface Channel {
   id: string; slug: string; name: string;
   category: string; language: string; active: boolean;
+  logoUrl: string | null;
   aiFeaturesEnabled: boolean;
   recordingEnabled: boolean;
   dempOutputUrl: string | null;                // primary (UDP if configured, else RTSP)
@@ -168,13 +170,18 @@ export default function ChannelsPage() {
               {!isLoading && rows.map((c) => {
                 const activeId = c.runtime?.activeSourceId;
                 const score = c.runtime?.score ?? null;
-                // "Signal" reflects what's ACTUALLY happening on the wire —
-                // not whether the channel is enabled in config.
+                // CMC has no failover-controller running, so most channels
+                // arrive here with score=null. Treat active + sources as
+                // LIVE by default (trust operator config); only downgrade
+                // when we have an actual health signal saying so.
+                const hasSource = c.sources.length > 0;
                 const signal: 'LIVE' | 'DEGRADED' | 'OFFLINE' | 'DISABLED' =
-                  !c.active ? 'DISABLED' :
-                  score === null ? 'OFFLINE' :
-                  score >= 0.5 ? 'LIVE' :
-                  score >= 0.25 ? 'DEGRADED' : 'OFFLINE';
+                  !c.active     ? 'DISABLED' :
+                  !hasSource    ? 'OFFLINE'  :
+                  score === null ? 'LIVE'    :
+                  score >= 0.5   ? 'LIVE'    :
+                  score >= 0.25  ? 'DEGRADED' :
+                                   'OFFLINE';
                 const signalVariant: 'green' | 'amber' | 'red' | 'default' =
                   signal === 'LIVE' ? 'green' :
                   signal === 'DEGRADED' ? 'amber' :
@@ -187,8 +194,11 @@ export default function ChannelsPage() {
                   >
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-3">
-                        <div className="h-9 w-9 rounded bg-panel2 border border-border flex items-center justify-center font-display font-bold text-[12px] text-muted">
-                          {c.name.slice(0,2).toUpperCase()}
+                        <div className="h-9 w-9 rounded bg-white border border-border overflow-hidden flex items-center justify-center font-display font-bold text-[12px] text-muted">
+                          {c.logoUrl
+                            ? <AuthImg src={c.logoUrl} alt="" className="max-w-full max-h-full object-contain"
+                                       fallback={<span>{c.name.slice(0,2).toUpperCase()}</span>} />
+                            : <span className="text-muted">{c.name.slice(0,2).toUpperCase()}</span>}
                         </div>
                         <div>
                           <div className="font-medium text-sm">{c.name}</div>

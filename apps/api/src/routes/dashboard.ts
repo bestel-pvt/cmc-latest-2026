@@ -94,7 +94,11 @@ const routes: FastifyPluginAsync = async (app) => {
     // way channels don't all show as IDLE just because the score
     // service isn't scoring.
     const chs = await app.prisma.channel.findMany({
-      select: { id: true, name: true, slug: true, active: true, aiFeaturesEnabled: true, category: true },
+      select: {
+        id: true, name: true, slug: true, active: true,
+        aiFeaturesEnabled: true, category: true,
+        _count: { select: { sources: true } },
+      },
       orderBy: { name: 'asc' },
     });
 
@@ -126,6 +130,7 @@ const routes: FastifyPluginAsync = async (app) => {
       return {
         id: c.id, name: c.name, slug: c.slug, active: c.active,
         aiFeaturesEnabled: c.aiFeaturesEnabled, category: c.category,
+        hasSource: c._count.sources > 0,
         score,
         lastSwitchAt: s.lastSwitchAt ? Number(s.lastSwitchAt) : null,
         activeSourceId: s.activeSourceId ?? null,

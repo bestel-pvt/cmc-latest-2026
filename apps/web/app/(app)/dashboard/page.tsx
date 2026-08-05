@@ -18,7 +18,7 @@ interface Kpis {
   clipsToday: number; segmentsToday: number;
   users: number;
   bytesWritten24h: number; onAirMinutes24h: number;
-  health: Array<{ id: string; name: string; slug: string; active: boolean; category: string; score: number | null; activeSourceId: string | null }>;
+  health: Array<{ id: string; name: string; slug: string; active: boolean; category: string; hasSource: boolean; score: number | null; activeSourceId: string | null }>;
   recentAudit: Array<{ id: string; action: string; entityType: string | null; createdAt: string; user: { name: string; email: string } | null }>;
 }
 
@@ -29,10 +29,14 @@ export default function DashboardPage() {
     refetchInterval: 10_000,
   });
 
-  const up   = kpis?.health.filter((c) => c.active && (c.score ?? 0) >= 0.5).length ?? 0;
-  const warn = kpis?.health.filter((c) => c.active && (c.score ?? 0) < 0.5 && (c.score ?? 0) >= 0.25).length ?? 0;
-  const down = kpis?.health.filter((c) => c.active && (c.score ?? 0) < 0.25).length ?? 0;
-  const idle = kpis?.health.filter((c) => c.active && c.score === null).length ?? 0;
+  // CMC has no failover-controller writing scores; a null score on an
+  // active-with-source channel means "no live signal, trust the config"
+  // and should count as UP, not IDLE. down/warn only apply when a real
+  // (non-null) score puts them there.
+  const up   = kpis?.health.filter((c) => c.active && c.hasSource && (c.score === null || c.score >= 0.5)).length ?? 0;
+  const warn = kpis?.health.filter((c) => c.active && c.hasSource && c.score !== null && c.score < 0.5 && c.score >= 0.25).length ?? 0;
+  const down = kpis?.health.filter((c) => c.active && c.hasSource && c.score !== null && c.score < 0.25).length ?? 0;
+  const idle = kpis?.health.filter((c) => c.active && !c.hasSource).length ?? 0;
 
   return (
     <div className="max-w-[1500px] mx-auto space-y-6">
@@ -92,7 +96,13 @@ export default function DashboardPage() {
                 title={c.name}
               >
                 <div className="flex items-center justify-between">
-                  <HealthMeter value={c.score ?? 0} size="sm" />
+                  {/* Same "trust config" rule as the counters above:
+                      active + has-source with no live score → treat as
+                      healthy (1.0). No source → 0 (visibly empty). */}
+                  <HealthMeter
+                    value={c.score ?? (c.active && c.hasSource ? 1 : 0)}
+                    size="sm"
+                  />
                   <Badge variant="outline" className="text-[9px] px-1 py-0">{c.category?.slice(0, 3) ?? '—'}</Badge>
                 </div>
                 <div className="text-[11px] mt-1.5 font-medium truncate">{c.name}</div>

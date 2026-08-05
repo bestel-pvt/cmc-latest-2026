@@ -287,7 +287,7 @@ export default function NewClipPage() {
         channelId, title, notes,
         startAt: startAtISO, endAt: endAtISO,
         format, resolution,
-        watermarkText: `${user?.email ?? 'unknown'} · ${new Date().toISOString()}`,
+        watermarkText: `${user?.email ?? 'unknown'} - ${new Date().toISOString()}`,
       },
     }),
     onSuccess: () => { toast.success('Clip queued'); router.push('/clips'); },
@@ -384,7 +384,7 @@ export default function NewClipPage() {
           </div>
           <div className="pt-2 border-t border-border">
             <div className="text-[10px] uppercase tracking-widest text-muted-2 mb-2">Watermark</div>
-            <div className="font-mono text-[11px] text-muted break-all">{user?.email} · {new Date().toISOString().slice(0, 19)}Z</div>
+            <div className="font-mono text-[11px] text-muted break-all">{user?.email} - {new Date().toISOString().slice(0, 19)}Z</div>
             <p className="text-[10px] text-muted-2 mt-1">Burned into the exported file. Cannot be disabled.</p>
           </div>
           <div className="pt-2 border-t border-border">

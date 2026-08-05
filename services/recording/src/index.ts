@@ -331,10 +331,16 @@ async function clipWorker(job: { clipId: string }) {
   // filter_complex — a watermark like "admin@demp.local · 2026-08-04T03:33:27.990Z"
   // was crashing ffmpeg (exit 234, "Invalid argument around [outv]").
   // Escape :, \, and % for drawtext, plus drop the ' which we already
-  // strip. Also flatten the ISO timestamp to a friendlier form.
+  // strip. Also flatten the ISO timestamp to a friendlier form. And
+  // strip anything non-ASCII: Windows ffmpeg reads argv as ANSI, and
+  // UTF-8 characters like the middle-dot (·) come through as garbled
+  // multibyte sequences that drawtext rejects with "Invalid argument".
   const wmRaw = (clip.watermarkText ?? '').replace(/'/g, '');
   const wm = wmRaw
     .replace(/T(\d\d):(\d\d):(\d\d)(\.\d+)?Z/, ' $1-$2-$3 UTC')  // ISO → readable
+    .replace(/·/g, '-')                                          // middle dot → hyphen
+    // eslint-disable-next-line no-control-regex
+    .replace(/[^\x20-\x7E]/g, '')                                // strip any remaining non-ASCII
     .replace(/\\/g, '\\\\')
     .replace(/:/g, '\\:')
     .replace(/%/g, '\\%');

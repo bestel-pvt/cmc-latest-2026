@@ -15,8 +15,9 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 type FF = ChildProcess & { stderr: NonNullable<ChildProcess['stderr']> };
 import { createHash } from 'node:crypto';
-import { createReadStream, existsSync, mkdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { createReadStream, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { readdir } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import Redis from 'ioredis';
 import pino from 'pino';
@@ -27,10 +28,12 @@ const log = pino({ transport: process.env.NODE_ENV === 'production' ? undefined 
 const REDIS_URL     = process.env.REDIS_URL     ?? 'redis://localhost:6380';
 const RECORDINGS    = resolve(process.env.RECORDINGS_DIR ?? './data/recordings');
 const CLIPS         = resolve(process.env.CLIPS_DIR      ?? './data/clips');
+const CLIP_ASSETS   = resolve(process.env.CLIP_ASSETS_DIR ?? './data/assets');
 const SEG_SECONDS   = Number(process.env.RECORDING_SEGMENT_SECONDS ?? 60);
 const V_BITRATE     = process.env.RECORDING_VIDEO_BITRATE ?? '2000k';
 const A_BITRATE     = process.env.RECORDING_AUDIO_BITRATE ?? '128k';
 const SIGN_KEY      = process.env.MANIFEST_SIGNING_KEY   ?? 'dev-only';
+const TITLE_CARD_SEC = 3;
 
 const redis    = new Redis(REDIS_URL);
 const redisPub = new Redis(REDIS_URL);
@@ -285,8 +288,38 @@ async function refreshSupervisors() {
   }
 }
 
+/** Escape a user-supplied string for use inside a drawtext text= value.
+ * Windows ffmpeg reads argv as ANSI so anything non-printable-ASCII
+ * turns into a garbled multibyte sequence that drawtext rejects with
+ * "Invalid argument"; :\\% are drawtext option/escape metacharacters.  */
+function escapeForDrawtext(s: string): string {
+  return s
+    // eslint-disable-next-line no-control-regex
+    .replace(/[^\x20-\x7E]/g, '')
+    .replace(/'/g, '')
+    .replace(/\\/g, '\\\\')
+    .replace(/:/g, '\\:')
+    .replace(/%/g, '\\%');
+}
+
+/** Wrap an ffmpeg invocation as a Promise so we can await + capture stderr. */
+function runFfmpeg(args: string[], stage: string): Promise<void> {
+  return new Promise((resolve2, reject) => {
+    const p = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let tail = '';
+    p.stderr.on('data', (b) => { tail += b.toString(); });
+    p.on('error', reject);
+    p.on('exit', (code) => code === 0
+      ? resolve2()
+      : reject(new Error(`ffmpeg ${stage} exit ${code} — last stderr: ${tail.slice(-500)}`)));
+  });
+}
+
 async function clipWorker(job: { clipId: string }) {
-  const clip = await prisma.clip.findUnique({ where: { id: job.clipId } });
+  const clip = await prisma.clip.findUnique({
+    where: { id: job.clipId },
+    include: { channel: { select: { name: true, slug: true } } },
+  });
   if (!clip) return;
   await prisma.clip.update({ where: { id: clip.id }, data: { status: 'RENDERING' } });
   log.info({ clipId: clip.id }, 'rendering clip');
@@ -313,47 +346,20 @@ async function clipWorker(job: { clipId: string }) {
     return;
   }
 
-  // Simple robust clip render:
-  //   * cut precisely with -ss / -to from the first covering segment
-  //   * scale/pad to target resolution
-  //   * burn DEMP + operator watermark
-  //   * audio: try to copy the source track; if the source has none we
-  //     inject silence so the output MP4 always has both v+a tracks
-  //     (avoids the "concat: audio stream missing → ffmpeg exit 234"
-  //      failure mode we hit in production).
-  // Cross-segment stitching (>1 segment span) is a follow-on that will
-  // build a concat demuxer input list.
   const first = covering[0]!;
   const ss = (clip.startAt.getTime() - first.startedAt.getTime()) / 1000;
   const to = (clip.endAt.getTime()   - first.startedAt.getTime()) / 1000;
-
-  // FFmpeg drawtext parses ':' as an option separator inside
-  // filter_complex — a watermark like "admin@demp.local · 2026-08-04T03:33:27.990Z"
-  // was crashing ffmpeg (exit 234, "Invalid argument around [outv]").
-  // Escape :, \, and % for drawtext, plus drop the ' which we already
-  // strip. Also flatten the ISO timestamp to a friendlier form. And
-  // strip anything non-ASCII: Windows ffmpeg reads argv as ANSI, and
-  // UTF-8 characters like the middle-dot (·) come through as garbled
-  // multibyte sequences that drawtext rejects with "Invalid argument".
-  const wmRaw = (clip.watermarkText ?? '').replace(/'/g, '');
-  const wm = wmRaw
-    .replace(/T(\d\d):(\d\d):(\d\d)(\.\d+)?Z/, ' $1-$2-$3 UTC')  // ISO → readable
-    .replace(/·/g, '-')                                          // middle dot → hyphen
-    // eslint-disable-next-line no-control-regex
-    .replace(/[^\x20-\x7E]/g, '')                                // strip any remaining non-ASCII
-    .replace(/\\/g, '\\\\')
-    .replace(/:/g, '\\:')
-    .replace(/%/g, '\\%');
-  const [w, h] = clip.resolution.split('x').map(Number);
   const duration = Math.max(1, to - ss);
+  const [w, h] = clip.resolution.split('x').map(Number);
 
-  // drawtext needs a real, resolvable font file. On Windows the drive
-  // colon is drawtext's option separator, so it must be double-escaped
-  // — a SINGLE backslash-colon ('C\:/...') still gets split on the ':';
-  // only 'C\\:/...' (which ffmpeg's parser reduces to 'C\:' → literal
-  // 'C:') survives filter-graph parsing. Also fontconfig isn't shipped
-  // with the Windows ffmpeg build, so a wrong path here segfaults
-  // instead of erroring cleanly. Never pass a Linux path on Windows.
+  // Watermark text — email + timestamp — flattened + ASCII-safe.
+  const wmRaw = (clip.watermarkText ?? '').replace(/'/g, '');
+  const wm = escapeForDrawtext(wmRaw.replace(/T(\d\d):(\d\d):(\d\d)(\.\d+)?Z/, ' $1-$2-$3 UTC'));
+
+  // drawtext fontfile: single-backslash-colon ('C\:/...') gets split
+  // by the Windows parser; double-backslash-colon ('C\\:/...') is the
+  // form that survives. Fontconfig isn't shipped on the Windows build
+  // so a wrong path here segfaults — do NOT pass a Linux path there.
   const FONT_BOLD = process.platform === 'win32'
     ? String.raw`C\\:/Windows/Fonts/arialbd.ttf`
     : '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
@@ -361,62 +367,154 @@ async function clipWorker(job: { clipId: string }) {
     ? String.raw`C\\:/Windows/Fonts/arial.ttf`
     : '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
 
-  // Only MP4 / MOV benefit from +faststart (moov atom relocation).
-  // MKV has no moov; the flag is silently ignored but noisier to log,
-  // so skip it. If we ever add WEBM back it needs libvpx-vp9 + libopus
-  // in place of libx264 + aac — WebM refuses H.264/AAC entirely.
+  const PAK_LOGO = join(CLIP_ASSETS, 'pak-navy-logo.png');
+  const ANL_LOGO = join(CLIP_ASSETS, 'powered-by-analysys.png');
+  const hasBranding = existsSync(PAK_LOGO) && existsSync(ANL_LOGO);
+  if (!hasBranding) log.warn({ PAK_LOGO, ANL_LOGO }, 'branding logos not found — falling back to text-only watermarks');
+
+  // Only MP4 / MOV benefit from +faststart. MKV ignores it; WebM
+  // would need libvpx-vp9 + libopus and is disabled at the UI layer.
   const isMovLike = clip.format === 'MP4' || clip.format === 'MOV';
 
-  const args = [
-    '-hide_banner', '-loglevel', 'warning',
-    '-ss', String(Math.max(0, ss)),
-    '-to', String(Math.max(ss + 1, to)),
-    '-i', first.path,
-    // Always-present silent audio (used only if source has no audio).
-    '-f', 'lavfi', '-t', String(duration + 1), '-i', 'anullsrc=r=48000:cl=stereo',
-    '-filter_complex',
-    `[0:v]scale=${w}:${h}:force_original_aspect_ratio=decrease,` +
-      `pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,` +
-      // Persistent PAK NAVY wordmark top-right
-      `drawtext=text='PAK NAVY':fontcolor=white@0.55:fontsize=42:fontfile=${FONT_BOLD}:x=w-tw-24:y=24,` +
-      // Bottom strip with operator/timestamp watermark. Hex colours
-      // MUST use the 0x prefix — a leading '#' inside a filter-graph
-      // token gets swallowed by ffmpeg's parser (treated as a comment
-      // start) and the rest of the drawbox goes with it. 0x0B1E3A is
-      // the same navy blue as #0B1E3A.
-      `drawbox=x=0:y=ih-30:w=iw:h=30:color=0x0B1E3A@0.8:t=fill,` +
-      `drawtext=text='${wm}':fontcolor=white@0.85:fontsize=14:fontfile=${FONT_REG}:x=16:y=h-22` +
-      `[outv]`,
-    '-map', '[outv]',
-    // Prefer source audio; if it doesn't exist, fall back to silent lavfi.
-    '-map', '0:a:0?', '-map', '1:a:0',
-    '-shortest',
-    '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', V_BITRATE,
-    '-c:a', 'aac', '-b:a', A_BITRATE, '-ac', '2', '-ar', '48000',
-    ...(isMovLike ? ['-movflags', '+faststart'] : []),
-    '-y',
-    outFile,
-  ];
-  log.info({ clipId: clip.id }, 'ffmpeg clip render');
+  // Two-pass render: main content first, then prepend title card via
+  // concat filter. One-pass is possible but the audio-branch handling
+  // (source-audio-or-silent + concat-with-silent-intro) inside a
+  // single filter graph is brittle; splitting keeps each pass
+  // trivially debuggable.
+  const workDir = mkdtempSync(join(tmpdir(), `clip-${clip.id}-`));
+  const mainPath = join(workDir, `main.${clip.format.toLowerCase()}`);
 
-  await new Promise<void>((resolve2, reject) => {
-    const p = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
-    let tail = '';
-    p.on('exit', (code) => code === 0 ? resolve2() : reject(new Error(`ffmpeg exit ${code} — last stderr: ${tail.slice(-400)}`)));
-    p.stderr.on('data', (b) => { tail += b.toString(); });
-    p.on('error', reject);
-  }).then(async () => {
+  try {
+    // ============================================================ Pass 1: main
+    // Centered PAK NAVY watermark @ 10% alpha, small Powered-by-Analysys
+    // lockup bottom-right, existing PAK NAVY top-right + operator strip.
+    const mainFilter: string[] = [
+      `[0:v]scale=${w}:${h}:force_original_aspect_ratio=decrease,` +
+        `pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2[base]`,
+    ];
+    let vLabel = 'base';
+    if (hasBranding) {
+      // Center watermark: PAK NAVY crest, ~28% of frame width, alpha 10%.
+      mainFilter.push(
+        `[2:v]scale=${Math.round(w * 0.28)}:-1,format=rgba,` +
+          `colorchannelmixer=aa=0.10[wm]`,
+        `[${vLabel}][wm]overlay=(W-w)/2:(H-h)/2[v1]`,
+      );
+      vLabel = 'v1';
+      // Bottom-right: Powered-by-Analysys lockup at ~12% of frame width.
+      mainFilter.push(
+        `[3:v]scale=${Math.round(w * 0.12)}:-1[an]`,
+        `[${vLabel}][an]overlay=W-w-16:H-h-46[v2]`,
+      );
+      vLabel = 'v2';
+    }
+    mainFilter.push(
+      `[${vLabel}]drawtext=text='PAK NAVY':fontcolor=white@0.8:fontsize=42:` +
+        `fontfile=${FONT_BOLD}:x=w-tw-24:y=24,` +
+      `drawbox=x=0:y=ih-30:w=iw:h=30:color=0x0B1E3A@0.8:t=fill,` +
+      `drawtext=text='${wm}':fontcolor=white@0.85:fontsize=14:` +
+        `fontfile=${FONT_REG}:x=16:y=h-22[outv]`,
+    );
+
+    const mainArgs: string[] = [
+      '-hide_banner', '-loglevel', 'warning',
+      '-ss', String(Math.max(0, ss)),
+      '-to', String(Math.max(ss + 1, to)),
+      '-i', first.path,
+      // Silent audio fallback — mapped only if source has no audio.
+      '-f', 'lavfi', '-t', String(duration + 1), '-i', 'anullsrc=r=48000:cl=stereo',
+    ];
+    if (hasBranding) mainArgs.push('-i', PAK_LOGO, '-i', ANL_LOGO);
+    mainArgs.push(
+      '-filter_complex', mainFilter.join(';'),
+      '-map', '[outv]',
+      '-map', '0:a:0?', '-map', '1:a:0',
+      '-shortest',
+      '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', V_BITRATE,
+      '-c:a', 'aac', '-b:a', A_BITRATE, '-ac', '2', '-ar', '48000',
+      ...(isMovLike ? ['-movflags', '+faststart'] : []),
+      '-y', mainPath,
+    );
+    log.info({ clipId: clip.id }, 'ffmpeg pass 1 — main content');
+    await runFfmpeg(mainArgs, 'main');
+
+    // ============================================================ Pass 2: title
+    // 3-second white title card carrying PAK NAVY crest, clip title,
+    // channel/time metadata, and Powered-by-Analysys lockup.  Concat
+    // with the main pass output. Both segments re-encoded together so
+    // the timeline is continuous (no discontinuity glitch).
+    const title = escapeForDrawtext(clip.title.slice(0, 60));
+    const startedIso = clip.startAt.toISOString().slice(0, 19).replace('T', ' ') + ' UTC';
+    const meta = escapeForDrawtext(`${clip.channel.name} — ${startedIso}`);
+
+    const concatArgs: string[] = [
+      '-hide_banner', '-loglevel', 'warning',
+      // Input 0: white background for TITLE_CARD_SEC seconds.
+      '-f', 'lavfi', '-i', `color=white:s=${w}x${h}:d=${TITLE_CARD_SEC}`,
+      // Input 1: matching silent audio for TITLE_CARD_SEC seconds.
+      '-f', 'lavfi', '-t', String(TITLE_CARD_SEC), '-i', 'anullsrc=r=48000:cl=stereo',
+    ];
+    let tcVideoLabel = '0:v';
+    const tcFilter: string[] = [];
+    if (hasBranding) {
+      concatArgs.push('-i', PAK_LOGO, '-i', ANL_LOGO);
+      // Input 4: main pass output (added after the logos).
+      concatArgs.push('-i', mainPath);
+      // Layout tuned so the crest doesn't overlap the title text.
+      // Logo top ~5% down, ~16% of width; title lands cleanly below at
+      // ~58% Y; meta below title; Analysys lockup pinned to the bottom.
+      tcFilter.push(
+        `[2:v]scale=${Math.round(w * 0.16)}:-1[titleLogo]`,
+        `[${tcVideoLabel}][titleLogo]overlay=(W-w)/2:${Math.round(h * 0.06)}[t1]`,
+        // Clip title — navy on white, ~58% Y so it clears the logo.
+        `[t1]drawtext=text='${title}':fontcolor=0x0B1E3A:fontsize=44:` +
+          `fontfile=${FONT_BOLD}:x=(w-tw)/2:y=${Math.round(h * 0.58)}[t2]`,
+        // Channel + time metadata — grey, just below the title.
+        `[t2]drawtext=text='${meta}':fontcolor=0x5A6572:fontsize=22:` +
+          `fontfile=${FONT_REG}:x=(w-tw)/2:y=${Math.round(h * 0.68)}[t3]`,
+        // Powered-by-Analysys lockup — ~16% of width, pinned near bottom.
+        `[3:v]scale=${Math.round(w * 0.16)}:-1[titleAn]`,
+        `[t3][titleAn]overlay=(W-w)/2:H-h-${Math.round(h * 0.06)}[titleV]`,
+        // Concat title + main. Interleave streams:
+        //   [titleV][titleA][mainV][mainA] → [outv][outa]
+        `[titleV][1:a][4:v][4:a]concat=n=2:v=1:a=1[outv][outa]`,
+      );
+    } else {
+      concatArgs.push('-i', mainPath);
+      tcFilter.push(
+        `[${tcVideoLabel}]drawtext=text='${title}':fontcolor=0x0B1E3A:fontsize=44:` +
+          `fontfile=${FONT_BOLD}:x=(w-tw)/2:y=${Math.round(h * 0.44)}[t1]`,
+        `[t1]drawtext=text='${meta}':fontcolor=0x5A6572:fontsize=22:` +
+          `fontfile=${FONT_REG}:x=(w-tw)/2:y=${Math.round(h * 0.55)}[titleV]`,
+        // With no branding inputs, mainPath is input 2.
+        `[titleV][1:a][2:v][2:a]concat=n=2:v=1:a=1[outv][outa]`,
+      );
+    }
+
+    concatArgs.push(
+      '-filter_complex', tcFilter.join(';'),
+      '-map', '[outv]', '-map', '[outa]',
+      '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', V_BITRATE,
+      '-c:a', 'aac', '-b:a', A_BITRATE, '-ac', '2', '-ar', '48000',
+      ...(isMovLike ? ['-movflags', '+faststart'] : []),
+      '-y', outFile,
+    );
+    log.info({ clipId: clip.id }, 'ffmpeg pass 2 — title card + concat');
+    await runFfmpeg(concatArgs, 'concat');
+
     const size = statSync(outFile).size;
     const hash = await sha256(outFile);
     await prisma.clip.update({ where: { id: clip.id }, data: {
       status: 'READY', path: outFile, sizeBytes: BigInt(size), sha256: hash,
     } });
-    log.info({ clipId: clip.id }, 'clip ready');
-  }).catch(async (err) => {
+    log.info({ clipId: clip.id, sizeMB: (size / 1024 / 1024).toFixed(1) }, 'clip ready');
+  } catch (err) {
     log.error({ err, clipId: clip.id }, 'clip render failed');
     await prisma.clip.update({ where: { id: clip.id }, data: { status: 'FAILED' } });
     try { unlinkSync(outFile); } catch { /* */ }
-  });
+  } finally {
+    try { rmSync(workDir, { recursive: true, force: true }); } catch { /* */ }
+  }
 }
 
 function hasFfmpeg(): boolean {

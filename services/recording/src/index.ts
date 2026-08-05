@@ -347,16 +347,18 @@ async function clipWorker(job: { clipId: string }) {
   const [w, h] = clip.resolution.split('x').map(Number);
   const duration = Math.max(1, to - ss);
 
-  // drawtext needs a real, resolvable font file. On Windows the colon
-  // in a drive path is also drawtext's option separator, so we escape
-  // it inline (C\:/Windows/…). Fontconfig isn't shipped with the
-  // Windows ffmpeg build, so if this path is wrong ffmpeg segfaults
-  // trying to fall back — do NOT pass a Linux path on Windows.
+  // drawtext needs a real, resolvable font file. On Windows the drive
+  // colon is drawtext's option separator, so it must be double-escaped
+  // — a SINGLE backslash-colon ('C\:/...') still gets split on the ':';
+  // only 'C\\:/...' (which ffmpeg's parser reduces to 'C\:' → literal
+  // 'C:') survives filter-graph parsing. Also fontconfig isn't shipped
+  // with the Windows ffmpeg build, so a wrong path here segfaults
+  // instead of erroring cleanly. Never pass a Linux path on Windows.
   const FONT_BOLD = process.platform === 'win32'
-    ? 'C\\:/Windows/Fonts/arialbd.ttf'
+    ? String.raw`C\\:/Windows/Fonts/arialbd.ttf`
     : '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
   const FONT_REG  = process.platform === 'win32'
-    ? 'C\\:/Windows/Fonts/arial.ttf'
+    ? String.raw`C\\:/Windows/Fonts/arial.ttf`
     : '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
 
   // Only MP4 / MOV benefit from +faststart (moov atom relocation).

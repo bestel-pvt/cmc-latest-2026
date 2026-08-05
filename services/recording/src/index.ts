@@ -341,8 +341,17 @@ async function clipWorker(job: { clipId: string }) {
   const [w, h] = clip.resolution.split('x').map(Number);
   const duration = Math.max(1, to - ss);
 
-  const FONT_BOLD = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
-  const FONT_REG  = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
+  // drawtext needs a real, resolvable font file. On Windows the colon
+  // in a drive path is also drawtext's option separator, so we escape
+  // it inline (C\:/Windows/…). Fontconfig isn't shipped with the
+  // Windows ffmpeg build, so if this path is wrong ffmpeg segfaults
+  // trying to fall back — do NOT pass a Linux path on Windows.
+  const FONT_BOLD = process.platform === 'win32'
+    ? 'C\\:/Windows/Fonts/arialbd.ttf'
+    : '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
+  const FONT_REG  = process.platform === 'win32'
+    ? 'C\\:/Windows/Fonts/arial.ttf'
+    : '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
 
   // Only MP4 / MOV benefit from +faststart (moov atom relocation).
   // MKV has no moov; the flag is silently ignored but noisier to log,

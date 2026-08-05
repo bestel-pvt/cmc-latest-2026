@@ -1,5 +1,5 @@
 import type { FastifyPluginAsync } from 'fastify';
-import { createReadStream, statSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { createReadStream, statSync, writeFileSync, mkdirSync, existsSync, readdirSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
@@ -118,7 +118,14 @@ const routes: FastifyPluginAsync = async (app) => {
 
   /** Quick "does this MP4 have a readable moov atom" probe. Recorder
    * kills / crashes leave zero-length or moov-less files; the concat
-   * demuxer stops dead on those, so we skip them. */
+   * demuxer stops dead on those, so we skip them.
+   *
+   * ffprobe isn't part of every ffmpeg build (the Windows build shipped
+   * on the CMC server has ffmpeg.exe + ffplay.exe but no ffprobe). When
+   * the binary can't be spawned we return TRUE and let downstream
+   * playback decide — the recorder only writes a DB row after a segment
+   * is fully closed and its SHA-256 is captured, so a row alone is a
+   * strong "this was a valid file" signal. */
   async function isPlayable(path: string): Promise<boolean> {
     return new Promise((resolve) => {
       const ff = spawn('ffprobe', [
@@ -128,7 +135,7 @@ const routes: FastifyPluginAsync = async (app) => {
       let out = '';
       ff.stdout.on('data', (b) => { out += b.toString(); });
       ff.on('exit', (code) => resolve(code === 0 && out.trim().length > 0));
-      ff.on('error', () => resolve(false));
+      ff.on('error', () => resolve(true));
     });
   }
 
@@ -217,11 +224,17 @@ const routes: FastifyPluginAsync = async (app) => {
     });
     if (covering.length === 0) return reply.notFound('no segments cover this range');
 
-    // Filter out zero-length / stub files up front — the remux step
-    // would fail and hls.js has no clean way to skip a segment.
-    const playable = covering.filter((s) => {
-      try { return statSync(s.path).size >= 4096; } catch { return false; }
-    });
+    // Filter out zero-length / stub / half-written files up front — the
+    // ffmpeg segment split would 500 with 'Invalid data found' otherwise
+    // and hls.js has no clean way to recover mid-playlist. Cheap ffprobe
+    // check filters the recorder's crash-truncated MP4s.
+    const playable: typeof covering = [];
+    for (const s of covering) {
+      if (!existsSync(s.path)) continue;
+      if (statSync(s.path).size < 4096) continue;
+      if (!(await isPlayable(s.path))) continue;
+      playable.push(s);
+    }
     if (playable.length === 0) return reply.notFound('no playable segments in range');
 
     // Each 60-s recorded MP4 is exposed as ~10 sub-segments of ~6 s
@@ -262,7 +275,6 @@ const routes: FastifyPluginAsync = async (app) => {
       if (existsSync(join(dir, '.ready'))) {
         // Count actual .ts files produced by ffmpeg.
         try {
-          const { readdirSync } = require('fs');
           nSub = readdirSync(dir).filter((f: string) => f.endsWith('.ts')).length;
         } catch {
           nSub = Math.max(1, Math.floor(durS / SUB_DURATION));
@@ -359,7 +371,14 @@ const routes: FastifyPluginAsync = async (app) => {
     try {
       await segmentToHlsSlices({ id: seg.id, path: seg.path });
     } catch (e) {
-      return reply.code(500).send({ error: 'slice failed', detail: e instanceof Error ? e.message : String(e) });
+      // Broken source MP4 (recorder killed mid-write, 'Invalid data
+      // found on input') — don't 500 in a loop. Return an empty valid
+      // MPEG-TS packet so hls.js just treats this slice as a gap and
+      // moves on to the next segment via the playlist's DISCONTINUITY.
+      app.log.warn({ segId: seg.id, err: e instanceof Error ? e.message : String(e) }, 'slice extract failed — sending empty TS');
+      const EMPTY_TS = Buffer.alloc(188, 0xff); EMPTY_TS[0] = 0x47; EMPTY_TS[1] = 0x1f; EMPTY_TS[2] = 0xff; EMPTY_TS[3] = 0x10;
+      reply.header('Content-Type', 'video/mp2t').header('Content-Length', 188);
+      return reply.send(EMPTY_TS);
     }
     let filePath = join(HLS_CACHE, seg.id, `${sliceIdx}.ts`);
     if (!existsSync(filePath)) {
@@ -369,7 +388,6 @@ const routes: FastifyPluginAsync = async (app) => {
       // understates rather than overstates, so this path should be
       // rare, but keep the safety net.)
       try {
-        const { readdirSync } = require('fs');
         const slices = readdirSync(join(HLS_CACHE, seg.id))
           .filter((f: string) => f.endsWith('.ts'))
           .map((f: string) => Number.parseInt(f, 10))
@@ -549,7 +567,7 @@ const routes: FastifyPluginAsync = async (app) => {
 
     const body = JSON.stringify({ sampleRate: sr, buckets, duration: totalDurMs / 1000, peaks });
     // Best-effort write, ignore ENOENT if tmp was cleaned mid-request.
-    try { require('fs').writeFileSync(cachePath, body); } catch {}
+    try { writeFileSync(cachePath, body); } catch {}
     reply.header('Content-Type', 'application/json').header('Cache-Control', 'public, max-age=3600');
     return reply.send(body);
   });

@@ -377,8 +377,12 @@ async function clipWorker(job: { clipId: string }) {
       `pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,` +
       // Persistent PAK NAVY wordmark top-right
       `drawtext=text='PAK NAVY':fontcolor=white@0.55:fontsize=42:fontfile=${FONT_BOLD}:x=w-tw-24:y=24,` +
-      // Bottom strip with operator/timestamp watermark
-      `drawbox=x=0:y=ih-30:w=iw:h=30:color=#0B1E3A@0.8:t=fill,` +
+      // Bottom strip with operator/timestamp watermark. Hex colours
+      // MUST use the 0x prefix — a leading '#' inside a filter-graph
+      // token gets swallowed by ffmpeg's parser (treated as a comment
+      // start) and the rest of the drawbox goes with it. 0x0B1E3A is
+      // the same navy blue as #0B1E3A.
+      `drawbox=x=0:y=ih-30:w=iw:h=30:color=0x0B1E3A@0.8:t=fill,` +
       `drawtext=text='${wm}':fontcolor=white@0.85:fontsize=14:fontfile=${FONT_REG}:x=16:y=h-22` +
       `[outv]`,
     '-map', '[outv]',

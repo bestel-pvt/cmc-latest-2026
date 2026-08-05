@@ -110,7 +110,16 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
     '-f', 'segment',
     '-segment_time', String(SEG_SECONDS),
     '-segment_format', 'mp4',
-    '-segment_format_options', 'movflags=+faststart',
+    // Fragmented MP4 — moov is written at file OPEN time (empty +
+    // default_base_moof), followed by moof/mdat pairs as frames arrive.
+    // Contrast with +faststart which requires a second pass at file
+    // CLOSE time to move the moov to the front; if the recorder is
+    // killed (service restart, crash, SIGINT during a segment) that
+    // second pass never runs and the resulting file has raw H.264
+    // data but no MP4 structure — completely unplayable, no possible
+    // remux. fMP4 avoids that failure mode entirely; every segment
+    // is playable the instant it starts writing.
+    '-segment_format_options', 'movflags=+frag_keyframe+empty_moov+default_base_moof',
     '-reset_timestamps', '1',
     '-strftime', '1',
     outPattern.replace('%M', '%Y%m%dT%H%M%SZ'),

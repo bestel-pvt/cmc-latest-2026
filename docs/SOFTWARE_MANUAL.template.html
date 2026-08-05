@@ -1,0 +1,2048 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CMC — Software Manual — PAK NAVY</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --ink: #1A2432;
+    --ink-muted: #5A6572;
+    --ink-soft: #7F8894;
+    --rule: #D8DBD0;
+    --rule-strong: #8FA096;
+    --paper: #FAFAF7;
+    --paper-2: #F3F3EC;
+    --navy: #003718;
+    --navy-2: #00521A;
+    --navy-tint: #E6ECE6;
+    --brass: #B8860B;
+    --brass-tint: #F4EAD3;
+    --danger: #8B2E2E;
+  }
+
+  * { box-sizing: border-box; }
+  html { color-scheme: light; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font: 12pt/1.55 "Segoe UI", -apple-system, "Helvetica Neue", Arial, sans-serif;
+    font-feature-settings: "kern" 1, "liga" 1;
+  }
+  @page {
+    size: A4;
+    margin: 20mm 18mm 22mm;
+  }
+
+  /* ============================================================ scaffolding */
+  .page {
+    max-width: 172mm;
+    margin: 0 auto;
+    padding: 20mm 0 24mm;
+    position: relative;
+  }
+  .page + .page { page-break-before: always; }
+
+  /* Running footer shown on-screen at the bottom of each .page block.
+     In print, replaced by the @page fixed footer below. */
+  .running-footer {
+    margin-top: 30mm;
+    padding-top: 8mm;
+    border-top: 0.4pt solid var(--rule);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 8.5pt;
+    color: var(--ink-muted);
+    letter-spacing: 0.02em;
+  }
+  .running-footer .analysys img { height: 18px; display: block; }
+  .running-footer .doc-id { text-transform: uppercase; letter-spacing: 0.14em; font-size: 8pt; }
+
+  @media print {
+    body { background: white; }
+    .page { padding: 0; max-width: none; margin: 0; }
+    .page + .page { page-break-before: always; }
+  }
+
+  /* ============================================================ typography */
+  h1, h2, h3, h4 {
+    font-family: Georgia, "Times New Roman", serif;
+    color: var(--navy);
+    text-wrap: balance;
+    font-weight: 500;
+    line-height: 1.2;
+  }
+  h1 { font-size: 32pt; margin: 0 0 6mm; letter-spacing: -0.01em; }
+  h2 { font-size: 20pt; margin: 12mm 0 5mm; letter-spacing: -0.005em; }
+  h3 { font-size: 14pt; margin: 8mm 0 3mm; color: var(--navy-2); }
+  h4 { font-size: 11pt; margin: 6mm 0 2mm; color: var(--ink); text-transform: uppercase; letter-spacing: 0.08em; font-family: "Segoe UI", sans-serif; font-weight: 700; }
+
+  p { margin: 0 0 3mm; max-width: 68ch; }
+  a { color: var(--navy-2); text-decoration: none; border-bottom: 0.5pt solid var(--navy-2); }
+  strong { color: var(--navy); font-weight: 600; }
+
+  code, .kbd, .path {
+    font-family: Consolas, "Cascadia Mono", "SF Mono", monospace;
+    font-size: 10.5pt;
+  }
+  code {
+    background: var(--paper-2);
+    padding: 1px 6px;
+    border-radius: 3px;
+    border: 0.4pt solid var(--rule);
+  }
+  .path { color: var(--navy-2); }
+  .kbd {
+    display: inline-block;
+    background: white;
+    border: 0.6pt solid var(--rule-strong);
+    border-bottom-width: 1.4pt;
+    padding: 1px 7px;
+    border-radius: 4px;
+    font-size: 9.5pt;
+    color: var(--navy);
+  }
+
+  ul, ol { margin: 0 0 4mm; padding-left: 6mm; }
+  li { margin-bottom: 1.4mm; max-width: 66ch; }
+  li::marker { color: var(--navy-2); }
+
+  /* ============================================================ eyebrow / rules */
+  .eyebrow {
+    font-size: 8.5pt;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: var(--navy-2);
+    font-weight: 700;
+    margin-bottom: 2mm;
+  }
+  .lede {
+    font-size: 13.5pt;
+    line-height: 1.5;
+    color: var(--ink);
+    max-width: 60ch;
+    margin: 0 0 8mm;
+  }
+  hr.section-rule {
+    border: none;
+    border-top: 0.6pt solid var(--rule-strong);
+    margin: 8mm 0;
+  }
+
+  /* ============================================================ cover page */
+  .cover {
+    min-height: 250mm;
+    display: flex;
+    flex-direction: column;
+    padding: 20mm 12mm 12mm;
+    position: relative;
+    background:
+      linear-gradient(180deg, transparent 0, transparent 40mm, var(--navy-tint) 40mm, var(--navy-tint) 42mm, transparent 42mm) no-repeat,
+      var(--paper);
+  }
+  .cover .crest {
+    width: 130px;
+    height: 130px;
+    margin: 0 auto 8mm;
+    display: block;
+  }
+  .cover .stamp {
+    text-align: center;
+    font-size: 8pt;
+    letter-spacing: 0.4em;
+    color: var(--navy);
+    font-weight: 700;
+    text-transform: uppercase;
+  }
+  .cover .divider {
+    width: 40mm;
+    margin: 6mm auto;
+    border-top: 0.8pt solid var(--navy);
+  }
+  .cover .who {
+    text-align: center;
+    font-size: 11pt;
+    color: var(--ink-muted);
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    margin-bottom: 40mm;
+  }
+  .cover .title {
+    text-align: center;
+    font-family: Georgia, serif;
+    font-size: 36pt;
+    line-height: 1.05;
+    color: var(--navy);
+    margin: 0 0 4mm;
+    letter-spacing: -0.01em;
+  }
+  .cover .subtitle {
+    text-align: center;
+    font-family: Georgia, serif;
+    font-style: italic;
+    font-size: 16pt;
+    color: var(--navy-2);
+    margin: 0 0 3mm;
+  }
+  .cover .kicker {
+    text-align: center;
+    font-size: 10.5pt;
+    color: var(--ink-muted);
+    letter-spacing: 0.08em;
+    margin: 0 0 4mm;
+  }
+  .cover .expanded {
+    text-align: center;
+    font-size: 9pt;
+    letter-spacing: 0.32em;
+    text-transform: uppercase;
+    color: var(--navy);
+    font-weight: 700;
+    margin: 5mm 0 0;
+  }
+  .cover .meta {
+    margin-top: auto;
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 6mm;
+    border-top: 0.6pt solid var(--rule-strong);
+    padding-top: 8mm;
+  }
+  .cover .meta .field { display: flex; flex-direction: column; }
+  .cover .meta .label {
+    font-size: 8pt;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--ink-muted);
+    margin-bottom: 1.5mm;
+  }
+  .cover .meta .value {
+    font-family: Georgia, serif;
+    font-size: 13pt;
+    color: var(--navy);
+  }
+  .cover .footer {
+    margin-top: 10mm;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    color: var(--ink-muted);
+    font-size: 9pt;
+  }
+  .cover .footer .analysys img { height: 24px; display: block; }
+
+  /* ============================================================ TOC */
+  .toc-list { list-style: none; padding: 0; margin: 0; counter-reset: chapter; }
+  .toc-list li {
+    counter-increment: chapter;
+    display: flex;
+    align-items: baseline;
+    padding: 2.4mm 0;
+    border-bottom: 0.4pt dotted var(--rule);
+  }
+  .toc-list li::before {
+    content: counter(chapter, decimal-leading-zero);
+    font-family: Consolas, monospace;
+    font-size: 9pt;
+    color: var(--brass);
+    width: 12mm;
+    letter-spacing: 0.1em;
+  }
+  .toc-list li .t {
+    flex: 1;
+    font-size: 12pt;
+    color: var(--ink);
+  }
+  .toc-list li .t small {
+    display: block;
+    color: var(--ink-muted);
+    font-size: 9.5pt;
+    margin-top: 0.5mm;
+  }
+  .toc-list li .p {
+    font-family: Consolas, monospace;
+    color: var(--navy-2);
+    font-size: 10pt;
+    font-variant-numeric: tabular-nums;
+  }
+  .toc-part {
+    font-size: 9pt;
+    letter-spacing: 0.28em;
+    text-transform: uppercase;
+    color: var(--navy-2);
+    margin: 8mm 0 3mm;
+    padding-bottom: 1.5mm;
+    border-bottom: 0.8pt solid var(--navy-2);
+    font-weight: 700;
+  }
+  .toc-part:first-child { margin-top: 4mm; }
+
+  /* ============================================================ chapter opener */
+  .chapter-opener {
+    display: grid;
+    grid-template-columns: 22mm 1fr;
+    gap: 8mm;
+    align-items: end;
+    padding-bottom: 5mm;
+    border-bottom: 0.8pt solid var(--navy);
+    margin-bottom: 10mm;
+  }
+  .chapter-opener .num {
+    font-family: Georgia, serif;
+    font-size: 48pt;
+    line-height: 0.9;
+    color: var(--navy-2);
+    font-style: italic;
+  }
+  .chapter-opener .num::before {
+    content: "";
+    display: block;
+    font-size: 8pt;
+    letter-spacing: 0.3em;
+    color: var(--ink-muted);
+    text-transform: uppercase;
+    font-style: normal;
+    font-family: "Segoe UI", sans-serif;
+    margin-bottom: 2mm;
+  }
+  .chapter-opener .heading .part {
+    font-size: 8.5pt;
+    letter-spacing: 0.24em;
+    text-transform: uppercase;
+    color: var(--brass);
+    font-weight: 700;
+    margin-bottom: 2mm;
+  }
+  .chapter-opener .heading h1 {
+    font-size: 28pt;
+    margin: 0 0 3mm;
+    color: var(--navy);
+  }
+  .chapter-opener .heading .subtitle {
+    font-style: italic;
+    color: var(--ink-muted);
+    font-size: 12pt;
+    max-width: 55ch;
+  }
+
+  /* ============================================================ step list */
+  .steps {
+    counter-reset: step;
+    list-style: none;
+    padding: 0;
+    margin: 4mm 0 6mm;
+    display: grid;
+    gap: 4mm;
+  }
+  .steps > li {
+    counter-increment: step;
+    display: grid;
+    grid-template-columns: 10mm 1fr;
+    gap: 4mm;
+    align-items: start;
+    padding: 0;
+  }
+  .steps > li::before {
+    content: counter(step);
+    font-family: Georgia, serif;
+    font-size: 15pt;
+    color: white;
+    background: var(--navy);
+    width: 8mm;
+    height: 8mm;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    line-height: 1;
+    padding-bottom: 1px;
+  }
+  .steps > li > .body { padding-top: 1mm; }
+  .steps > li > .body p { margin: 0 0 2mm; }
+
+  /* ============================================================ callouts */
+  .callout {
+    display: grid;
+    grid-template-columns: 6mm 1fr;
+    gap: 4mm;
+    padding: 4mm 5mm;
+    margin: 5mm 0;
+    background: var(--paper-2);
+    border-left: 2pt solid var(--navy-2);
+  }
+  .callout.note { background: var(--navy-tint); border-left-color: var(--navy); }
+  .callout.tip { background: var(--brass-tint); border-left-color: var(--brass); }
+  .callout.warn { background: #FBEFEA; border-left-color: var(--danger); }
+  .callout .icon {
+    font-family: Georgia, serif;
+    font-style: italic;
+    font-size: 14pt;
+    color: var(--navy);
+    line-height: 1;
+    padding-top: 1mm;
+  }
+  .callout.tip .icon { color: var(--brass); }
+  .callout.warn .icon { color: var(--danger); }
+  .callout .body p { margin: 0 0 2mm; }
+  .callout .body p:last-child { margin-bottom: 0; }
+  .callout .label {
+    display: inline-block;
+    font-size: 8pt;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--navy);
+    font-weight: 700;
+    margin-right: 3mm;
+  }
+  .callout.tip .label { color: var(--brass); }
+  .callout.warn .label { color: var(--danger); }
+
+  /* ============================================================ tables */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 4mm 0 6mm;
+    font-size: 10.5pt;
+  }
+  th, td {
+    text-align: left;
+    padding: 3mm 4mm;
+    border-bottom: 0.4pt solid var(--rule);
+    vertical-align: top;
+  }
+  th {
+    background: var(--paper-2);
+    font-size: 8.5pt;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--navy);
+    font-weight: 700;
+    border-bottom: 0.8pt solid var(--navy-2);
+  }
+  tr:last-child td { border-bottom: none; }
+  td.mono { font-family: Consolas, monospace; font-size: 10pt; color: var(--navy-2); }
+  td.center, th.center { text-align: center; }
+
+  /* ============================================================ screen mock */
+  .screen {
+    margin: 5mm 0 6mm;
+    border: 0.6pt solid var(--rule-strong);
+    border-radius: 3px;
+    overflow: hidden;
+    background: white;
+  }
+  .screen .title-bar {
+    display: flex;
+    align-items: center;
+    gap: 3mm;
+    padding: 2mm 4mm;
+    background: linear-gradient(180deg, #EBEEEA, #DDE1DA);
+    border-bottom: 0.4pt solid var(--rule-strong);
+    font-size: 9pt;
+    color: var(--ink-muted);
+  }
+  .screen .title-bar .dots { display: flex; gap: 4px; }
+  .screen .title-bar .dots span { width: 8px; height: 8px; border-radius: 50%; background: var(--rule-strong); }
+  .screen .body {
+    padding: 5mm;
+    display: grid;
+    gap: 3mm;
+    color: var(--ink);
+    font-size: 10pt;
+  }
+  .screen .toolbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 2mm 3mm;
+    background: var(--paper-2);
+    border-radius: 2px;
+  }
+  .screen .toolbar .brand { font-weight: 700; color: var(--navy); }
+  .screen .toolbar .btn {
+    display: inline-block;
+    background: var(--navy);
+    color: white;
+    padding: 1.5mm 4mm;
+    border-radius: 2px;
+    font-size: 9pt;
+    letter-spacing: 0.05em;
+  }
+  .screen .caption {
+    display: block;
+    font-size: 9pt;
+    color: var(--ink-muted);
+    text-align: center;
+    padding: 2mm 4mm 3mm;
+    border-top: 0.4pt solid var(--rule);
+    background: var(--paper);
+    font-style: italic;
+  }
+
+  /* Field diagram — e.g. showing button locations */
+  .diagram {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 3mm;
+    margin: 4mm 0;
+  }
+  .diagram .cell {
+    padding: 4mm;
+    background: var(--paper-2);
+    border: 0.4pt solid var(--rule);
+    border-radius: 2px;
+  }
+  .diagram .cell .label {
+    font-size: 8pt;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--brass);
+    font-weight: 700;
+    margin-bottom: 2mm;
+  }
+  .diagram .cell .value {
+    font-family: Georgia, serif;
+    color: var(--navy);
+    font-size: 14pt;
+    line-height: 1.15;
+  }
+
+  /* Definition list */
+  dl { margin: 4mm 0; }
+  dt {
+    font-weight: 700;
+    color: var(--navy);
+    font-size: 10.5pt;
+    margin-top: 4mm;
+  }
+  dt:first-child { margin-top: 0; }
+  dd { margin: 1mm 0 0; padding-left: 6mm; color: var(--ink); font-size: 11pt; max-width: 62ch; }
+
+  /* ============================================================ role badges */
+  .role {
+    display: inline-block;
+    padding: 0.4mm 2.4mm;
+    border-radius: 999px;
+    font-size: 8pt;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    font-weight: 700;
+    vertical-align: middle;
+  }
+  .role.admin { background: var(--navy); color: white; }
+  .role.op { background: var(--navy-tint); color: var(--navy); }
+  .role.analyst { background: var(--brass-tint); color: var(--brass); }
+  .role.viewer { background: var(--paper-2); color: var(--ink-muted); }
+
+  /* ============================================================ print */
+  @media print {
+    a { color: var(--navy-2); border-bottom: none; }
+    .callout { break-inside: avoid; }
+    .screen { break-inside: avoid; }
+    .steps > li { break-inside: avoid; }
+    table { break-inside: auto; }
+    tr { break-inside: avoid; }
+    h2, h3 { break-after: avoid; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ================================================================== COVER -->
+<section class="page cover">
+  <img class="crest" src="data:image/png;base64,{{LOGO_B64}}" alt="PAK NAVY crest">
+  <div class="stamp">Pakistan Navy · Directorate of Media</div>
+  <div class="divider"></div>
+  <div class="who">Restricted · Operational Use</div>
+
+  <div class="title">Channel Monitoring<br>&amp; Clipping</div>
+  <div class="subtitle">Software Manual</div>
+  <div class="kicker">Broadcast intelligence platform for PAK NAVY operators &amp; analysts</div>
+  <div class="expanded">CMC · Version 1.0</div>
+
+  <div class="meta">
+    <div class="field">
+      <span class="label">Version</span>
+      <span class="value">1.0.0</span>
+    </div>
+    <div class="field">
+      <span class="label">Issued</span>
+      <span class="value">August 2026</span>
+    </div>
+    <div class="field">
+      <span class="label">Classification</span>
+      <span class="value">Internal</span>
+    </div>
+  </div>
+
+  <div class="footer">
+    <span>© 2026 — Prepared for the Pakistan Navy.</span>
+    <span class="analysys"><img src="data:image/png;base64,{{ANALYSYS_B64}}" alt="Powered by Analysys"></span>
+  </div>
+</section>
+
+<!-- ================================================================== TOC -->
+<section class="page">
+  <div class="eyebrow">Contents</div>
+  <h1>What's in this manual</h1>
+  <p class="lede">Everything you need to run CMC end-to-end — from your first sign-in
+  through building a broadcast-quality clip for evidence or briefing.
+  Chapters are grouped into six parts; each chapter opens on a fresh page.</p>
+
+  <ol class="toc-list">
+    <li class="toc-part">Part I · Getting started</li>
+    <li><span class="t">Introduction<small>What CMC does, who uses it, key concepts.</small></span><span class="p">p. 4</span></li>
+    <li><span class="t">Signing in<small>URL, credentials, first-launch behaviour.</small></span><span class="p">p. 6</span></li>
+    <li><span class="t">The interface<small>Layout of the app, navigation, common conventions.</small></span><span class="p">p. 8</span></li>
+
+    <li class="toc-part">Part II · Monitoring</li>
+    <li><span class="t">Dashboard<small>KPI tiles, live health heatmap, recent alerts.</small></span><span class="p">p. 10</span></li>
+    <li><span class="t">Channels<small>Browsing the channel list, source health, per-channel detail.</small></span><span class="p">p. 12</span></li>
+    <li><span class="t">The Video Wall<small>Installing and running CMC-VideoWall on the operator PC.</small></span><span class="p">p. 15</span></li>
+
+    <li class="toc-part">Part III · Recording &amp; clipping</li>
+    <li><span class="t">24×7 Recording<small>How recording works, storage layout, retention.</small></span><span class="p">p. 19</span></li>
+    <li><span class="t">Browsing recordings<small>Calendar, hourly strip, segment list, in-place playback.</small></span><span class="p">p. 21</span></li>
+    <li><span class="t">Downloading segments<small>Single-segment download and multi-segment stitching.</small></span><span class="p">p. 23</span></li>
+    <li><span class="t">Creating clips<small>Opening the NLE editor, in/out markers, watermark, export.</small></span><span class="p">p. 25</span></li>
+    <li><span class="t">Managing clips<small>Listing, previewing, downloading, deleting.</small></span><span class="p">p. 28</span></li>
+
+    <li class="toc-part">Part IV · Downloads</li>
+    <li><span class="t">Downloads panel<small>Getting the Video Wall installer and other assets.</small></span><span class="p">p. 30</span></li>
+
+    <li class="toc-part">Part V · Administration</li>
+    <li><span class="t">Users &amp; roles<small>Creating operator accounts, disabling access, roles.</small></span><span class="p">p. 31</span></li>
+    <li><span class="t">Audit log<small>Reviewing every state-changing action for accountability.</small></span><span class="p">p. 33</span></li>
+    <li><span class="t">Settings<small>Retention days, air-gap mode, system-wide policy.</small></span><span class="p">p. 34</span></li>
+    <li><span class="t">Legal holds<small>Locking specific windows from janitor deletion.</small></span><span class="p">p. 35</span></li>
+
+    <li class="toc-part">Part VI · Reference</li>
+    <li><span class="t">Troubleshooting<small>Symptoms, likely causes, first actions to take.</small></span><span class="p">p. 36</span></li>
+    <li><span class="t">Appendices<small>Keyboard shortcuts, URL reference, support contact.</small></span><span class="p">p. 38</span></li>
+  </ol>
+
+  <div class="running-footer">
+    <span class="doc-id">CMC-MAN-1.0 · Contents</span>
+    <span class="analysys"><img src="data:image/png;base64,{{ANALYSYS_B64}}" alt="Powered by Analysys"></span>
+  </div>
+</section>
+
+<!-- ================================================================== CH 1 -->
+<section class="page">
+  <div class="chapter-opener">
+    <div class="num">01</div>
+    <div class="heading">
+      <div class="part">Part I · Getting started</div>
+      <h1>Introduction</h1>
+      <div class="subtitle">What CMC is, who it serves, and the model behind the platform.</div>
+    </div>
+  </div>
+
+  <h2>What CMC does</h2>
+  <p><strong>Channel Monitoring &amp; Clipping (CMC)</strong> ingests every TV feed of interest
+  to the Pakistan Navy — currently thirty DGPR-approved news channels — off the satellite
+  UDP multicast, decodes them centrally, and makes them available three ways:</p>
+
+  <ul>
+    <li><strong>Live wall</strong> — every channel visible at once on the operations-room
+    wall via the <em>CMC-VideoWall</em> desktop viewer.</li>
+    <li><strong>Continuous recording</strong> — 24×7 storage of every channel on a
+    rolling 30-day window, indexed to the second, evidence-grade with per-segment
+    SHA-256 checksums.</li>
+    <li><strong>Clip creation</strong> — an NLE-style editor for cutting a specific
+    moment out of a recording, adding a burned-in watermark, and exporting the
+    result as an MP4 for briefings or evidence retention.</li>
+  </ul>
+
+  <h2>Who uses it</h2>
+  <p>CMC is designed for four operator profiles. Each has its own dashboard
+  posture, its own set of permissions, and its own workflow.</p>
+
+  <dl>
+    <dt><span class="role admin">Admin</span> &nbsp; System owner</dt>
+    <dd>Runs the platform. Manages users, keeps an eye on the audit log,
+    approves legal holds, changes retention policy. Typically the on-duty
+    NCO for IT.</dd>
+
+    <dt><span class="role op">Operator</span> &nbsp; Wall operator</dt>
+    <dd>Runs the video wall day-to-day, drops in on live feeds, kicks off
+    quick clip exports for the duty officer. Doesn't touch user accounts
+    or system settings.</dd>
+
+    <dt><span class="role analyst">Analyst</span> &nbsp; Content review</dt>
+    <dd>Spends most time in the Recordings and Clips sections — reviewing
+    past broadcasts, cutting the sequences of interest, exporting for
+    onward distribution.</dd>
+
+    <dt><span class="role viewer">Viewer</span> &nbsp; Read-only</dt>
+    <dd>Can browse recordings and clips but cannot download or export.
+    Assigned to auditors and to observers who need visibility without
+    the ability to move media off the platform.</dd>
+  </dl>
+
+  <h2>The model behind the platform</h2>
+  <p>Three concepts recur throughout the interface. Understanding them makes
+  everything else obvious.</p>
+
+  <div class="diagram">
+    <div class="cell">
+      <div class="label">Channel</div>
+      <div class="value">A logical TV network</div>
+    </div>
+    <div class="cell">
+      <div class="label">Source</div>
+      <div class="value">One physical UDP feed of that channel</div>
+    </div>
+    <div class="cell">
+      <div class="label">Segment</div>
+      <div class="value">A 60-second slice of recording</div>
+    </div>
+  </div>
+
+  <p>A channel like <em>Geo News</em> may have one <strong>source</strong> today and a backup
+  source added tomorrow — the channel is the operator's view, sources are how it
+  actually arrives. Recordings are always broken into 60-second <strong>segments</strong>
+  so the janitor can trim old material precisely and clip exports can start on any
+  even minute boundary.</p>
+
+  <div class="callout note">
+    <span class="icon">§</span>
+    <div class="body">
+      <span class="label">Note</span>
+      <p>CMC is a stripped-down deployment of the wider DEMP broadcast intelligence
+      platform, tailored for PAK NAVY's brief: monitor, record, clip. AI transcription,
+      ticker-OCR, and automatic source failover are all out of scope for this build.</p>
+    </div>
+  </div>
+
+  <div class="running-footer">
+    <span class="doc-id">CMC-MAN-1.0 · Ch. 1 · Introduction</span>
+    <span class="analysys"><img src="data:image/png;base64,{{ANALYSYS_B64}}" alt="Powered by Analysys"></span>
+  </div>
+</section>
+
+<!-- ================================================================== CH 2 -->
+<section class="page">
+  <div class="chapter-opener">
+    <div class="num">02</div>
+    <div class="heading">
+      <div class="part">Part I · Getting started</div>
+      <h1>Signing in</h1>
+      <div class="subtitle">How to reach the platform, sign in, and what happens on first launch.</div>
+    </div>
+  </div>
+
+  <h2>The address bar</h2>
+  <p>CMC is delivered as a web application. Open any modern browser (Chrome,
+  Edge, Firefox) and navigate to:</p>
+
+  <p><code>http://10.51.80.202:3001</code></p>
+
+  <p>The <code>10.51.80.202</code> host is the operations-room server on the
+  recording LAN. If you are on a machine attached to the storage network
+  instead of recording, use <code>http://172.16.205.21:3001</code> — both
+  point to the same server.</p>
+
+  <div class="callout tip">
+    <span class="icon">☞</span>
+    <div class="body">
+      <span class="label">Tip</span>
+      <p>Bookmark the URL on first visit. The dashboard is where every
+      workflow starts and you will return to it often.</p>
+    </div>
+  </div>
+
+  <h2>The sign-in screen</h2>
+  <p>The sign-in screen carries the PAK NAVY crest at the top of the form.
+  Enter your issued email and password.</p>
+
+  <div class="screen">
+    <div class="title-bar">
+      <span class="dots"><span></span><span></span><span></span></span>
+      <span>CMC · Sign in</span>
+    </div>
+    <div class="body">
+      <div style="display: flex; flex-direction: column; align-items: center; gap: 3mm; padding: 5mm 0;">
+        <div style="width: 24mm; height: 24mm; background: var(--navy-tint); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-family: Georgia, serif; color: var(--navy); font-size: 20pt;">⚓</div>
+        <div style="font-family: Georgia, serif; font-size: 14pt; color: var(--navy); font-weight: 700;">PAK NAVY</div>
+        <div style="font-size: 9pt; color: var(--ink-muted);">CMC · Channel Monitoring &amp; Clipping</div>
+      </div>
+      <div style="background: var(--paper); border: 0.4pt solid var(--rule); padding: 4mm; border-radius: 2px; display: grid; gap: 2mm;">
+        <div style="font-size: 8pt; color: var(--ink-muted); text-transform: uppercase; letter-spacing: 0.1em;">Email</div>
+        <div style="border: 0.4pt solid var(--rule); padding: 1.5mm 3mm; border-radius: 2px; background: white; color: var(--ink-muted); font-size: 9pt;">operator@navy.local</div>
+        <div style="font-size: 8pt; color: var(--ink-muted); text-transform: uppercase; letter-spacing: 0.1em;">Password</div>
+        <div style="border: 0.4pt solid var(--rule); padding: 1.5mm 3mm; border-radius: 2px; background: white; color: var(--ink-muted); font-size: 9pt;">••••••••••••</div>
+        <div style="background: var(--navy); color: white; text-align: center; padding: 2mm; border-radius: 2px; margin-top: 2mm; font-weight: 700; font-size: 10pt;">Sign in</div>
+      </div>
+    </div>
+    <span class="caption">Sign-in form. Credentials are issued by the Admin during onboarding.</span>
+  </div>
+
+  <h2>What happens on first sign-in</h2>
+  <ol class="steps">
+    <li><div class="body">
+      <p><strong>The dashboard opens.</strong> A short "welcome" toast in
+      the top-right corner confirms who you are signed in as.</p>
+    </div></li>
+    <li><div class="body">
+      <p><strong>Session persists.</strong> Your browser keeps the session
+      alive for eight hours. Close the tab, come back, no re-login required
+      inside that window.</p>
+    </div></li>
+    <li><div class="body">
+      <p><strong>Role determines what you see.</strong> An Analyst will see
+      the Recordings and Clips sections in the nav; a Viewer will see them
+      but download buttons will be hidden.</p>
+    </div></li>
+  </ol>
+
+  <div class="callout warn">
+    <span class="icon">!</span>
+    <div class="body">
+      <span class="label">Wrong credentials</span>
+      <p>The form shows "Wrong email or password" for a bad login, and
+      "Session expired — please sign in again" when a saved session
+      has timed out. The distinction matters: the first means retry
+      the password; the second usually means you left the tab open
+      overnight and Windows locked the session.</p>
+    </div>
+  </div>
+
+  <div class="running-footer">
+    <span class="doc-id">CMC-MAN-1.0 · Ch. 2 · Signing in</span>
+    <span class="analysys"><img src="data:image/png;base64,{{ANALYSYS_B64}}" alt="Powered by Analysys"></span>
+  </div>
+</section>
+
+<!-- ================================================================== CH 3 -->
+<section class="page">
+  <div class="chapter-opener">
+    <div class="num">03</div>
+    <div class="heading">
+      <div class="part">Part I · Getting started</div>
+      <h1>The interface</h1>
+      <div class="subtitle">A quick tour of the layout so every subsequent chapter has a common vocabulary.</div>
+    </div>
+  </div>
+
+  <h2>The top bar</h2>
+  <p>Every screen in CMC carries the same top bar. From left to right:</p>
+
+  <ul>
+    <li><strong>PAK NAVY crest &amp; wordmark</strong> — click to return to the dashboard.</li>
+    <li><strong>Section links</strong> — Dashboard, Channels, Recordings, Clips, Downloads, Admin.
+    Admin only appears for accounts with the <span class="role admin">Admin</span> role.</li>
+    <li><strong>Global search</strong> — type a channel name or clip title, jump straight to it.</li>
+    <li><strong>User menu</strong> — your email, role badge, Sign out.</li>
+  </ul>
+
+  <h2>Common patterns</h2>
+  <p>Wherever these appear, they behave the same way.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Element</th>
+        <th>Behaviour</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Green primary button</strong></td>
+        <td>Commits the current action (Sign in, Export clip, Add user). Only one primary button per screen.</td>
+      </tr>
+      <tr>
+        <td><strong>Outline secondary button</strong></td>
+        <td>Non-committing action (Cancel, Reset filters, Back). Always safe to click.</td>
+      </tr>
+      <tr>
+        <td><strong>Live dot</strong> · <span style="color: #22C55E">●</span></td>
+        <td>Green = channel is delivering packets; grey = channel is disabled or offline.</td>
+      </tr>
+      <tr>
+        <td><strong>Duration</strong> · <span class="mono" style="color: var(--navy-2)">01:42:07</span></td>
+        <td>Always <em>hours:minutes:seconds</em>. Times in the app are always the server's local time (PKT).</td>
+      </tr>
+      <tr>
+        <td><strong>Toast</strong> (top-right)</td>
+        <td>Confirms a save, warns of a failure, links to the affected record. Auto-dismisses in 6 s.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout note">
+    <span class="icon">§</span>
+    <div class="body">
+      <span class="label">Note</span>
+      <p>The interface is desktop-first — every screen is built for a
+      1920 × 1080 monitor. It works on a laptop but the recordings
+      calendar and clip editor really want the horizontal real estate.</p>
+    </div>
+  </div>
+
+  <div class="running-footer">
+    <span class="doc-id">CMC-MAN-1.0 · Ch. 3 · The interface</span>
+    <span class="analysys"><img src="data:image/png;base64,{{ANALYSYS_B64}}" alt="Powered by Analysys"></span>
+  </div>
+</section>
+
+<!-- ================================================================== CH 4 -->
+<section class="page">
+  <div class="chapter-opener">
+    <div class="num">04</div>
+    <div class="heading">
+      <div class="part">Part II · Monitoring</div>
+      <h1>Dashboard</h1>
+      <div class="subtitle">A single glance at how the platform is doing — and where to look if something is off.</div>
+    </div>
+  </div>
+
+  <h2>Four KPI tiles</h2>
+  <p>The top row summarises the last 24 hours at a glance. Numbers are
+  refreshed live every fifteen seconds — no reload required.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Tile</th>
+        <th>What it counts</th>
+        <th>When to worry</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Channels online</strong></td>
+        <td>Sources delivering packets right now.</td>
+        <td>Below <strong>28 of 30</strong> during business hours.</td>
+      </tr>
+      <tr>
+        <td><strong>Recordings 24 h</strong></td>
+        <td>New segments written in the last day.</td>
+        <td>Below <strong>~40,000</strong> across all channels.</td>
+      </tr>
+      <tr>
+        <td><strong>Disk usage</strong></td>
+        <td>Recording volume utilisation.</td>
+        <td>Above <strong>85%</strong> — call IT before it hits 95.</td>
+      </tr>
+      <tr>
+        <td><strong>Clips today</strong></td>
+        <td>Clips exported since midnight.</td>
+        <td>Rarely — this is an activity signal, not health.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Live health heatmap</h2>
+  <p>The heatmap below the KPI tiles shows every channel as a coloured square:
+  <span style="color: #22C55E">green</span> = live and healthy,
+  <span style="color: var(--brass)">amber</span> = degraded (packet loss),
+  <span style="color: var(--danger)">red</span> = down,
+  grey = disabled. Hover any square to see the channel name and its
+  current bitrate; click it to jump straight to the channel detail.</p>
+
+  <h2>Recent activity strip</h2>
+  <p>Two feeds sit side by side at the bottom of the dashboard:</p>
+  <ul>
+    <li><strong>Recent alerts</strong> — the last twenty alerts fired.
+    Currently limited to <em>source switch</em> events. Click any row to jump to the
+    affected channel with its state at that moment.</li>
+    <li><strong>Recent clips</strong> — the last twenty clip exports across
+    the platform, with the operator who exported and how long the source
+    was. Click any row to preview the clip.</li>
+  </ul>
+
+  <div class="callout tip">
+    <span class="icon">☞</span>
+    <div class="body">
+      <span class="label">Tip</span>
+      <p>The dashboard is where every duty handover starts. First action of every
+      shift: open the dashboard, check the four tiles are green, glance at the
+      heatmap for any red squares, brief the incoming operator.</p>
+    </div>
+  </div>
+
+  <div class="running-footer">
+    <span class="doc-id">CMC-MAN-1.0 · Ch. 4 · Dashboard</span>
+    <span class="analysys"><img src="data:image/png;base64,{{ANALYSYS_B64}}" alt="Powered by Analysys"></span>
+  </div>
+</section>
+
+<!-- ================================================================== CH 5 -->
+<section class="page">
+  <div class="chapter-opener">
+    <div class="num">05</div>
+    <div class="heading">
+      <div class="part">Part II · Monitoring</div>
+      <h1>Channels</h1>
+      <div class="subtitle">The full channel roster — configure, health-check, drill into any single feed.</div>
+    </div>
+  </div>
+
+  <h2>The channel list</h2>
+  <p>The Channels page shows every configured channel — logo, name, category,
+  language, live health, current signal, and whether recording is enabled.
+  Sortable and filterable by category or language.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Column</th>
+        <th>Explanation</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>Channel</strong></td><td>The channel logo (upload from the detail page) alongside its display name and slug.</td></tr>
+      <tr><td><strong>Category</strong></td><td>Editorial category (News, Sports, Entertainment). Set by the Admin.</td></tr>
+      <tr><td><strong>Lang</strong></td><td>Primary language of the feed. Used by the search and by the language filter.</td></tr>
+      <tr><td><strong>Health</strong></td><td>A rolling 60-second bar. Green ticks = healthy; amber = degraded; red = dropped.</td></tr>
+      <tr><td><strong>Signal</strong></td><td>The current one-word verdict — LIVE, DEGRADED, OFFLINE, DISABLED.</td></tr>
+      <tr><td><strong>Recording</strong></td><td>Green pill = recorder is writing segments right now; grey = paused or disabled.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Channel detail</h2>
+  <p>Click any channel row to open its detail drawer. The detail view shows:</p>
+
+  <h3>Overview</h3>
+  <p>Logo, name, category, language, current signal, and disk usage for this
+  channel over the last day. A small <em>Upload logo</em> control at the top
+  lets an Admin drop in a PNG or JPG that will then appear everywhere this
+  channel is shown across the platform.</p>
+
+  <h3>Recording status</h3>
+  <p>A live badge shows whether the recorder is writing this channel right
+  now, alongside the size of the last hour's segments and the timestamp of
+  the most recent write. If recording has stalled, this is the first
+  place the anomaly shows.</p>
+
+  <div class="callout note">
+    <span class="icon">§</span>
+    <div class="body">
+      <span class="label">Channel configuration is pre-provisioned</span>
+      <p>The list of channels and their underlying inputs is
+      pre-provisioned in the backend during platform deployment.
+      Operators, Analysts and Admins view the roster and health
+      through this page but the roster itself doesn't change from
+      inside the web app.</p>
+    </div>
+  </div>
+
+  <div class="running-footer">
+    <span class="doc-id">CMC-MAN-1.0 · Ch. 5 · Channels</span>
+    <span class="analysys"><img src="data:image/png;base64,{{ANALYSYS_B64}}" alt="Powered by Analysys"></span>
+  </div>
+</section>
+
+<!-- ================================================================== CH 6 -->
+<section class="page">
+  <div class="chapter-opener">
+    <div class="num">06</div>
+    <div class="heading">
+      <div class="part">Part II · Monitoring</div>
+      <h1>The Video Wall</h1>
+      <div class="subtitle">CMC-VideoWall — the desktop client that drives the physical operations-room wall.</div>
+    </div>
+  </div>
+
+  <p>The video wall is the physical display in the operations room — eight monitors
+  in a 4×2 grid, driven from a single Windows workstation. That workstation runs
+  <strong>CMC-VideoWall.exe</strong>, a native desktop client that:</p>
+  <ul>
+    <li>Signs in against the same server as the web app.</li>
+    <li>Joins the satellite UDP multicast for every channel directly, bypassing the server.</li>
+    <li>Composes them into one of four fixed layouts.</li>
+    <li>Runs on a stripped, portable Rust / GStreamer stack — no install, no admin.</li>
+  </ul>
+
+  <h2>Installing on the wall PC</h2>
+  <ol class="steps">
+    <li><div class="body">
+      <p>Sign into CMC on any browser. Go to
+      <strong>Downloads → CMC-VideoWall.zip</strong> and download it (≈ 45 MB).</p>
+    </div></li>
+    <li><div class="body">
+      <p>Copy the ZIP onto the wall PC. Extract it anywhere on a local drive —
+      <span class="path">C:\CMC-VideoWall\</span> is the convention, but the folder
+      is fully relocatable so a USB stick works too.</p>
+    </div></li>
+    <li><div class="body">
+      <p>Double-click <code>CMC-VideoWall.cmd</code>. The first launch opens the
+      sign-in dialog. Enter your CMC credentials and the API address of the
+      server (<code>http://10.51.80.202:4001</code>). The tool remembers you
+      on every subsequent launch.</p>
+    </div></li>
+  </ol>
+
+  <div class="callout tip">
+    <span class="icon">☞</span>
+    <div class="body">
+      <span class="label">Multicast NIC</span>
+      <p>If the wall PC has more than one network card (typical: one for LAN, one
+      for the recording network), fill in the <em>Multicast NIC IP</em> field
+      with the interface that sees the satellite feeds — usually
+      <code>10.51.80.x</code>. Leaving it blank lets Windows pick, which
+      sometimes picks the wrong card and no channels appear.</p>
+    </div>
+  </div>
+
+  <h2>The main window</h2>
+  <p>Once signed in, the app shows a preview of the wall in a normal window.
+  From left to right along the top:</p>
+  <ul>
+    <li><strong>Layout picker</strong> — dropdown with the four available layouts
+    (Single, Dual, Mosaic-20, Grid-32). Switching layout is instant.</li>
+    <li><strong>Refresh</strong> — re-pull the channel list from the server (use
+    this after Admin adds a new channel).</li>
+    <li><strong>Auto-fill</strong> — checkbox. When on, any empty slot on the
+    wall is filled by cycling through unassigned channels. Turn off if you want
+    empty slots to stay empty.</li>
+    <li><strong>Logout</strong> — sign out and return to the login dialog.</li>
+    <li><strong>Start Fullscreen</strong> — the big green button. Opens the wall
+    as a borderless fullscreen window filling the whole desktop (which the
+    wall's video splitter feeds to the eight physical monitors).</li>
+  </ul>
+
+  <p>The right-hand panel is the <em>channel picker</em>: every channel with its
+  logo, name, and a green / grey dot for online status. The centre is the
+  <em>wall preview</em>: coloured tiles laid out in the current layout, each
+  showing the channel logo and name (or "Slot N" when empty).</p>
+
+  <h2>Placing channels on the wall</h2>
+  <ol class="steps">
+    <li><div class="body"><p>Click a channel on the right-hand panel — it highlights.</p></div></li>
+    <li><div class="body"><p>Click a slot on the preview — the channel binds there and its logo appears in that slot.</p></div></li>
+    <li><div class="body"><p>Repeat for other channels / slots. Assignments save automatically to your local profile.</p></div></li>
+    <li><div class="body"><p>Right-click any slot for a menu: <em>Fill mode</em> (Stretch / Crop-fill / Fit) and <em>Clear slot</em>.</p></div></li>
+  </ol>
+
+  <h2>Fullscreen playback</h2>
+  <p>Press <span class="kbd">F11</span> or click <strong>Start Fullscreen</strong>.
+  A borderless window opens covering the entire desktop, and every assigned slot
+  starts playing its channel. Empty slots stay black unless <em>Auto-fill</em>
+  is on, in which case they're populated automatically.</p>
+
+  <p>Press <span class="kbd">Esc</span> or <span class="kbd">F11</span> again in
+  the fullscreen window to return to the preview.</p>
+
+  <div class="callout warn">
+    <span class="icon">!</span>
+    <div class="body">
+      <span class="label">Grid-32 sizing</span>
+      <p>Grid-32 puts 32 concurrent 1080p decoders on the wall PC. On the
+      operations-room workstation (10th-gen Intel with iGPU) this runs
+      comfortably. On a laptop or via RDP the CPU may saturate — stick
+      to Mosaic (20 tiles) for those environments.</p>
+    </div>
+  </div>
+
+  <div class="running-footer">
+    <span class="doc-id">CMC-MAN-1.0 · Ch. 6 · Video Wall</span>
+    <span class="analysys"><img src="data:image/png;base64,{{ANALYSYS_B64}}" alt="Powered by Analysys"></span>
+  </div>
+</section>
+
+<!-- ================================================================== CH 7 -->
+<section class="page">
+  <div class="chapter-opener">
+    <div class="num">07</div>
+    <div class="heading">
+      <div class="part">Part III · Recording &amp; clipping</div>
+      <h1>24×7 Recording</h1>
+      <div class="subtitle">How recording actually works underneath, so you know exactly what's on disk.</div>
+    </div>
+  </div>
+
+  <h2>What gets recorded</h2>
+  <p>Every channel with <em>Recording enabled</em> in its configuration is
+  recorded continuously — 24 hours a day, 7 days a week, regardless of whether
+  anyone is looking. The recorder runs as a server-side service; nothing on the
+  operator PC is involved.</p>
+
+  <h2>How it's stored</h2>
+  <p>The recorder chops each channel's live stream into <strong>60-second
+  MP4 segments</strong>. Each segment is written to disk as soon as its 60
+  seconds are over, then hashed with SHA-256 and indexed in the database.</p>
+
+  <p>On disk, segments live under a strict path structure so a human can
+  navigate them without the app:</p>
+
+  <p><code>/data/recordings/{channelId}/{yyyy}/{mm}/{dd}/{hh}/{mm}.mp4</code></p>
+
+  <p>Alongside each <code>.mp4</code> sits a <code>.sha256</code> sidecar with
+  the checksum, and once an hour the segments are grouped into a signed
+  <em>manifest</em> — this is the chain-of-custody artefact evidence
+  reviewers ask for.</p>
+
+  <h2>Retention</h2>
+  <p>A <strong>janitor</strong> service runs every night at 02:00 PKT. It
+  deletes any segment older than the configured retention window
+  (default: <strong>30 days</strong>) UNLESS a legal hold covers that channel's
+  time window — see <a href="#chapter-legal-holds">Legal holds</a>.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Metric</th>
+        <th>Value</th>
+        <th>Notes</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>Retention window</td><td>30 days</td><td>Fixed policy — cannot be increased or decreased from the app.</td></tr>
+      <tr><td>Segment length</td><td>60 seconds</td><td>Enforced platform-wide.</td></tr>
+      <tr><td>Storage bitrate</td><td>~2 Mbps per channel</td><td>Source dependent (satellite feed).</td></tr>
+      <tr><td>Daily volume</td><td>~21 GB / channel / day</td><td>Derived from the above.</td></tr>
+      <tr><td>Storage per channel · 30 d</td><td>~630 GB</td><td>Sizing target the platform is provisioned for.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout note">
+    <span class="icon">§</span>
+    <div class="body">
+      <span class="label">Retention is fixed at 30 days</span>
+      <p>The 30-day rolling window is a platform-wide policy. It is not
+      exposed as an operator-editable setting because storage sizing is
+      calibrated to exactly that window. To keep material beyond 30 days,
+      place a <em>legal hold</em> (Chapter 16) or export a clip (Chapter 10).</p>
+    </div>
+  </div>
+
+  <div class="running-footer">
+    <span class="doc-id">CMC-MAN-1.0 · Ch. 7 · Recording</span>
+    <span class="analysys"><img src="data:image/png;base64,{{ANALYSYS_B64}}" alt="Powered by Analysys"></span>
+  </div>
+</section>
+
+<!-- ================================================================== CH 8 -->
+<section class="page">
+  <div class="chapter-opener">
+    <div class="num">08</div>
+    <div class="heading">
+      <div class="part">Part III · Recording &amp; clipping</div>
+      <h1>Browsing recordings</h1>
+      <div class="subtitle">Finding the specific broadcast you need — from a month's worth of tape down to the second.</div>
+    </div>
+  </div>
+
+  <h2>Three-step drill-down</h2>
+  <p>The Recordings page is designed to be drilled in three clicks:
+  channel → day → hour → the specific minute you care about.</p>
+
+  <ol class="steps">
+    <li><div class="body">
+      <p><strong>Pick a channel.</strong> A dropdown at the top of the Recordings
+      page lists every channel with recording enabled. Type-ahead search makes
+      the pick fast even with thirty channels.</p>
+    </div></li>
+    <li><div class="body">
+      <p><strong>Pick a day.</strong> A month calendar appears. Days with recorded
+      content are highlighted; days with no recording (channel was down, or beyond
+      retention) are greyed out. Click any highlighted day.</p>
+    </div></li>
+    <li><div class="body">
+      <p><strong>Pick an hour.</strong> A horizontal 24-hour strip appears below
+      the calendar, each hour shown as a bar. The bar's height indicates how many
+      minutes in that hour actually recorded (60 = a perfect hour, less = there
+      were gaps). Hover to see a thumbnail; click to open that hour's segment list.</p>
+    </div></li>
+    <li><div class="body">
+      <p><strong>Play a segment.</strong> The segment list is a scrollable table
+      of every 60-second segment in that hour. Click one and an inline player
+      opens showing that segment with a scrubber. Use the transport controls or
+      the keyboard shortcuts (<span class="kbd">J</span> back, <span class="kbd">K</span>
+      pause, <span class="kbd">L</span> forward, <span class="kbd">Space</span> toggle).</p>
+    </div></li>
+  </ol>
+
+  <h2>Segment metadata</h2>
+  <p>Every row in the segment list shows:</p>
+  <ul>
+    <li><strong>Time</strong> — the start-of-segment in HH:MM:SS (PKT).</li>
+    <li><strong>Duration</strong> — normally 60 s, occasionally shorter if the
+    source dropped mid-segment.</li>
+    <li><strong>Size</strong> — how many megabytes the segment occupies on disk.</li>
+    <li><strong>SHA-256</strong> — evidence-chain checksum. Click to copy.</li>
+    <li><strong>Actions</strong> — Preview · Download · Send to clip editor.</li>
+  </ul>
+
+  <div class="callout tip">
+    <span class="icon">☞</span>
+    <div class="body">
+      <span class="label">Save time with search</span>
+      <p>Use the top-of-page search box to jump to a specific date + channel
+      directly. Format is <code>{channel} {yyyy-mm-dd}</code>, e.g.
+      <code>geo-news 2026-08-04</code>. The Recordings page will land you
+      straight on that day's hour strip.</p>
+    </div>
+  </div>
+
+  <div class="running-footer">
+    <span class="doc-id">CMC-MAN-1.0 · Ch. 8 · Browsing recordings</span>
+    <span class="analysys"><img src="data:image/png;base64,{{ANALYSYS_B64}}" alt="Powered by Analysys"></span>
+  </div>
+</section>
+
+<!-- ================================================================== CH 9 -->
+<section class="page">
+  <div class="chapter-opener">
+    <div class="num">09</div>
+    <div class="heading">
+      <div class="part">Part III · Recording &amp; clipping</div>
+      <h1>Downloading segments</h1>
+      <div class="subtitle">Pulling raw recording material off the platform for archival, evidence, or downstream editing.</div>
+    </div>
+  </div>
+
+  <h2>One segment</h2>
+  <p>The simplest case: you need the raw MP4 for one specific minute.</p>
+  <ol class="steps">
+    <li><div class="body"><p>Drill down to the segment (Recordings → channel → day → hour).</p></div></li>
+    <li><div class="body"><p>Hit the <strong>Download</strong> action in that segment's row.</p></div></li>
+    <li><div class="body"><p>A signed URL is generated and the browser starts the download. Filename convention: <code>{channel}_{yyyy-mm-dd}_{HHMMSS}.mp4</code>.</p></div></li>
+    <li><div class="body"><p>Verify the download by comparing its SHA-256 to the one shown in the segment row.</p></div></li>
+  </ol>
+
+  <h2>A range of segments</h2>
+  <p>Frequently you want a longer chunk — say, an hour of coverage. CMC
+  will stitch adjacent segments server-side and hand you a single MP4.</p>
+  <ol class="steps">
+    <li><div class="body"><p>Tick the checkbox on each segment you want, or drag
+    the range across the segment list.</p></div></li>
+    <li><div class="body"><p>The floating <em>Bulk actions</em> bar appears at
+    the bottom of the page.</p></div></li>
+    <li><div class="body"><p>Click <strong>Download stitched</strong>. The
+    server concatenates the selected segments (they must be contiguous)
+    and streams the merged MP4 as one download.</p></div></li>
+    <li><div class="body"><p>The stitched file's filename encodes the start and
+    end times: <code>{channel}_{yyyy-mm-dd}_{HHMMSS}-{HHMMSS}.mp4</code>.</p></div></li>
+  </ol>
+
+  <div class="callout warn">
+    <span class="icon">!</span>
+    <div class="body">
+      <span class="label">Viewer role restriction</span>
+      <p>The Download and Bulk-download actions are hidden entirely for
+      the <span class="role viewer">Viewer</span> role. Viewers can preview
+      segments but cannot move media off the platform. If a Viewer needs a
+      copy, an Analyst or Admin has to do the download.</p>
+    </div>
+  </div>
+
+  <div class="callout note">
+    <span class="icon">§</span>
+    <div class="body">
+      <span class="label">Evidence chain</span>
+      <p>Every download is written to the audit log with the timestamp, the
+      operator, the segments involved, and the file's SHA-256. When a copy
+      of a CMC recording is submitted as evidence, the audit log entry is
+      how you prove chain-of-custody.</p>
+    </div>
+  </div>
+
+  <div class="running-footer">
+    <span class="doc-id">CMC-MAN-1.0 · Ch. 9 · Downloading segments</span>
+    <span class="analysys"><img src="data:image/png;base64,{{ANALYSYS_B64}}" alt="Powered by Analysys"></span>
+  </div>
+</section>
+
+<!-- ================================================================== CH 10 -->
+<section class="page">
+  <div class="chapter-opener">
+    <div class="num">10</div>
+    <div class="heading">
+      <div class="part">Part III · Recording &amp; clipping</div>
+      <h1>Creating clips</h1>
+      <div class="subtitle">The NLE editor — cut a precise moment out of a recording, brand it, export it.</div>
+    </div>
+  </div>
+
+  <p>A <em>clip</em> is a purpose-built cut of a recording, exported as a
+  standalone MP4 for briefings, evidence submissions, or press replies. The
+  clip editor is patterned after professional NLE (non-linear editor) tools —
+  keyboard-driven, precise to the frame.</p>
+
+  <h2>Opening the editor</h2>
+  <p>There are three ways to open the editor with source material loaded:</p>
+  <ul>
+    <li><strong>From a segment row</strong> — hit the "Send to clip editor"
+    action. The editor opens with that segment on the timeline.</li>
+    <li><strong>From a stitched selection</strong> — pick a range of segments,
+    hit <strong>Create clip from selection</strong>. The editor opens with
+    that whole range on the timeline.</li>
+    <li><strong>From scratch</strong> — click <strong>Clips → New clip</strong>
+    in the top nav. A dialog asks for the channel and time range; the editor
+    opens on that material.</li>
+  </ul>
+
+  <h2>The editor layout</h2>
+  <p>Two panels side by side:</p>
+  <ul>
+    <li><strong>Source</strong> (left) — the raw material with its own
+    playhead. This is what you scrub through to find the exact in and out
+    points.</li>
+    <li><strong>Program</strong> (right) — the current cut with the
+    watermark composited on. This is what the exported MP4 will look like.</li>
+  </ul>
+
+  <p>Below both is the <strong>timeline</strong>: a horizontal ruler with a
+  waveform showing the audio envelope, the current in/out markers as coloured
+  bars, and a playhead you can drag with the mouse or step with the keyboard.</p>
+
+  <h2>The clip workflow</h2>
+  <ol class="steps">
+    <li><div class="body">
+      <p><strong>Find your in point.</strong> Scrub the source until the
+      playhead sits on the frame that should START the clip. Press
+      <span class="kbd">I</span>. The in-marker snaps to the playhead.</p>
+    </div></li>
+    <li><div class="body">
+      <p><strong>Find your out point.</strong> Scrub forward to the frame
+      that should END the clip. Press <span class="kbd">O</span>. The
+      out-marker snaps to the playhead.</p>
+    </div></li>
+    <li><div class="body">
+      <p><strong>Preview.</strong> Press <span class="kbd">Space</span> in
+      the Program panel. Playback loops between the in and out markers.
+      Adjust with <span class="kbd">I</span>/<span class="kbd">O</span> as many
+      times as you like.</p>
+    </div></li>
+    <li><div class="body">
+      <p><strong>Fill in the metadata.</strong> The right sidebar asks for a
+      title (required), notes (optional but recommended), and confirms your
+      watermark. The watermark defaults to your CMC email + the current
+      timestamp; the field is editable if you need a different tag.</p>
+    </div></li>
+    <li><div class="body">
+      <p><strong>Pick format &amp; resolution.</strong> Dropdown lets you
+      choose between MP4 at 1080p, 720p, or 480p. 720p is the sensible
+      default — small enough to email, still crisp on a laptop screen.</p>
+    </div></li>
+    <li><div class="body">
+      <p><strong>Click Export.</strong> A toast confirms the export has queued
+      and shows a progress bar. Depending on length the export takes 5–30
+      seconds; you can keep working elsewhere in CMC while it runs.</p>
+    </div></li>
+    <li><div class="body">
+      <p><strong>The clip appears in Clips → Recent.</strong> A toast link
+      jumps you straight to it, ready to preview or download.</p>
+    </div></li>
+  </ol>
+
+  <h2>Transport shortcuts</h2>
+  <table>
+    <thead>
+      <tr>
+        <th style="width: 30mm">Shortcut</th>
+        <th>Action</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td><span class="kbd">Space</span></td><td>Play / pause in the focused panel.</td></tr>
+      <tr><td><span class="kbd">J</span></td><td>Reverse playback (repeat presses accelerate).</td></tr>
+      <tr><td><span class="kbd">K</span></td><td>Pause.</td></tr>
+      <tr><td><span class="kbd">L</span></td><td>Forward playback (repeat presses accelerate).</td></tr>
+      <tr><td><span class="kbd">I</span></td><td>Set in point at the current playhead.</td></tr>
+      <tr><td><span class="kbd">O</span></td><td>Set out point at the current playhead.</td></tr>
+      <tr><td><span class="kbd">←</span> / <span class="kbd">→</span></td><td>Step one frame back / forward.</td></tr>
+      <tr><td><span class="kbd">Shift</span>+<span class="kbd">←</span> / <span class="kbd">→</span></td><td>Step one second back / forward.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout tip">
+    <span class="icon">☞</span>
+    <div class="body">
+      <span class="label">Watermark is non-optional</span>
+      <p>Every exported clip carries a burned-in watermark in the bottom-right
+      corner — your CMC email plus the export timestamp. This is deliberate:
+      it makes casual re-sharing traceable. There is no way to disable it
+      from the editor.</p>
+    </div>
+  </div>
+
+  <div class="running-footer">
+    <span class="doc-id">CMC-MAN-1.0 · Ch. 10 · Creating clips</span>
+    <span class="analysys"><img src="data:image/png;base64,{{ANALYSYS_B64}}" alt="Powered by Analysys"></span>
+  </div>
+</section>
+
+<!-- ================================================================== CH 11 -->
+<section class="page">
+  <div class="chapter-opener">
+    <div class="num">11</div>
+    <div class="heading">
+      <div class="part">Part III · Recording &amp; clipping</div>
+      <h1>Managing clips</h1>
+      <div class="subtitle">Finding, previewing, downloading, and (with permission) removing exported clips.</div>
+    </div>
+  </div>
+
+  <h2>The clips list</h2>
+  <p>The Clips page lists every clip on the platform, newest first. Each row
+  shows the title, channel it came from, the covered time range, its duration,
+  who exported it, and the export timestamp.</p>
+
+  <p>Filters along the top:</p>
+  <ul>
+    <li><strong>By channel</strong> — narrow to one channel.</li>
+    <li><strong>By operator</strong> — narrow to clips exported by a specific person.</li>
+    <li><strong>By date</strong> — clips exported in a specific window.</li>
+    <li><strong>Full-text search</strong> — matches title AND notes.</li>
+  </ul>
+
+  <h2>Clip actions</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Action</th>
+        <th>Who can do it</th>
+        <th>What it does</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Preview</strong></td>
+        <td><span class="role viewer">Viewer</span>+</td>
+        <td>Opens an inline player. No download; strictly for review.</td>
+      </tr>
+      <tr>
+        <td><strong>Download</strong></td>
+        <td><span class="role analyst">Analyst</span>+</td>
+        <td>Downloads the MP4 to your machine. Logged in the audit trail.</td>
+      </tr>
+      <tr>
+        <td><strong>Copy link</strong></td>
+        <td><span class="role analyst">Analyst</span>+</td>
+        <td>Puts a signed, time-limited URL on your clipboard. Valid for one hour.</td>
+      </tr>
+      <tr>
+        <td><strong>Delete</strong></td>
+        <td><span class="role admin">Admin</span></td>
+        <td>Removes the clip and its MP4 from disk. Cannot be undone.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Copy-link workflow — for evidence handover</h2>
+  <p>Rather than emailing an MP4 attachment (which many mail relays strip),
+  the <em>Copy link</em> action generates a short-lived URL that anyone with
+  the link can use to download the clip.</p>
+
+  <ol class="steps">
+    <li><div class="body"><p>Find the clip in the list.</p></div></li>
+    <li><div class="body"><p>Click <strong>Copy link</strong>. A toast confirms the URL is on your clipboard and shows its expiry.</p></div></li>
+    <li><div class="body"><p>Paste into your handover email. Recipient clicks it, browser downloads the MP4.</p></div></li>
+    <li><div class="body"><p>After the expiry (default one hour), the URL stops working. The clip itself remains on the platform.</p></div></li>
+  </ol>
+
+  <div class="callout warn">
+    <span class="icon">!</span>
+    <div class="body">
+      <span class="label">Delete is irrecoverable</span>
+      <p>There is no trash. Once an Admin deletes a clip, both the row and
+      the underlying MP4 are gone. If you need to keep a clip beyond
+      retention, place a <em>legal hold</em> on the covering window (see
+      Chapter 16) — that prevents both janitor deletion and manual delete.</p>
+    </div>
+  </div>
+
+  <div class="running-footer">
+    <span class="doc-id">CMC-MAN-1.0 · Ch. 11 · Managing clips</span>
+    <span class="analysys"><img src="data:image/png;base64,{{ANALYSYS_B64}}" alt="Powered by Analysys"></span>
+  </div>
+</section>
+
+<!-- ================================================================== CH 12 -->
+<section class="page">
+  <div class="chapter-opener">
+    <div class="num">12</div>
+    <div class="heading">
+      <div class="part">Part IV · Downloads</div>
+      <h1>Downloads panel</h1>
+      <div class="subtitle">The single spot to fetch official CMC assets — installer, launcher, docs.</div>
+    </div>
+  </div>
+
+  <p>The <strong>Downloads</strong> page is a small central library of the assets
+  operators need but that don't fit anywhere else in the app.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Asset</th>
+        <th>What it is</th>
+        <th>Size</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>CMC-VideoWall.zip</strong></td>
+        <td>The desktop video-wall client, portable folder — no install needed.</td>
+        <td>≈ 45 MB</td>
+      </tr>
+      <tr>
+        <td><strong>Software Manual (this document)</strong></td>
+        <td>Latest revision of the operator manual, PDF.</td>
+        <td>≈ 3 MB</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>How a new build reaches the operator</h2>
+  <p>When Analysys ships a revised CMC-VideoWall build it is uploaded to
+  the Downloads folder on the server and becomes available to every
+  operator immediately — nothing to re-run on the server.</p>
+
+  <ol class="steps">
+    <li><div class="body"><p>The new ZIP replaces the previous one at <code>D:\cmc\downloads\CMC-VideoWall.zip</code>.</p></div></li>
+    <li><div class="body"><p>The Downloads page auto-serves whatever is at that path — the operator sees the fresh file on the next visit.</p></div></li>
+    <li><div class="body"><p>Operators download the new ZIP and extract it, replacing their local folder. Saved wall assignments and preferences carry across because those live in <code>%APPDATA%\CMC-VideoWall\</code>, not in the app folder.</p></div></li>
+  </ol>
+
+  <div class="running-footer">
+    <span class="doc-id">CMC-MAN-1.0 · Ch. 12 · Downloads</span>
+    <span class="analysys"><img src="data:image/png;base64,{{ANALYSYS_B64}}" alt="Powered by Analysys"></span>
+  </div>
+</section>
+
+<!-- ================================================================== CH 13 -->
+<section class="page">
+  <div class="chapter-opener">
+    <div class="num">13</div>
+    <div class="heading">
+      <div class="part">Part V · Administration</div>
+      <h1>Users &amp; roles</h1>
+      <div class="subtitle">Creating operator accounts, controlling what each account can do, revoking access cleanly.</div>
+    </div>
+  </div>
+
+  <h2>The user roster</h2>
+  <p>Admin → Users. A table of every account, showing email, display name,
+  role, last-sign-in timestamp, and status (active / disabled). Sortable
+  and searchable.</p>
+
+  <h2>Creating an account</h2>
+  <ol class="steps">
+    <li><div class="body"><p>Click <strong>Add user</strong>. A dialog opens.</p></div></li>
+    <li><div class="body"><p>Fill in email (must be unique platform-wide), display name (what the user will see in their menu), and an initial password.</p></div></li>
+    <li><div class="body"><p>Pick a role — <span class="role admin">Admin</span> / <span class="role op">Operator</span> / <span class="role analyst">Analyst</span> / <span class="role viewer">Viewer</span>. See Chapter 1 for the role model.</p></div></li>
+    <li><div class="body"><p>Click <strong>Create</strong>. The account is active immediately; hand the credentials over via a secure channel (voice, physically-handed print, encrypted chat) — not plain email.</p></div></li>
+  </ol>
+
+  <h2>Disabling access</h2>
+  <p>When someone leaves the duty roster, <em>don't delete</em> — <em>disable</em>.
+  Deleting removes the audit-log linkage; disabling keeps history intact
+  while immediately terminating access.</p>
+
+  <ol class="steps">
+    <li><div class="body"><p>Find the user in the roster.</p></div></li>
+    <li><div class="body"><p>Click the <strong>Disable</strong> icon in their row (a padlock).</p></div></li>
+    <li><div class="body"><p>Confirm the dialog. All active sessions for that account are killed within 60 seconds. The row moves to the "Disabled" section and greys out.</p></div></li>
+    <li><div class="body"><p>To re-enable later, click the padlock again.</p></div></li>
+  </ol>
+
+  <h2>Passwords &amp; MFA</h2>
+  <p>The current build uses email + password only. MFA is on the roadmap for
+  a subsequent release. In the meantime:</p>
+  <ul>
+    <li>Passwords must be at least 12 characters with mixed case and a digit.</li>
+    <li>Password re-use is not enforced by the platform — enforce operationally.</li>
+    <li>An account is auto-locked after five consecutive failed sign-ins; Admin has to explicitly unlock.</li>
+  </ul>
+
+  <div class="callout note">
+    <span class="icon">§</span>
+    <div class="body">
+      <span class="label">Password reset</span>
+      <p>A forgotten-password self-service flow is deliberately absent —
+      resets go through the Admin so there's an accountable human in
+      the loop. Admin sets a new temporary password from the user
+      detail page and hands it over out-of-band.</p>
+    </div>
+  </div>
+
+  <div class="running-footer">
+    <span class="doc-id">CMC-MAN-1.0 · Ch. 13 · Users</span>
+    <span class="analysys"><img src="data:image/png;base64,{{ANALYSYS_B64}}" alt="Powered by Analysys"></span>
+  </div>
+</section>
+
+<!-- ================================================================== CH 14 -->
+<section class="page">
+  <div class="chapter-opener">
+    <div class="num">14</div>
+    <div class="heading">
+      <div class="part">Part V · Administration</div>
+      <h1>Audit log</h1>
+      <div class="subtitle">Every state-changing action, immutable, forever — the accountability spine of the platform.</div>
+    </div>
+  </div>
+
+  <p>Every action in CMC that CHANGES state — a login, a source added, a clip
+  exported, a segment downloaded, a user disabled — is written to the
+  <strong>audit log</strong> as an immutable record. Reads (browsing recordings,
+  previewing a clip) are not logged; only writes and access to media.</p>
+
+  <h2>What each entry contains</h2>
+  <ul>
+    <li>Timestamp (PKT, second-precision).</li>
+    <li>Actor (the user who performed the action).</li>
+    <li>Actor's role at the time (in case they've since been changed).</li>
+    <li>Action verb (<code>SIGN_IN</code>, <code>CLIP_EXPORT</code>, <code>SEGMENT_DOWNLOAD</code>, …).</li>
+    <li>Entity type + ID the action targeted.</li>
+    <li>Diff — for updates, the before/after values.</li>
+    <li>IP address of the client.</li>
+  </ul>
+
+  <h2>Browsing the log</h2>
+  <p>Admin → Audit log. A reverse-chronological table. Filter down the volume
+  quickly with:</p>
+  <ul>
+    <li>Time range picker — last hour, last day, last week, custom.</li>
+    <li>Actor — pick one user or a group.</li>
+    <li>Action verb — pick from a dropdown.</li>
+    <li>Entity type — pick "Channel", "Clip", "User", "Segment", "Setting".</li>
+    <li>Free-text search across all fields.</li>
+  </ul>
+
+  <h2>Exporting the log</h2>
+  <p>Click <strong>Export current view</strong> to download the filtered result
+  set as a CSV. Useful for compliance handovers or post-incident write-ups.</p>
+
+  <div class="callout warn">
+    <span class="icon">!</span>
+    <div class="body">
+      <span class="label">Immutability</span>
+      <p>There is no interface anywhere in CMC to edit or delete an audit
+      log entry. Entries can be exported and archived but never modified,
+      which is what makes them useable as evidence. If you find a mistake
+      in a log entry (unusual — most errors are actor mistakes at the time,
+      not log corruption) file it as an incident, don't try to patch it.</p>
+    </div>
+  </div>
+
+  <div class="running-footer">
+    <span class="doc-id">CMC-MAN-1.0 · Ch. 14 · Audit log</span>
+    <span class="analysys"><img src="data:image/png;base64,{{ANALYSYS_B64}}" alt="Powered by Analysys"></span>
+  </div>
+</section>
+
+<!-- ================================================================== CH 15 -->
+<section class="page">
+  <div class="chapter-opener">
+    <div class="num">15</div>
+    <div class="heading">
+      <div class="part">Part V · Administration</div>
+      <h1>Settings</h1>
+      <div class="subtitle">The small set of platform-wide knobs an Admin actually needs to touch.</div>
+    </div>
+  </div>
+
+  <p>Admin → Settings. Every knob here is platform-wide and takes effect on
+  save — no restart required.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Setting</th>
+        <th>Default</th>
+        <th>Effect</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Clip default resolution</strong></td>
+        <td>720p</td>
+        <td>What the clip editor's resolution dropdown shows as pre-selected.</td>
+      </tr>
+      <tr>
+        <td><strong>Clip URL expiry</strong></td>
+        <td>1 hour</td>
+        <td>How long a <em>Copy link</em> URL stays valid.</td>
+      </tr>
+      <tr>
+        <td><strong>Session timeout</strong></td>
+        <td>8 hours</td>
+        <td>How long a signed-in browser session lasts before requiring a re-login.</td>
+      </tr>
+      <tr>
+        <td><strong>Air-gap mode</strong></td>
+        <td>Off</td>
+        <td>When on, blocks every outbound connection from the frontend (fonts, images, telemetry). For deployments with no internet.</td>
+      </tr>
+      <tr>
+        <td><strong>Password min length</strong></td>
+        <td>12</td>
+        <td>Minimum length enforced on account creation and password change.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout note">
+    <span class="icon">§</span>
+    <div class="body">
+      <span class="label">Every change is logged</span>
+      <p>Changing any of these values is a state change — every save writes
+      an audit log entry showing the before/after values and who
+      made the change.</p>
+    </div>
+  </div>
+
+  <div class="running-footer">
+    <span class="doc-id">CMC-MAN-1.0 · Ch. 15 · Settings</span>
+    <span class="analysys"><img src="data:image/png;base64,{{ANALYSYS_B64}}" alt="Powered by Analysys"></span>
+  </div>
+</section>
+
+<!-- ================================================================== CH 16 -->
+<section class="page" id="chapter-legal-holds">
+  <div class="chapter-opener">
+    <div class="num">16</div>
+    <div class="heading">
+      <div class="part">Part V · Administration</div>
+      <h1>Legal holds</h1>
+      <div class="subtitle">Keeping specific windows of recording safe from janitor deletion — indefinitely.</div>
+    </div>
+  </div>
+
+  <p>The 30-day retention is fine for most material. But when an incident is
+  under review, a specific time window needs to be kept regardless of how
+  much time passes. That's a <strong>legal hold</strong>.</p>
+
+  <p>A legal hold names a channel (or "all channels"), a start and end time,
+  a reason, and the person who requested it. While it's active, the janitor
+  will REFUSE to delete any segment that falls inside that window, even if
+  it's older than the retention days.</p>
+
+  <h2>Placing a hold</h2>
+  <ol class="steps">
+    <li><div class="body"><p>Admin → Legal holds.</p></div></li>
+    <li><div class="body"><p>Click <strong>New hold</strong>.</p></div></li>
+    <li><div class="body"><p>Pick a channel (or "all"), enter start and end timestamps, write a reason. The reason field is not optional — this is what an auditor will read six months from now.</p></div></li>
+    <li><div class="body"><p>Click <strong>Place hold</strong>. The hold is active immediately and shown in the roster with a padlock icon on the affected channel row.</p></div></li>
+  </ol>
+
+  <h2>Expiring / releasing a hold</h2>
+  <p>Holds either expire naturally at their end time OR are released manually.
+  Releasing a hold does not automatically delete the covered segments —
+  it just makes them eligible for deletion at the next janitor run if they
+  are also outside the normal retention window.</p>
+
+  <div class="callout warn">
+    <span class="icon">!</span>
+    <div class="body">
+      <span class="label">Holds win over Delete</span>
+      <p>A hold blocks both the janitor AND manual clip deletes across
+      the covered window. If you attempt to delete a clip whose material
+      falls inside an active hold, the operation is refused with a toast
+      pointing at the responsible hold. This is intentional: it's the
+      accountability rail.</p>
+    </div>
+  </div>
+
+  <div class="running-footer">
+    <span class="doc-id">CMC-MAN-1.0 · Ch. 16 · Legal holds</span>
+    <span class="analysys"><img src="data:image/png;base64,{{ANALYSYS_B64}}" alt="Powered by Analysys"></span>
+  </div>
+</section>
+
+<!-- ================================================================== CH 17 -->
+<section class="page">
+  <div class="chapter-opener">
+    <div class="num">17</div>
+    <div class="heading">
+      <div class="part">Part VI · Reference</div>
+      <h1>Troubleshooting</h1>
+      <div class="subtitle">The symptoms you actually see, the first action that fixes them 90% of the time.</div>
+    </div>
+  </div>
+
+  <h2>Web app symptoms</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Symptom</th>
+        <th>Likely cause</th>
+        <th>First action</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Sign-in returns "Wrong email or password"</td>
+        <td>Bad credentials, or account disabled.</td>
+        <td>Ask Admin to verify the account exists and is active.</td>
+      </tr>
+      <tr>
+        <td>Sign-in returns "Session expired"</td>
+        <td>Browser session timed out.</td>
+        <td>Retry — it should sign in cleanly.</td>
+      </tr>
+      <tr>
+        <td>Dashboard KPIs stuck / not updating</td>
+        <td>WebSocket dropped, page lost live feed.</td>
+        <td>Reload the page (F5).</td>
+      </tr>
+      <tr>
+        <td>Channel signal red for one channel</td>
+        <td>Satellite feed dropped, or source URL wrong.</td>
+        <td>Open the channel, check the sources list; alert IT if all sources red.</td>
+      </tr>
+      <tr>
+        <td>Recording calendar shows no days</td>
+        <td>Wrong channel picked, or channel not recording.</td>
+        <td>Confirm the channel is enabled for recording in Admin → Channels.</td>
+      </tr>
+      <tr>
+        <td>Clip export fails with "cannot stitch non-contiguous segments"</td>
+        <td>The picked segments have a gap between them.</td>
+        <td>Choose smaller ranges each side of the gap, export separately.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Video Wall symptoms</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Symptom</th>
+        <th>Likely cause</th>
+        <th>First action</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>App won't launch — VCRUNTIME140.dll missing</td>
+        <td>Older ZIP without Visual C++ runtime bundled.</td>
+        <td>Re-download the latest ZIP from Downloads; extract fresh.</td>
+      </tr>
+      <tr>
+        <td>App launches but window never appears</td>
+        <td>OpenGL missing — usually on RDP without hardware GPU.</td>
+        <td>Run at the physical console instead of RDP, or ensure opengl32.dll is present next to the exe.</td>
+      </tr>
+      <tr>
+        <td>"Device is not ready" on cmd launch</td>
+        <td>Extracted to an unmountable path (removable drive ejected).</td>
+        <td>Re-extract to a local drive (C:\ or D:\).</td>
+      </tr>
+      <tr>
+        <td>Some tiles black on the wall</td>
+        <td>Those channels' UDP sources aren't reaching the wall PC.</td>
+        <td>Verify the Multicast NIC IP is correct at login; verify with VLC that <code>udp://@239.1.1.5:1111</code> plays.</td>
+      </tr>
+      <tr>
+        <td>Grid-32 tiles stutter</td>
+        <td>CPU saturated — normally 32 concurrent decodes on the operations wall PC. On a laptop, use Mosaic (20) instead.</td>
+        <td>Switch to Mosaic-20 layout.</td>
+      </tr>
+      <tr>
+        <td>ESC doesn't return from fullscreen</td>
+        <td>Focus is not on the wall window.</td>
+        <td>Click the fullscreen window first, then press Esc.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout tip">
+    <span class="icon">☞</span>
+    <div class="body">
+      <span class="label">When the fix isn't obvious</span>
+      <p>Every symptom above assumes you're seeing SOMETHING. If the app is
+      utterly unresponsive, capture the console log to a file — <code>
+      CMC-VideoWall.cmd &gt; log.txt 2&gt;&amp;1</code> — and send it to
+      Analysys support. The log almost always names the failing subsystem
+      in its last few lines.</p>
+    </div>
+  </div>
+
+  <div class="running-footer">
+    <span class="doc-id">CMC-MAN-1.0 · Ch. 17 · Troubleshooting</span>
+    <span class="analysys"><img src="data:image/png;base64,{{ANALYSYS_B64}}" alt="Powered by Analysys"></span>
+  </div>
+</section>
+
+<!-- ================================================================== APPENDICES -->
+<section class="page">
+  <div class="chapter-opener">
+    <div class="num">A</div>
+    <div class="heading">
+      <div class="part">Part VI · Reference</div>
+      <h1>Appendices</h1>
+      <div class="subtitle">Shortcut sheet, URLs, and how to reach us.</div>
+    </div>
+  </div>
+
+  <h2 id="appendix-shortcuts">A · Full keyboard shortcut sheet</h2>
+
+  <h4>Clip editor</h4>
+  <table>
+    <thead><tr><th style="width: 34mm">Shortcut</th><th>Action</th></tr></thead>
+    <tbody>
+      <tr><td><span class="kbd">Space</span></td><td>Play / pause.</td></tr>
+      <tr><td><span class="kbd">J</span> / <span class="kbd">K</span> / <span class="kbd">L</span></td><td>Reverse / pause / forward transport.</td></tr>
+      <tr><td><span class="kbd">I</span> / <span class="kbd">O</span></td><td>Set in / out marker.</td></tr>
+      <tr><td><span class="kbd">←</span> / <span class="kbd">→</span></td><td>Step one frame back / forward.</td></tr>
+      <tr><td><span class="kbd">Shift</span>+<span class="kbd">←</span> / <span class="kbd">→</span></td><td>Step one second back / forward.</td></tr>
+      <tr><td><span class="kbd">Ctrl</span>+<span class="kbd">Enter</span></td><td>Export clip.</td></tr>
+    </tbody>
+  </table>
+
+  <h4>Video Wall (fullscreen mode)</h4>
+  <table>
+    <thead><tr><th style="width: 34mm">Shortcut</th><th>Action</th></tr></thead>
+    <tbody>
+      <tr><td><span class="kbd">F11</span></td><td>Toggle fullscreen (enter or exit).</td></tr>
+      <tr><td><span class="kbd">Esc</span></td><td>Exit fullscreen back to preview.</td></tr>
+      <tr><td>Right-click on tile</td><td>Fill mode &amp; clear-slot menu.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>B · URL reference</h2>
+  <table>
+    <thead><tr><th>Purpose</th><th>URL</th></tr></thead>
+    <tbody>
+      <tr><td>Web app (recording LAN)</td><td class="mono">http://10.51.80.202:3001</td></tr>
+      <tr><td>Web app (storage LAN)</td><td class="mono">http://172.16.205.21:3001</td></tr>
+      <tr><td>API (used by Video Wall)</td><td class="mono">http://10.51.80.202:4001</td></tr>
+      <tr><td>Downloads folder (server)</td><td class="mono">D:\cmc\downloads\</td></tr>
+      <tr><td>Recording data (server)</td><td class="mono">/data/cmc/recordings/</td></tr>
+    </tbody>
+  </table>
+
+  <h2>C · Support &amp; escalation</h2>
+  <p>For issues with the CMC software itself that survive the first-action
+  fixes in Chapter 17:</p>
+  <dl>
+    <dt>Analysys support desk</dt>
+    <dd>Primary contact for software bugs, feature requests, and
+    incident-response on the platform. Email and phone details supplied
+    in the deployment handover pack.</dd>
+
+    <dt>Escalation window</dt>
+    <dd>P1 (platform unusable): 30 minutes to acknowledgement, 4 hours
+    to resolution. P2 (feature not working as expected): next business day.</dd>
+  </dl>
+
+  <div class="running-footer">
+    <span class="doc-id">CMC-MAN-1.0 · Appendices</span>
+    <span class="analysys"><img src="data:image/png;base64,{{ANALYSYS_B64}}" alt="Powered by Analysys"></span>
+  </div>
+</section>
+
+<!-- ================================================================== END -->
+<section class="page" style="min-height: 200mm; display: flex; flex-direction: column; justify-content: space-between;">
+  <div style="text-align: center; padding-top: 60mm;">
+    <img src="data:image/png;base64,{{LOGO_B64}}" style="width: 80px; height: 80px; opacity: 0.5;" alt="">
+    <div style="margin-top: 8mm; font-family: Georgia, serif; font-size: 14pt; color: var(--navy);">End of manual</div>
+    <div style="margin-top: 3mm; font-size: 10pt; color: var(--ink-muted);">CMC · Software Manual · v1.0 · August 2026</div>
+  </div>
+  <div style="display: flex; justify-content: space-between; align-items: center; font-size: 9pt; color: var(--ink-muted);">
+    <span>Prepared for the Pakistan Navy.</span>
+    <span><img src="data:image/png;base64,{{ANALYSYS_B64}}" style="height: 20px;" alt="Powered by Analysys"></span>
+  </div>
+</section>
+
+</body>
+</html>

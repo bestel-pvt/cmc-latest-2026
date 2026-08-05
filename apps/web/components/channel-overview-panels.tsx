@@ -55,7 +55,8 @@ export function LogoUploader({ channelId, currentUrl }: { channelId: string; cur
     <div className="flex items-center gap-3">
       <div className="h-16 w-16 rounded-md border border-line bg-white overflow-hidden flex items-center justify-center">
         {currentUrl
-          ? <img src={currentUrl} alt="channel logo" className="max-w-full max-h-full object-contain" />
+          ? <AuthImg src={currentUrl} alt="channel logo" className="max-w-full max-h-full object-contain"
+                     fallback={<ImagePlus className="h-6 w-6 text-muted-2" />} />
           : <ImagePlus className="h-6 w-6 text-muted-2" />}
       </div>
       <div>

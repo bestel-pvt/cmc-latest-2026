@@ -3,7 +3,7 @@ import { createReadStream, existsSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 /**
- * Public download endpoint for the DEMP Viewer desktop app.
+ * Public download endpoint for the CMC Viewer desktop app.
  *
  * Files land at /opt/demp/data/downloads/ from the packaging step. This
  * route is intentionally NOT behind `authenticate` — the .exe is meant to

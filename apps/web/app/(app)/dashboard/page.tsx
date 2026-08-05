@@ -77,7 +77,7 @@ export default function DashboardPage() {
         <CardHeader className="flex-row items-center justify-between">
           <div>
             <CardTitle>Channel Health</CardTitle>
-            <p className="text-xs text-muted mt-1">Live per-channel status from mediamtx.</p>
+            <p className="text-xs text-muted mt-1">Live per-channel status.</p>
           </div>
           <Link href="/channels" className="text-xs text-brand hover:underline inline-flex items-center gap-1">
             All channels <ArrowUpRight className="h-3 w-3" />

@@ -2,8 +2,9 @@
  * DEMP recording service.
  *
  * Responsibilities:
- *  - Supervise one FFmpeg process per active channel that reads the LL-HLS
- *    stream published by MediaMTX and writes 60-second MP4 segments.
+ *  - Supervise one FFmpeg process per active channel that reads the source
+ *    directly (UDP multicast for satellite feeds, RTSP for backups) and
+ *    writes 60-second MP4 segments.
  *  - On segment close: SHA-256 the file, insert a `RecordingSegment` row,
  *    roll into the hourly `RecordingManifest` (ed25519-signed rollup).
  *  - Publish `demp:events:segment` on Redis so the UI's recording browser

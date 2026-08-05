@@ -2,47 +2,25 @@ import type { FastifyPluginAsync } from 'fastify';
 import { upsertChannelSchema } from '@cmc/shared';
 
 /**
- * Both stream URLs for a channel. Operators pick whichever their
- * network supports:
- *   - udp:  low-latency multicast; ONLY works on the same broadcast
- *           domain as the server (same LAN switch). Multicast does not
- *           cross Tailscale / most VPNs / most routers.
- *   - rtsp: TCP-based; works from any network the server is reachable
- *           on (including Tailscale peers, remote sites). Slightly
- *           higher latency, one connection per viewer.
+ * CMC stream URL for a channel. Only the UDP multicast rebroadcast is
+ * emitted — the video-wall client joins that UDP group directly (no
+ * MediaMTX / RTSP hop). Same-LAN VLC can attach to the same URL.
  */
-function dempUrlsFor(slug: string, port: number | null | undefined): {
-  udp: string | null; rtsp: string; rtspLo: string;
+function dempUrlsFor(_slug: string, port: number | null | undefined): {
+  udp: string | null;
 } {
-  const host = process.env.PUBLIC_STREAM_HOST ?? '100.105.45.112';
   let udp: string | null = null;
   if (port) {
     const octet = 100 + (port % 155);
     udp = `udp://@239.7.${octet}.${port & 0xff}:${port}`;
   }
-  // rtsp   = raw mediamtx path. UDP source is auto-joined (source
-  //          field in mediamtx.yml), so this path is always warm and
-  //          the first frame lands in ~200 ms — critical for VLC in
-  //          the desktop viewer, which times out before the -lo
-  //          transcoder cold-starts (~6-10 s) for channels not on
-  //          runOnInit.  30 Mbps HD.
-  // rtspLo = 480p on-demand transcode. Cheap on bandwidth (~600 kbps)
-  //          and CPU (auto-terminates 30 s after last viewer). Only
-  //          Dunya / 24 keep this warm; other channels take a few
-  //          seconds to spin up. Reserve for browser preview / large
-  //          walls where bandwidth matters more than start-up time.
-  return {
-    udp,
-    rtsp:   `rtsp://${host}:8554/${slug}`,
-    rtspLo: `rtsp://${host}:8554/${slug}-lo`,
-  };
+  return { udp };
 }
 
-/** Back-compat single-URL helper (used by CSV export). Prefers UDP so
- * exported LAN operator sheets keep multicast; falls back to RTSP. */
+/** Back-compat single-URL helper (used by CSV export). Returns the UDP
+ * multicast URL when the channel has an output port, otherwise null. */
 function dempUrlFor(slug: string, port?: number | null): string | null {
-  const { udp, rtsp } = dempUrlsFor(slug, port ?? null);
-  return udp ?? rtsp;
+  return dempUrlsFor(slug, port ?? null).udp;
 }
 
 const routes: FastifyPluginAsync = async (app) => {
@@ -65,51 +43,28 @@ const routes: FastifyPluginAsync = async (app) => {
       orderBy: { name: 'asc' },
     });
 
-    // Attach hot health from Redis (best-effort). When the failover
-    // controller isn't writing scores, fall back to mediamtx path
-    // readiness — a channel whose source is actively pushing packets
-    // shouldn't be tagged IDLE.
-    const mtxReady: Record<string, boolean> = {};
-    try {
-      const { request } = await import('undici');
-      const mtxUrl = process.env.MEDIAMTX_API_URL ?? 'http://localhost:9997';
-      const r = await request(`${mtxUrl}/v3/paths/list?itemsPerPage=1000`);
-      if (r.statusCode < 400) {
-        const body = await r.body.json() as { items?: Array<{ name: string; ready?: boolean; bytesReceived?: number }> };
-        for (const p of body.items ?? []) {
-          if (p.ready && (p.bytesReceived ?? 0) > 0) mtxReady[p.name] = true;
-        }
-      }
-    } catch { /* mediamtx offline */ }
-
+    // Attach hot health from Redis (best-effort). Wall clients join UDP
+    // multicast DIRECTLY, so the server has no rebroadcast-side signal
+    // to consult — operator `active` + failover-controller score are the
+    // only inputs.
     const withHealth = await Promise.all(channels.map(async (c) => {
       const state = await app.redis.hgetall(`demp:ch:${c.id}:state`);
-      // Same MAX rule as the dashboard route — see dashboard.ts comment.
       const redisScore = state.score !== undefined && state.score !== '' ? Number(state.score) : null;
-      const mtxScore = mtxReady[c.slug] ? 0.9 : null;
-      let score: number | null = null;
-      if (redisScore !== null && mtxScore !== null) score = Math.max(redisScore, mtxScore);
-      else score = redisScore ?? mtxScore;
       const urls = dempUrlsFor(c.slug, c.dempOutputPort);
-      // "online" is what desktop viewer + web UI use to render a
-      // channel as pickable vs greyed-out. A raw mediamtx path can be
-      // in a state where mtxReady=true but bytes-received=0 — meaning
-      // the transport joined the multicast group but the source isn't
-      // publishing. We treat that as offline: only paths with a real
-      // failover-controller score or with mtxReady && recent bytes
-      // count as online.
-      const online = (score !== null && score > 0.2) || Boolean(mtxReady[c.slug]);
+      // "online" drives grey-out in the web UI. Trust the operator's
+      // `active` flag as the source of truth; a positive failover-
+      // controller score only ever ADDS confidence, never subtracts.
+      // Channels that are genuinely dead get flipped to `active=false`
+      // in the admin UI.
+      const online = Boolean(c.active) || (redisScore !== null && redisScore > 0.2);
       return {
         ...c,
         online,
-        dempOutputUrl: urls.udp ?? urls.rtsp,
-        dempOutputUrlUdp: urls.udp,
-        dempOutputUrlRtsp: urls.rtsp,
-        dempOutputUrlRtspLo: urls.rtspLo,
+        dempOutputUrl: urls.udp,
         runtime: {
           activeSourceId: state.activeSourceId ?? null,
           lastSwitchAt:   state.lastSwitchAt ? Number(state.lastSwitchAt) : null,
-          score,
+          score: redisScore,
         },
       };
     }));
@@ -171,10 +126,10 @@ const routes: FastifyPluginAsync = async (app) => {
 
   // Latest freeze-frame of the live channel — used by the ticker/flasher region editor.
   //
-  // Prefers the direct RTSP path (MediaMTX exposes rtsp://localhost:8554/<slug>
-  // as soon as a source is publishing — no HLS packaging delay). Buffers the
-  // full PNG in memory before responding, so Fastify sends the correct
-  // Content-Length and we never emit a headers-then-empty-body response.
+  // Grabs directly from the primary source (UDP multicast, RTSP, SRT, …) —
+  // no MediaMTX in the loop. Buffers the full PNG in memory before responding
+  // so Fastify sends the correct Content-Length and we never emit a
+  // headers-then-empty-body response.
   app.get('/:id/frame.png', async (req, reply) => {
     const { id } = req.params as { id: string };
     const ch = await app.prisma.channel.findUnique({
@@ -184,28 +139,31 @@ const routes: FastifyPluginAsync = async (app) => {
     if (!ch) return reply.notFound();
 
     const { spawn } = await import('node:child_process');
-    const rtspSrc = `rtsp://127.0.0.1:8554/${ch.slug}`;
     const primary = ch.sources[0];
-    let udpSrc: string | null = null;
-    if (primary && primary.kind === 'UDP') {
-      let u = primary.url.trim();
-      if (u.includes('://') && !u.split('://', 2)[1]!.startsWith('@')) {
-        const [proto, rest] = u.split('://', 2);
-        u = `${proto!.toLowerCase()}://@${rest}`;
+    if (!primary) return reply.code(503).send({ error: 'no source configured for this channel' });
+
+    let src = primary.url.trim();
+    const isUdpLike = primary.kind === 'UDP' || primary.kind === 'RTP';
+    if (isUdpLike) {
+      if (src.includes('://') && !src.split('://', 2)[1]!.startsWith('@')) {
+        const [proto, rest] = src.split('://', 2);
+        src = `${proto!.toLowerCase()}://@${rest}`;
       }
-      udpSrc = `${u}?fifo_size=100000&overrun_nonfatal=1&timeout=5000000`;
+      if (!src.includes('?')) {
+        src = `${src}?fifo_size=100000&overrun_nonfatal=1&timeout=5000000`;
+      }
     }
 
-    async function grab(src: string, isMpegTs: boolean, timeoutMs: number): Promise<Buffer | null> {
+    async function grab(source: string, isMpegTs: boolean, timeoutMs: number): Promise<Buffer | null> {
       return await new Promise((resolve) => {
         const args = [
           '-y', '-hide_banner', '-nostdin', '-loglevel', 'error',
           '-analyzeduration', '5M', '-probesize', '5M',
           '-err_detect', 'ignore_err',
           '-fflags', '+discardcorrupt+igndts+genpts',
-          ...(src.startsWith('rtsp') ? ['-rtsp_transport', 'tcp'] : []),
+          ...(source.startsWith('rtsp') ? ['-rtsp_transport', 'tcp'] : []),
           ...(isMpegTs ? ['-f', 'mpegts'] : []),
-          '-i', src,
+          '-i', source,
           '-frames:v', '1', '-q:v', '2', '-f', 'image2', '-vcodec', 'png',
           'pipe:1',
         ];
@@ -223,11 +181,7 @@ const routes: FastifyPluginAsync = async (app) => {
       });
     }
 
-    // UDP source direct first (satellite feed — most reliable),
-    // fall back to mediamtx RTSP path.
-    let png: Buffer | null = null;
-    if (udpSrc) png = await grab(udpSrc, true, 10000);
-    if (!png) png = await grab(rtspSrc, false, 8000);
+    const png = await grab(src, isUdpLike, 10000);
     if (!png) return reply.code(503).send({ error: 'no live signal — unable to capture a freeze frame' });
 
     return reply
@@ -238,7 +192,7 @@ const routes: FastifyPluginAsync = async (app) => {
       .send(png);
   });
 
-  // CSV export of channels + sources + DEMP output URLs.
+  // CSV export of channels + sources + CMC output URLs.
   app.get('/export.csv', async (_req, reply) => {
     const channels = await app.prisma.channel.findMany({
       include: { sources: { orderBy: [{ isPrimary: 'desc' }, { priority: 'desc' }] } },
@@ -252,8 +206,7 @@ const routes: FastifyPluginAsync = async (app) => {
       return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
     };
     for (const c of channels) {
-      const urls = dempUrlsFor(c.slug, c.dempOutputPort);
-      const url = urls.udp ?? urls.rtsp;
+      const url = dempUrlFor(c.slug, c.dempOutputPort);
       if (c.sources.length === 0) {
         rows.push([c.name, c.slug, c.category, c.language, c.active, c.aiFeaturesEnabled, url, '', '', '', '', ''].map(esc).join(','));
       } else {
@@ -277,7 +230,7 @@ const routes: FastifyPluginAsync = async (app) => {
     });
     if (!channel) return reply.notFound();
 
-    // Attach per-source health from Redis + computed DEMP UDP URL
+    // Attach per-source health from Redis + computed CMC UDP URL
     const sourcesWithHealth = await Promise.all(channel.sources.map(async (s) => {
       const raw = await app.redis.get(`demp:src:${s.id}:health`);
       return { ...s, health: raw ? JSON.parse(raw) : null };
@@ -286,10 +239,7 @@ const routes: FastifyPluginAsync = async (app) => {
     const _urls = dempUrlsFor(channel.slug, channel.dempOutputPort);
     return {
       ...channel,
-      dempOutputUrl: _urls.udp ?? _urls.rtsp,
-      dempOutputUrlUdp:  _urls.udp,
-      dempOutputUrlRtsp: _urls.rtsp,
-      dempOutputUrlRtspLo: _urls.rtspLo,
+      dempOutputUrl: _urls.udp,
       sources: sourcesWithHealth,
       runtime: {
         activeSourceId: state.activeSourceId ?? null,
@@ -307,7 +257,6 @@ const routes: FastifyPluginAsync = async (app) => {
     await app.audit(req, 'channel.create', { entityType: 'Channel', entityId: created.id, meta: { slug: created.slug } });
     (req as unknown as { auditWritten?: boolean }).auditWritten = true;
 
-    await app.mediamtx.regenerateConfig().catch(() => {});
     return reply.code(201).send(created);
   });
 
@@ -322,37 +271,12 @@ const routes: FastifyPluginAsync = async (app) => {
       if (k in body) data[k] = body[k];
     }
 
-    // Demo-scope gate: AI features (ticker/flasher OCR, transcription) and
-    // recording are ONLY allowed on the whitelisted demo channel (Dunya News).
-    // Attempts to enable them elsewhere return a 403 with a clear message so
-    // the UI can surface a toast, and the operator understands why the toggle
-    // silently reverts.
-    const DEMO_SCOPE_SLUG = process.env.DEMP_DEMO_SLUG ?? 'dunya-news';
-    const enablingGatedFeature =
-      data.aiFeaturesEnabled === true || data.recordingEnabled === true;
-    if (enablingGatedFeature) {
-      const existing = await app.prisma.channel.findUnique({
-        where: { id },
-        select: { slug: true, name: true },
-      });
-      if (!existing) return reply.notFound();
-      if (existing.slug !== DEMO_SCOPE_SLUG) {
-        return reply
-          .code(403)
-          .send({
-            error: 'DEMO_SCOPE',
-            message: `Demo scope: AI features and recording are only enabled on ${DEMO_SCOPE_SLUG}. ` +
-                     `Contact DEMP admin to license additional channels.`,
-            channel: existing.slug,
-          });
-      }
-    }
-
+    // CMC: no demo scope gate — every channel can toggle recording +
+    // clipping freely.
     const updated = await app.prisma.channel.update({ where: { id }, data: data as never });
     await app.audit(req, 'channel.update', { entityType: 'Channel', entityId: id, meta: { fields: Object.keys(data) } });
     (req as unknown as { auditWritten?: boolean }).auditWritten = true;
 
-    await app.mediamtx.regenerateConfig().catch(() => {});
     return updated;
   });
 
@@ -361,7 +285,6 @@ const routes: FastifyPluginAsync = async (app) => {
     await app.prisma.channel.delete({ where: { id } });
     await app.audit(req, 'channel.delete', { entityType: 'Channel', entityId: id });
     (req as unknown as { auditWritten?: boolean }).auditWritten = true;
-    await app.mediamtx.regenerateConfig().catch(() => {});
     return reply.code(204).send();
   });
 
@@ -372,15 +295,12 @@ const routes: FastifyPluginAsync = async (app) => {
     if (!sourceId) return reply.badRequest('sourceId required');
     const src = await app.prisma.source.findFirst({ where: { id: sourceId, channelId: id } });
     if (!src) return reply.notFound();
-    const ch = await app.prisma.channel.findUnique({ where: { id } });
-    if (!ch) return reply.notFound();
 
     await app.redis.hset(`demp:ch:${id}:state`, {
       activeSourceId: src.id,
       lastSwitchAt: Date.now(),
       forcedBy: req.user.id,
     });
-    await app.mediamtx.setActiveSource(ch.slug, src.url, src.kind);
     await app.redisPub.publish('demp:events:source-switch', JSON.stringify({
       type: 'channel.source-switch', channelId: id, toSourceId: src.id, reason: 'operator-override', at: Date.now(),
     }));

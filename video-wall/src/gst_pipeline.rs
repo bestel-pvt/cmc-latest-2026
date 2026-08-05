@@ -278,6 +278,13 @@ pub fn build_swdec_any_codec(src: &UdpSource, downsample_to: u32, sink_kind: Sin
     let sink_chain = match sink_kind {
         SinkKind::GlShared => " ! glupload ! glimagesink name=vsink sync=false force-aspect-ratio=false",
         SinkKind::D3d11 => " ! d3d11videosink name=vsink sync=false",
+        // Last-resort: whatever plugin registered on this host.
+        // autovideosink swaps to the best-available sink at runtime
+        // — on RDP or a headless Windows Server box (no D3D11
+        // interface, no Mesa OpenGL) it typically picks
+        // directdrawsink / d3dvideosink from gst-plugins-good, both
+        // of which render fine on the Basic Display Adapter.
+        SinkKind::Auto => " ! autovideosink name=vsink sync=false",
     };
     format!(
         "udpsrc address={addr} port={port}{bind} caps=\"video/mpegts,systemstream=(boolean)true\" \
@@ -301,6 +308,10 @@ pub enum SinkKind {
     /// hosts but caps out around 20 concurrent sinks before the
     /// driver runs out of swap chain slots.
     D3d11,
+    /// autovideosink — GStreamer picks whatever's actually
+    /// registered on this host. Ultimate fallback for headless /
+    /// RDP servers where neither GL nor D3D11 initialise.
+    Auto,
 }
 
 #[cfg(test)]

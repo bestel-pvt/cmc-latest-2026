@@ -315,13 +315,17 @@ fn spawn_playing_tile(
         .ok_or_else(|| anyhow!("no primary URL for {}", channel.slug))?;
     let src = gst_pipeline::UdpSource::parse(&url)?;
 
-    // Sink strategy: try `glimagesink` first — its shared GL context
-    // scales O(1) with N sinks (Grid32 doesn't exhaust driver
-    // resources → no black patches). If GL init fails on the host
-    // (e.g. no OpenGL 2.0+ driver AND no Mesa fallback bundled), we
-    // fall back to `d3d11videosink` which works everywhere but caps
-    // out around ~20 concurrent sinks. decodebin3 auto-picks the
-    // decoder for any codec (H.264, H.265, MPEG-2).
+    // Sink strategy — three-tier fallback so the wall works on any
+    // Windows host, from GPU-equipped operator PCs down to headless
+    // servers reached via RDP:
+    //   1. glimagesink (shared GL context) — O(1) driver cost
+    //      across N sinks; best for Grid32.
+    //   2. d3d11videosink — fast on GPU hosts, caps at ~20 sinks.
+    //   3. autovideosink — GStreamer picks whatever's actually
+    //      registered (directdrawsink / d3dvideosink) so headless /
+    //      RDP boxes without D3D11 or Mesa still render.
+    // decodebin3 auto-picks the decoder for any codec (H.264, H.265,
+    // MPEG-2).
     let pipeline = build_pipeline(
         &gst_pipeline::build_swdec_any_codec(&src, downsample_to, gst_pipeline::SinkKind::GlShared),
         hwnd,
@@ -332,7 +336,13 @@ fn spawn_playing_tile(
             hwnd,
         )
     })
-    .with_context(|| format!("both GL + D3D11 sinks failed for {}", channel.slug))?;
+    .or_else(|_| {
+        build_pipeline(
+            &gst_pipeline::build_swdec_any_codec(&src, downsample_to, gst_pipeline::SinkKind::Auto),
+            hwnd,
+        )
+    })
+    .with_context(|| format!("all sinks (GL + D3D11 + auto) failed for {}", channel.slug))?;
 
     if let Some(vsink) = pipeline.by_name("vsink") {
         apply_fill_mode(&vsink, fill);

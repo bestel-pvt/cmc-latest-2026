@@ -30,7 +30,6 @@ services/*/data/
 /recordings/
 /clips/
 /models/
-.mediamtx.pid
 *.sqlite
 *.db
 

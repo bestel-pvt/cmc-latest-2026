@@ -14,7 +14,6 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { HealthMeter } from '@/components/health-meter';
 import { Monitor as MonitorIcon } from 'lucide-react';
 import { TickerRegionsEditor, type Rect } from '@/components/ticker-regions-editor';
-import { DemoScopeBanner } from '@/components/demo-scope-banner';
 import { LogoUploader, RecordingStatusPanel, SwitchHistoryPanel, TickerThumbGrid } from '@/components/channel-overview-panels';
 import { api } from '@/lib/api';
 import { SOURCE_KINDS } from '@cmc/shared';
@@ -217,7 +216,6 @@ export default function ChannelDetailPage() {
           </p>
         </CardHeader>
         <CardContent className="space-y-3">
-          {!ch.aiFeaturesEnabled && <DemoScopeBanner feature="Ticker + Flasher OCR" />}
           <TickerRegionsEditor
             channelId={ch.id}
             initial={{

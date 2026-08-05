@@ -26,7 +26,6 @@ const routes: FastifyPluginAsync = async (app) => {
     }
     await app.audit(req, 'source.create', { entityType: 'Source', entityId: created.id, meta: { channelId: parsed.data.channelId } });
     (req as unknown as { auditWritten?: boolean }).auditWritten = true;
-    await app.mediamtx.regenerateConfig().catch(() => {});
     return reply.code(201).send(created);
   });
 
@@ -43,7 +42,6 @@ const routes: FastifyPluginAsync = async (app) => {
     }
     await app.audit(req, 'source.update', { entityType: 'Source', entityId: id, meta: parsed.data });
     (req as unknown as { auditWritten?: boolean }).auditWritten = true;
-    await app.mediamtx.regenerateConfig().catch(() => {});
     return updated;
   });
 
@@ -52,7 +50,6 @@ const routes: FastifyPluginAsync = async (app) => {
     await app.prisma.source.delete({ where: { id } });
     await app.audit(req, 'source.delete', { entityType: 'Source', entityId: id });
     (req as unknown as { auditWritten?: boolean }).auditWritten = true;
-    await app.mediamtx.regenerateConfig().catch(() => {});
     return reply.code(204).send();
   });
 
@@ -71,7 +68,6 @@ const routes: FastifyPluginAsync = async (app) => {
     });
     await app.audit(req, 'source.reorder', { entityType: 'Channel', entityId: body.channelId, meta: { order: body.order, primaryId: body.primaryId } });
     (req as unknown as { auditWritten?: boolean }).auditWritten = true;
-    await app.mediamtx.regenerateConfig().catch(() => {});
     return { ok: true };
   });
 };

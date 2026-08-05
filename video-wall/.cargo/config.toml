@@ -1,0 +1,19 @@
+# Cargo build env for GStreamer on Windows.
+#
+# The default GStreamer install path is `C:\gstreamer\1.0\msvc_x86_64`.
+# `gstreamer-sys` uses pkg-config to locate headers + libs at build
+# time and needs the DLLs on PATH at run time. Setting these here
+# means `cargo build` / `cargo run` "just work" without the developer
+# having to remember to export anything.
+#
+# If GStreamer is installed elsewhere, override with the ENV in your
+# shell — [env] is a base only; shell env wins per Cargo semantics.
+
+[env]
+PKG_CONFIG_PATH = "C:\\Program Files\\gstreamer\\1.0\\msvc_x86_64\\lib\\pkgconfig"
+GSTREAMER_1_0_ROOT_MSVC_X86_64 = "C:\\Program Files\\gstreamer\\1.0\\msvc_x86_64\\"
+
+# NOTE: The GStreamer installer prepends its bin dir to the system
+# PATH — no cargo config needed at runtime. If DLLs aren't found on
+# `cargo run`, log out + back in (or reboot) so the updated PATH
+# reaches your shell.

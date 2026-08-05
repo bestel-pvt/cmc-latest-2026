@@ -88,11 +88,10 @@ const routes: FastifyPluginAsync = async (app) => {
     const bytesWritten24h = Number(segmentBytesRow[0]?.bytes ?? 0n);
     const onAirMinutes24h = Math.round(segmentsToday * 60 / 60);
 
-    // Redis-backed per-channel health snapshot. When the failover
-    // controller isn't running we fall back to mediamtx's own path
-    // readiness (source has actively been publishing packets) — that
-    // way channels don't all show as IDLE just because the score
-    // service isn't scoring.
+    // Redis-backed per-channel health snapshot. The failover controller
+    // (when running) writes a rolling score into Redis; when nothing is
+    // scoring we simply return null and the UI falls back to
+    // "trust operator config" — see dashboard/page.tsx for that rule.
     const chs = await app.prisma.channel.findMany({
       select: {
         id: true, name: true, slug: true, active: true,
@@ -102,36 +101,14 @@ const routes: FastifyPluginAsync = async (app) => {
       orderBy: { name: 'asc' },
     });
 
-    const mtxReady: Record<string, boolean> = {};
-    try {
-      const { request } = await import('undici');
-      const mtxUrl = process.env.MEDIAMTX_API_URL ?? 'http://localhost:9997';
-      const r = await request(`${mtxUrl}/v3/paths/list?itemsPerPage=1000`);
-      if (r.statusCode < 400) {
-        const body = await r.body.json() as { items?: Array<{ name: string; ready?: boolean; bytesReceived?: number }> };
-        for (const p of body.items ?? []) {
-          if (p.ready && (p.bytesReceived ?? 0) > 0) mtxReady[p.name] = true;
-        }
-      }
-    } catch { /* mediamtx offline — leave all false */ }
-
     const health = await Promise.all(chs.map(async (c) => {
       const s = await app.redis.hgetall(`demp:ch:${c.id}:state`);
-      // Health score = MAX(failover-controller score, mediamtx-readiness).
-      // A stale Redis score of 0 shouldn't hide the fact that mediamtx
-      // is currently receiving bytes for this channel — bytes flowing
-      // is ground truth. The controller's real gradient still wins
-      // when it's a positive value (33 %, 78 %, etc).
       const redisScore = s.score !== undefined && s.score !== '' ? Number(s.score) : null;
-      const mtxScore = mtxReady[c.slug] ? 0.9 : null;
-      let score: number | null = null;
-      if (redisScore !== null && mtxScore !== null) score = Math.max(redisScore, mtxScore);
-      else score = redisScore ?? mtxScore;
       return {
         id: c.id, name: c.name, slug: c.slug, active: c.active,
         aiFeaturesEnabled: c.aiFeaturesEnabled, category: c.category,
         hasSource: c._count.sources > 0,
-        score,
+        score: redisScore,
         lastSwitchAt: s.lastSwitchAt ? Number(s.lastSwitchAt) : null,
         activeSourceId: s.activeSourceId ?? null,
       };

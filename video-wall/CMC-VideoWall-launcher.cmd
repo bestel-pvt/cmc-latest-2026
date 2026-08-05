@@ -17,6 +17,15 @@ set "GST_PLUGIN_SCANNER=%~dp0gst-plugin-scanner.exe"
 set "GST_PLUGIN_SYSTEM_PATH="
 set "GST_REGISTRY=%~dp0registry.cache"
 
+REM Nuke any stale plugin registry from a previous extraction. If the
+REM cache says "d3d11videosink not available" (because a prior scan
+REM happened on a host without the plugin loaded, or with a different
+REM plugin set) GStreamer never re-scans — element lookups just fail
+REM with "no element ...". Deleting the cache forces a fresh scan
+REM (~1 s on first launch, then cached again). Safe: only affects
+REM the app-local cache we set above.
+if exist "%GST_REGISTRY%" del /q "%GST_REGISTRY%" 2>nul
+
 REM Mesa's Gallium loader picks ZINK (Vulkan-backed driver) by default
 REM if any indication of Vulkan is present, then fails with
 REM "ZINK: failed to load vulkan-1.dll" on hosts that don't ship the

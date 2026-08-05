@@ -10,7 +10,7 @@ on-prem; the only piece that touches the public internet is an optional
 
 | Component | Runs as | Port | Notes |
 |---|---|---|---|
-| Postgres, Redis, MediaMTX, Ollama, nginx | Docker (`docker-compose.prod.yml`) | see compose | MediaMTX uses `network_mode: host` for UDP multicast |
+| Postgres, Redis, Ollama, nginx | Docker (`docker-compose.prod.yml`) | see compose | infra only — no stream rebroadcast server |
 | API (Fastify), Web (Next.js) | **systemd** on the host | 4001 / 3001 | fronted by nginx :8080 |
 | Recording, Failover controller, Janitor, AI Scheduler | systemd (Node) | — | spawn FFmpeg on host |
 | Transcription, Ticker OCR, Ticker Grouper | systemd (Python venv per service) | — | need Tesseract + Python 3.11 |
@@ -64,7 +64,7 @@ sudo -u demp bash infra/scripts/deploy.sh
 That single script:
 
 1. `git pull` + `pnpm install`
-2. Brings up Postgres / Redis / MediaMTX / Ollama / nginx via Docker Compose
+2. Brings up Postgres / Redis / Ollama / nginx via Docker Compose
 3. Runs `prisma migrate deploy` + `generate`
 4. Pulls the Ollama model if missing (Analysys GPT — Qwen 2.5 3B multilingual)
 5. Builds `@demp/api` and `@demp/web`

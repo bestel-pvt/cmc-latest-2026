@@ -18,7 +18,6 @@ import redisPlugin from './plugins/redis.js';
 import authPlugin from './plugins/auth.js';
 import auditPlugin from './plugins/audit.js';
 import wsPlugin from './plugins/ws.js';
-import mediaMtxPlugin from './plugins/mediamtx.js';
 
 import authRoutes from './routes/auth.js';
 import channelsRoutes from './routes/channels.js';
@@ -57,7 +56,6 @@ async function main() {
   await app.register(redisPlugin);
   await app.register(authPlugin);
   await app.register(auditPlugin);
-  await app.register(mediaMtxPlugin);
   await app.register(wsPlugin);
 
   app.get('/health', async () => ({

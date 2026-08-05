@@ -89,7 +89,7 @@ export function AnalysysLogo({ className, size = 22 }: { className?: string; siz
 }
 
 /**
- * "Powered by Analysys" — official supplied lockup, unchanged from DEMP.
+ * "Powered by Analysys" — official supplied lockup, unchanged from CMC/DEMP forks.
  * Operator wants it kept as-is on CMC too.
  */
 export function PoweredByAnalysys({ className, height = 36 }: { className?: string; height?: number }) {

@@ -1,10 +1,12 @@
 # =====================================================================
-# DEMP — production Docker Compose overrides
+# CMC — production Docker Compose overrides
 #
-# Layout: infrastructure runs in Docker (Postgres, Redis, MediaMTX, Ollama);
+# Layout: infrastructure runs in Docker (Postgres, Redis, Ollama, nginx);
 # the Node + Python application services run natively on the host under
-# systemd so they can spawn FFmpeg on the host with zero container overhead
-# and MediaMTX gets host networking for UDP multicast.
+# systemd so they can spawn FFmpeg on the host with zero container
+# overhead. Ingest / recording read UDP multicast directly on the host;
+# the video-wall client joins the same multicast groups from its LAN
+# (no rebroadcast server in the loop).
 #
 # Usage on the Ubuntu server:
 #   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
@@ -29,17 +31,6 @@ services:
     ports: []
     volumes:
       - /data/demp/redis:/data
-
-  # MediaMTX needs host networking for UDP multicast joins on Linux.
-  # On the Ubuntu server this is fine; on Docker Desktop (Windows/Mac) fall
-  # back to the port-mapping mode from docker-compose.yml.
-  mediamtx:
-    restart: always
-    network_mode: host
-    # `ports` is ignored under host networking; keep the config file mount.
-    volumes:
-      - ./infra/mediamtx/mediamtx.yml:/mediamtx.yml:ro
-      - /data/demp/recordings:/recordings
 
   # Local LLM for DEMP GPT. Pull the model once:
   #   docker exec demp_ollama ollama pull qwen2.5:3b-instruct

@@ -1,7 +1,7 @@
 'use client';
 
 /**
- * <AuthImg> — <img> that fetches its bytes with the DEMP bearer token,
+ * <AuthImg> — <img> that fetches its bytes with the CMC bearer token,
  * then hands the resulting blob URL to a native <img>. Needed anywhere
  * the API image endpoint is behind `authenticate`, because a plain
  * <img src> can't attach an Authorization header.

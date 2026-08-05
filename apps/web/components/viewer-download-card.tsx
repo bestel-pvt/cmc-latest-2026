@@ -1,7 +1,7 @@
 'use client';
 
 /**
- * Card / button that surfaces the DEMP Viewer .exe. The API's
+ * Card / button that surfaces the CMC Viewer .exe. The API's
  * /api/downloads/desktop-viewer/manifest endpoint reports whether the
  * build is available (it is once ops has run the packaging step); if
  * not, we hide the download UI instead of showing a broken link.
@@ -45,7 +45,7 @@ export function ViewerDownloadCard() {
         <div>
           <CardTitle className="flex items-center gap-2">
             <Monitor className="h-4 w-4 text-brand" />
-            DEMP Viewer — Video Wall
+            CMC Viewer — Video Wall
           </CardTitle>
           <p className="text-xs text-muted mt-1 max-w-md">
             Native Windows app that plays every channel's satellite UDP directly (no

@@ -25,9 +25,7 @@ interface Channel {
   logoUrl: string | null;
   aiFeaturesEnabled: boolean;
   recordingEnabled: boolean;
-  dempOutputUrl: string | null;                // primary (UDP if configured, else RTSP)
-  dempOutputUrlUdp: string | null;             // multicast UDP for same-LAN VLC
-  dempOutputUrlRtsp: string | null;            // RTSP for remote / Tailscale VLC
+  dempOutputUrl: string | null;                // UDP multicast rebroadcast
   sources: Array<{ id: string; name: string; url: string; kind: string; isPrimary: boolean }>;
   runtime?: { score: number | null; activeSourceId: string | null };
 }

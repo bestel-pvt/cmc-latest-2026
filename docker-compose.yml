@@ -35,37 +35,6 @@ services:
       timeout: 3s
       retries: 20
 
-  mediamtx:
-    # The -ffmpeg variant ships with the ffmpeg binary — required for the
-    # runOnReady per-channel UDP re-broadcast hooks.
-    image: bluenviron/mediamtx:1.9.3-ffmpeg
-    container_name: demp_mediamtx
-    restart: unless-stopped
-    # host networking is best for UDP MPEG-TS multicast, but on Windows/Mac
-    # Docker Desktop uses port mappings instead. On the Linux server we'll
-    # switch to network_mode: host in docker-compose.prod.yml.
-    ports:
-      # HLS
-      - "8888:8888"
-      # WebRTC (browser playback)
-      - "8889:8889"
-      # RTSP
-      - "8554:8554"
-      # RTMP (for republish)
-      - "1935:1935"
-      # SRT
-      - "8890:8890/udp"
-      # API (config + path management)
-      - "9997:9997"
-      # Prometheus metrics
-      - "9998:9998"
-    volumes:
-      - ./infra/mediamtx/mediamtx.yml:/mediamtx.yml:ro
-      - ./data/recordings:/recordings
-    depends_on:
-      postgres:
-        condition: service_healthy
-
   # Local LLM runtime for DEMP GPT (no internet needed at runtime).
   # After first startup:
   #   docker exec demp_ollama ollama pull qwen2.5:3b-instruct
@@ -82,7 +51,7 @@ services:
       OLLAMA_KEEP_ALIVE: 30m
       OLLAMA_NUM_PARALLEL: 2
 
-  # nginx as a path-router in front of (currently one, later N) MediaMTX shards
+  # nginx reverse-proxy in front of the CMC web + API on the host.
   nginx:
     image: nginx:1.27-alpine
     container_name: demp_nginx
@@ -91,8 +60,6 @@ services:
       - "8080:8080"
     volumes:
       - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-    depends_on:
-      - mediamtx
 
 volumes:
   demp_pg_data:

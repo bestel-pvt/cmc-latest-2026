@@ -1,0 +1,57 @@
+[package]
+name = "cmc-videowall"
+version = "0.1.0"
+edition = "2021"
+description = "CMC Video Wall — GStreamer + Rust replacement for the Python/VLC viewer"
+license = "Proprietary"
+
+[[bin]]
+name = "CMC-VideoWall"
+path = "src/main.rs"
+
+[dependencies]
+# GStreamer core + video overlay for HWND embedding
+gstreamer = "0.24"
+gstreamer-video = "0.24"
+
+# Native windowing (creates HWNDs we hand to GStreamer's videosink)
+winit = { version = "0.30", features = ["rwh_06"] }
+raw-window-handle = "0.6"
+
+# UI chrome — login screen, toolbar, right-side channel list. eframe
+# runs egui on top of winit + wgpu so it composites cleanly next to
+# our video windows and gives us a native look with almost no ceremony.
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.31"
+egui_extras = { version = "0.31", features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["png", "webp", "jpeg"] }
+
+# Async runtime for API calls (login, /channels fetch)
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Serialization for config + API DTOs
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling + logging
+anyhow = "1"
+env_logger = "0.11"
+log = "0.4"
+
+# Config directory resolution
+dirs = "5"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+opt-level = 3

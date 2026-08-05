@@ -22,8 +22,7 @@ packages/
   db/                       Prisma schema + client (shared)
   shared/                   Zod, TS types, brand tokens, constants
 infra/
-  mediamtx/                 MediaMTX config
-  nginx/                    Path-router for MediaMTX shards
+  nginx/                    Reverse proxy for web + API on port 8080
 ```
 
 ## Prerequisites
@@ -39,7 +38,7 @@ infra/
 ```bash
 cp .env.example .env
 pnpm install
-pnpm docker:up            # postgres, redis, mediamtx, nginx
+pnpm docker:up            # postgres, redis, ollama, nginx
 pnpm db:generate
 pnpm db:migrate           # first time — creates schema
 pnpm db:seed              # admin@demp.local / demp-admin-2026 + 8 sample channels
@@ -50,8 +49,6 @@ Then open:
 
 - Web:      http://localhost:3001
 - API:      http://localhost:4001
-- MediaMTX API: http://localhost:9997
-- HLS:      http://localhost:8888
 - Nginx:    http://localhost:8080
 
 ## Server deployment (roadmap)
@@ -83,4 +80,4 @@ Assumes ~2 Mbps average per channel. News-HD adds ~50%. Multi-resolution recordi
 
 ## Realistic scope note
 
-Even the foundation is a multi-week build. The current codebase covers **Phase 1** — foundation + core paths (ingest → play → record → clip, plus transcription for a limited channel count). Phase 2+ items (multi-shard MediaMTX, face/logo/scene detection, SAML/OIDC + MFA, storage tiering, public REST + webhooks) are called out in the [plan file](../.claude/plans/breezy-strolling-sky.md).
+Even the foundation is a multi-week build. The current codebase covers **Phase 1** — foundation + core paths (ingest → play → record → clip, plus transcription for a limited channel count). Phase 2+ items (face/logo/scene detection, SAML/OIDC + MFA, storage tiering, public REST + webhooks) are called out in the [plan file](../.claude/plans/breezy-strolling-sky.md).

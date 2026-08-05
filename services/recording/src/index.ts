@@ -335,6 +335,12 @@ async function clipWorker(job: { clipId: string }) {
   const FONT_BOLD = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
   const FONT_REG  = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
 
+  // Only MP4 / MOV benefit from +faststart (moov atom relocation).
+  // MKV has no moov; the flag is silently ignored but noisier to log,
+  // so skip it. If we ever add WEBM back it needs libvpx-vp9 + libopus
+  // in place of libx264 + aac — WebM refuses H.264/AAC entirely.
+  const isMovLike = clip.format === 'MP4' || clip.format === 'MOV';
+
   const args = [
     '-hide_banner', '-loglevel', 'warning',
     '-ss', String(Math.max(0, ss)),
@@ -345,9 +351,8 @@ async function clipWorker(job: { clipId: string }) {
     '-filter_complex',
     `[0:v]scale=${w}:${h}:force_original_aspect_ratio=decrease,` +
       `pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,` +
-      // Persistent PAK NAVY wordmark top-right + Powered by Analysys line
+      // Persistent PAK NAVY wordmark top-right
       `drawtext=text='PAK NAVY':fontcolor=white@0.55:fontsize=42:fontfile=${FONT_BOLD}:x=w-tw-24:y=24,` +
-      `drawtext=text='Powered by Analysys':fontcolor=white@0.55:fontsize=14:fontfile=${FONT_REG}:x=w-tw-24:y=68,` +
       // Bottom strip with operator/timestamp watermark
       `drawbox=x=0:y=ih-30:w=iw:h=30:color=#0B1E3A@0.8:t=fill,` +
       `drawtext=text='${wm}':fontcolor=white@0.85:fontsize=14:fontfile=${FONT_REG}:x=16:y=h-22` +
@@ -358,7 +363,7 @@ async function clipWorker(job: { clipId: string }) {
     '-shortest',
     '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', V_BITRATE,
     '-c:a', 'aac', '-b:a', A_BITRATE, '-ac', '2', '-ar', '48000',
-    '-movflags', '+faststart',
+    ...(isMovLike ? ['-movflags', '+faststart'] : []),
     '-y',
     outFile,
   ];

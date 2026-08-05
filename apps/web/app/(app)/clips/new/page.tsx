@@ -59,6 +59,18 @@ export default function NewClipPage() {
   const [playing, setPlaying] = useState(false);
   const [muted, setMuted] = useState(true);
 
+  // Discrete video-load state so the user sees WHY the frame is dark
+  // instead of a silent aspect-ratio placeholder. 'error' surfaces the
+  // real HTTP status from the manifest endpoint, not hls.js's generic
+  // "manifestLoadError" wording.
+  const [videoState, setVideoState] = useState<
+    { kind: 'idle' } |
+    { kind: 'loading'; step: string } |
+    { kind: 'ready' } |
+    { kind: 'error'; message: string }
+  >({ kind: 'idle' });
+  const [waveState, setWaveState] = useState<'idle' | 'loading' | 'ready' | 'failed'>('idle');
+
   const [title, setTitle] = useState('');
   const [notes, setNotes] = useState('');
   const [format, setFormat] = useState<'MP4' | 'MOV' | 'MKV' | 'WEBM'>('MP4');
@@ -85,7 +97,9 @@ export default function NewClipPage() {
     : null);
 
   // Attach hls.js pointing at the session playlist. Restart the player
-  // whenever channel/session window changes.
+  // whenever channel/session window changes. Probe the manifest URL
+  // ourselves FIRST so a 404 / 401 / 500 surfaces with an actionable
+  // message instead of hls.js's opaque "manifestLoadError".
   useEffect(() => {
     const video = videoRef.current;
     if (!video || !channelId || !effectiveStart || !effectiveEnd) return;
@@ -97,30 +111,69 @@ export default function NewClipPage() {
     const src = `${API_BASE}/api/recordings/session.m3u8?${p}`;
 
     let hls: Hls | null = null;
-    if (Hls.isSupported()) {
-      hls = new Hls({
-        xhrSetup: (xhr) => { if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`); },
-        // See recordings/page.tsx for the rationale — 6 s slices +
-        // rolling 12 s buffer = instant seek to any point of a
-        // multi-hour session.
-        maxBufferLength: 12,
-        maxMaxBufferLength: 24,
-        backBufferLength: 12,
-        maxBufferSize: 8 * 1024 * 1024,
-        startFragPrefetch: true,
-        lowLatencyMode: false,
-      });
-      hls.on(Hls.Events.ERROR, (_e, data) => {
-        if (data.fatal) toast.error(`Playback: ${data.details}`);
-      });
-      hls.loadSource(src);
-      hls.attachMedia(video);
-    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      video.src = src;
-    } else {
-      toast.error('This browser cannot play HLS.');
-    }
-    return () => { hls?.destroy(); };
+    let cancelled = false;
+
+    (async () => {
+      setVideoState({ kind: 'loading', step: 'Checking recording…' });
+      // Probe: gives us the REAL failure reason (no segments, expired
+      // token, server down) so the video panel doesn't just show "error"
+      // with hls.js's opaque code.
+      try {
+        const probe = await fetch(src, {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        });
+        if (cancelled) return;
+        if (!probe.ok) {
+          const body = await probe.text().catch(() => '');
+          const parsed = (() => { try { return JSON.parse(body) as { message?: string; error?: string }; } catch { return null; } })();
+          const detail = parsed?.message ?? parsed?.error ?? body.slice(0, 160);
+          const message =
+            probe.status === 401 ? 'Session expired — please sign in again.' :
+            probe.status === 404 ? (detail || 'No playable segments in this recording window.') :
+            probe.status >= 500  ? `Server error while assembling playlist${detail ? ` — ${detail}` : ''}.` :
+                                    `HTTP ${probe.status}${detail ? ` — ${detail}` : ''}`;
+          setVideoState({ kind: 'error', message });
+          return;
+        }
+      } catch (err) {
+        if (cancelled) return;
+        setVideoState({ kind: 'error', message: `Network error reaching the recording server${err instanceof Error ? ` (${err.message})` : ''}.` });
+        return;
+      }
+
+      if (cancelled) return;
+      setVideoState({ kind: 'loading', step: 'Buffering first frames…' });
+
+      if (Hls.isSupported()) {
+        hls = new Hls({
+          xhrSetup: (xhr) => { if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`); },
+          // See recordings/page.tsx for the rationale — 6 s slices +
+          // rolling 12 s buffer = instant seek to any point of a
+          // multi-hour session.
+          maxBufferLength: 12,
+          maxMaxBufferLength: 24,
+          backBufferLength: 12,
+          maxBufferSize: 8 * 1024 * 1024,
+          startFragPrefetch: true,
+          lowLatencyMode: false,
+        });
+        hls.on(Hls.Events.ERROR, (_e, data) => {
+          if (data.fatal) {
+            setVideoState({ kind: 'error', message: `${data.type} — ${data.details}` });
+          }
+        });
+        hls.on(Hls.Events.MANIFEST_PARSED, () => setVideoState({ kind: 'ready' }));
+        hls.loadSource(src);
+        hls.attachMedia(video);
+      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        video.src = src;
+        setVideoState({ kind: 'ready' });
+      } else {
+        setVideoState({ kind: 'error', message: 'This browser cannot play HLS.' });
+      }
+    })();
+
+    return () => { cancelled = true; hls?.destroy(); };
   }, [channelId, effectiveStart, effectiveEnd]);
 
   // Waveform (peaks fetched from the API — server pre-computes them
@@ -129,6 +182,7 @@ export default function NewClipPage() {
   useEffect(() => {
     if (!waveRef.current || !channelId || !effectiveStart || !effectiveEnd) return;
     let cancelled = false;
+    setWaveState('loading');
     const token = typeof window !== 'undefined' ? localStorage.getItem('demp.accessToken') : null;
     const p = new URLSearchParams();
     p.set('channelId', channelId);
@@ -160,9 +214,11 @@ export default function NewClipPage() {
           media: videoRef.current ?? undefined,
         });
         wsRef.current = ws;
+        setWaveState('ready');
       } catch (e) {
         // Fallback: no waveform, still render the flat click-to-seek strip below.
         console.warn('waveform load failed:', e);
+        setWaveState('failed');
       }
     })();
     return () => { cancelled = true; wsRef.current?.destroy(); wsRef.current = null; };
@@ -278,6 +334,21 @@ export default function NewClipPage() {
               muted={muted}
               onClick={() => { const v = videoRef.current; if (!v) return; v.paused ? v.play() : v.pause(); }}
             />
+            {videoState.kind === 'loading' && (
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-ink/80 text-sm text-white/80 pointer-events-none">
+                <Loader2 className="h-6 w-6 animate-spin text-brand" />
+                <div>{videoState.step}</div>
+              </div>
+            )}
+            {videoState.kind === 'error' && (
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-ink/90 px-6 text-center text-sm">
+                <div className="text-accent-red font-semibold">Can&apos;t load this recording</div>
+                <div className="text-white/80 text-xs max-w-md">{videoState.message}</div>
+                <div className="text-white/40 text-[10px] mt-2">
+                  If the recorder just started, wait ~60 s for the first segment to close. Otherwise reach out to support.
+                </div>
+              </div>
+            )}
           </div>
         </Card>
 
@@ -367,6 +438,16 @@ export default function NewClipPage() {
             on top with pointer-events-none so it stays clickable. */}
         <div className="relative rounded-md border border-border bg-panel2/40 overflow-hidden">
           <div ref={waveRef} className="h-16" />
+          {waveState === 'loading' && (
+            <div className="pointer-events-none absolute inset-0 flex items-center justify-center gap-2 text-[11px] text-muted-2">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading waveform…
+            </div>
+          )}
+          {waveState === 'failed' && (
+            <div className="pointer-events-none absolute inset-0 flex items-center justify-center text-[11px] text-muted-2">
+              Waveform unavailable — timeline still clickable for seek.
+            </div>
+          )}
           {inPct !== null  && <div className="pointer-events-none absolute inset-y-0 left-0 bg-ink/60" style={{ width: `${inPct}%` }} />}
           {outPct !== null && <div className="pointer-events-none absolute inset-y-0 right-0 bg-ink/60" style={{ width: `${100 - outPct}%` }} />}
           <div className="pointer-events-none absolute inset-y-0 border-l-2 border-brand" style={{ left: `${curPct}%` }} />

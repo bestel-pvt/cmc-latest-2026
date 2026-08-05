@@ -4,7 +4,7 @@ import Link from 'next/link';
 import { useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useRouter } from 'next/navigation';
-import { Plus, Search, Radio, Filter, Download, Copy, Check, Circle, CircleDot, Loader2 } from 'lucide-react';
+import { Plus, Search, Filter, Download, Circle, CircleDot, Loader2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -30,29 +30,6 @@ interface Channel {
   dempOutputUrlRtsp: string | null;            // RTSP for remote / Tailscale VLC
   sources: Array<{ id: string; name: string; url: string; kind: string; isPrimary: boolean }>;
   runtime?: { score: number | null; activeSourceId: string | null };
-}
-
-function CopyBtn({ value }: { value: string }) {
-  const [copied, setCopied] = useState(false);
-  async function copy(e: React.MouseEvent) {
-    e.preventDefault();
-    e.stopPropagation();                          // don't trigger the row click
-    // Clipboard API requires HTTPS or localhost. Fall back to execCommand for HTTP LAN.
-    try {
-      await navigator.clipboard.writeText(value);
-    } catch {
-      const ta = document.createElement('textarea');
-      ta.value = value; ta.style.position = 'fixed'; ta.style.opacity = '0';
-      document.body.appendChild(ta); ta.select();
-      try { document.execCommand('copy'); } finally { document.body.removeChild(ta); }
-    }
-    setCopied(true); setTimeout(() => setCopied(false), 1200);
-  }
-  return (
-    <button title="Copy" onClick={copy} className="text-muted-2 hover:text-brand">
-      {copied ? <Check className="h-3 w-3 text-accent-green" /> : <Copy className="h-3 w-3" />}
-    </button>
-  );
 }
 
 export default function ChannelsPage() {
@@ -154,8 +131,6 @@ export default function ChannelsPage() {
                 <th className="text-left px-4 py-2">Channel</th>
                 <th className="text-left px-4 py-2">Category</th>
                 <th className="text-left px-4 py-2">Lang</th>
-                <th className="text-left px-4 py-2">Sources</th>
-                <th className="text-left px-4 py-2">CMC stream (VLC)</th>
                 <th className="text-left px-4 py-2 w-56">Health</th>
                 <th className="text-left px-4 py-2">Signal</th>
                 <th className="text-left px-4 py-2">Recording</th>
@@ -164,11 +139,10 @@ export default function ChannelsPage() {
             <tbody className="divide-y divide-border">
               {isLoading && (
                 Array.from({ length: 6 }).map((_, i) => (
-                  <tr key={i}><td colSpan={8} className="px-4 py-3"><div className="h-6 bg-panel2/50 rounded animate-pulse" /></td></tr>
+                  <tr key={i}><td colSpan={6} className="px-4 py-3"><div className="h-6 bg-panel2/50 rounded animate-pulse" /></td></tr>
                 ))
               )}
               {!isLoading && rows.map((c) => {
-                const activeId = c.runtime?.activeSourceId;
                 const score = c.runtime?.score ?? null;
                 // CMC has no failover-controller running, so most channels
                 // arrive here with score=null. Treat active + sources as
@@ -208,34 +182,6 @@ export default function ChannelsPage() {
                     </td>
                     <td className="px-4 py-3 text-muted"><Badge variant="outline">{c.category}</Badge></td>
                     <td className="px-4 py-3 text-muted"><Badge variant="outline">{c.language}</Badge></td>
-                    <td className="px-4 py-3">
-                      <div className="flex flex-col gap-0.5 text-xs">
-                        {c.sources.map((s) => {
-                          const isActive = s.id === activeId;
-                          return (
-                            <div key={s.id} className={cn('flex items-center gap-1.5', isActive && 'font-semibold text-accent-green')}>
-                              <Radio className={cn('h-3 w-3 shrink-0', isActive ? 'text-accent-green' : 'text-muted-2')} />
-                              <span>{s.name || s.kind}</span>
-                              <span className="text-muted-2 font-mono truncate max-w-[220px]" title={s.url}>{s.url}</span>
-                            </div>
-                          );
-                        })}
-                        {c.sources.length === 0 && <span className="text-muted-2">no sources</span>}
-                      </div>
-                    </td>
-                    <td className="px-4 py-3">
-                      <div className="flex flex-col gap-1 text-[11px] font-mono">
-                        {c.dempOutputUrlUdp ? (
-                          <div className="flex items-center gap-1.5" title="Multicast UDP — same-LAN VLC clients only; won't work over Tailscale/VPN">
-                            <Badge variant="outline" className="text-[9px] px-1 py-0">UDP</Badge>
-                            <span className="truncate max-w-[220px]" title={c.dempOutputUrlUdp}>{c.dempOutputUrlUdp}</span>
-                            <CopyBtn value={c.dempOutputUrlUdp} />
-                          </div>
-                        ) : (
-                          <span className="text-muted-2">—</span>
-                        )}
-                      </div>
-                    </td>
                     <td className="px-4 py-3"><HealthMeter value={score} label size="sm" /></td>
                     <td className="px-4 py-3">
                       <div className="flex flex-col gap-1 items-start">
@@ -249,7 +195,7 @@ export default function ChannelsPage() {
                 );
               })}
               {!isLoading && rows.length === 0 && (
-                <tr><td colSpan={8} className="p-10 text-center text-muted text-sm">
+                <tr><td colSpan={6} className="p-10 text-center text-muted text-sm">
                   No channels yet. Use <b>New Channel</b> to add your first one.
                 </td></tr>
               )}

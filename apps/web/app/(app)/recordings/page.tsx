@@ -1,21 +1,17 @@
 'use client';
 
 /**
- * Recordings — default view: EVERY recording (session) across all channels,
- * newest first. Filters (channel + date range + text search) narrow the
- * view. Each row is a logical recording spanning start-of-record to
- * stop-of-record, not the 60 s ffmpeg segment.
- *
- * Click Play → streams the session in the browser (assembled from the
- * segments it spans). Click Create clip → jumps to /clips/new with the
- * session preselected.
+ * Recordings — one row per logical recording session (start → stop, not the
+ * 60 s ffmpeg segment). Click a row to open the Clip Editor with the full
+ * session loaded; download the raw MP4 from the inline action. No separate
+ * preview player — the editor IS the player.
  */
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useMemo, useState } from 'react';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import { useQuery } from '@tanstack/react-query';
-import Hls from 'hls.js';
-import { Film, Play, Search, Scissors, Download, X } from 'lucide-react';
+import { Film, Search, Download, Loader2 } from 'lucide-react';
 import { toast } from 'sonner';
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '@/components/ui/select';
@@ -23,7 +19,6 @@ import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { api } from '@/lib/api';
 import { fmtBytes, fmtDurationMs } from '@/lib/utils';
-import { DemoScopeBanner } from '@/components/demo-scope-banner';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? '';
 
@@ -43,6 +38,7 @@ interface Session {
 interface Channel { id: string; name: string; slug: string }
 
 export default function RecordingsPage() {
+  const router = useRouter();
   const today = new Date().toISOString().slice(0, 10);
   const [channelId, setChannelId] = useState<string>('all');
   const [from, setFrom] = useState<string>(() => {
@@ -51,7 +47,7 @@ export default function RecordingsPage() {
   });
   const [to, setTo] = useState<string>(today);
   const [q, setQ] = useState('');
-  const [playing, setPlaying] = useState<Session | null>(null);
+  const [downloadingId, setDownloadingId] = useState<string | null>(null);
 
   const { data: channels } = useQuery<Channel[]>({
     queryKey: ['channels.for-recordings'],
@@ -80,18 +76,53 @@ export default function RecordingsPage() {
       s.channel.slug.toLowerCase().includes(needle));
   }, [sessions, q]);
 
+  function openEditor(s: Session) {
+    router.push(
+      `/clips/new?channelId=${s.channelId}` +
+      `&sessionStart=${encodeURIComponent(s.startedAt)}` +
+      `&sessionEnd=${encodeURIComponent(s.endedAt)}`,
+    );
+  }
+
+  async function download(s: Session, e: React.MouseEvent) {
+    e.stopPropagation();
+    if (downloadingId) return;
+    setDownloadingId(s.id);
+    try {
+      const token = typeof window !== 'undefined' ? localStorage.getItem('demp.accessToken') : null;
+      const p = new URLSearchParams();
+      p.set('channelId', s.channelId);
+      p.set('from', s.startedAt);
+      p.set('to',   s.endedAt);
+      toast.info('Preparing MP4 — large recordings can take a few seconds.');
+      const r = await fetch(`${API_BASE}/api/recordings/session-media?${p}`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${s.channel.slug}_${new Date(s.startedAt).toISOString().slice(0, 19).replace(/[:T]/g, '-')}.mp4`;
+      document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+      toast.success('Recording downloaded');
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Download failed');
+    } finally {
+      setDownloadingId(null);
+    }
+  }
+
   return (
     <div className="max-w-[1500px] mx-auto space-y-4">
       <div className="flex items-end justify-between gap-4 flex-wrap">
         <div>
           <h1 className="font-display text-2xl font-bold tracking-tight">Recordings</h1>
           <p className="text-xs text-muted mt-0.5">
-            30-day rolling archive. Grouped by recording session (start → stop). Filters narrow the view.
+            30-day rolling archive. Click any row to open it in the Clip Editor — trim, watermark, export.
           </p>
         </div>
       </div>
-
-      <DemoScopeBanner feature="Recording" />
 
       <Card className="p-3">
         <div className="flex items-center gap-2 flex-wrap text-xs">
@@ -141,14 +172,19 @@ export default function RecordingsPage() {
                     <th className="text-left px-4 py-2">Size</th>
                     <th className="text-left px-4 py-2">Segments</th>
                     <th className="text-left px-4 py-2">File / ID</th>
-                    <th className="px-4 py-2 w-56"></th>
+                    <th className="px-4 py-2 w-32"></th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-line">
                   {filtered.map((s) => {
                     const started = new Date(s.startedAt);
                     return (
-                      <tr key={s.id} className="hover:bg-panel/40">
+                      <tr
+                        key={s.id}
+                        onClick={() => openEditor(s)}
+                        className="hover:bg-panel/40 cursor-pointer transition-colors"
+                        title="Open in Clip Editor"
+                      >
                         <td className="px-4 py-2.5 font-medium">{s.channel.name}</td>
                         <td className="px-4 py-2.5 font-mono text-xs">
                           {started.toLocaleString(undefined, {
@@ -163,16 +199,18 @@ export default function RecordingsPage() {
                           {s.channel.slug}_{started.toISOString().slice(0, 19).replace(/[:T]/g, '-')}.mp4
                         </td>
                         <td className="px-4 py-2.5">
-                          <div className="flex items-center gap-1 justify-end">
-                            <Button size="sm" variant="secondary" onClick={() => setPlaying(s)}>
-                              <Play className="h-3.5 w-3.5" /> Play
-                            </Button>
-                            <Link href={`/clips/new?channelId=${s.channelId}&sessionStart=${encodeURIComponent(s.startedAt)}&sessionEnd=${encodeURIComponent(s.endedAt)}`}>
-                              <Button size="sm" variant="secondary" title="Create clip from this session">
-                                <Scissors className="h-3.5 w-3.5" />
-                              </Button>
-                            </Link>
-                          </div>
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            disabled={downloadingId === s.id}
+                            onClick={(e) => download(s, e)}
+                            title="Download raw MP4"
+                          >
+                            {downloadingId === s.id
+                              ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                              : <Download className="h-3.5 w-3.5" />}
+                            Download
+                          </Button>
                         </td>
                       </tr>
                     );
@@ -184,117 +222,8 @@ export default function RecordingsPage() {
         </CardContent>
       </Card>
 
-      {playing && <SessionPlayerModal session={playing} onClose={() => setPlaying(null)} />}
-    </div>
-  );
-}
-
-/**
- * HLS-backed session player. The server exposes an .m3u8 that lists
- * every 60-s segment covering [startedAt, endedAt]; hls.js loads only
- * the segments it needs. First frame appears in ~1-2 s regardless of
- * whether the session is 5 minutes or 24 hours long, and any seek
- * jumps straight to the target segment (streams the surrounding ones
- * in the background as a normal HLS buffer would).
- */
-function SessionPlayerModal({ session, onClose }: { session: Session; onClose: () => void }) {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
-
-    const token = typeof window !== 'undefined' ? localStorage.getItem('demp.accessToken') : null;
-    const p = new URLSearchParams();
-    p.set('channelId', session.channelId);
-    p.set('from', session.startedAt);
-    p.set('to',   session.endedAt);
-    const src = `${API_BASE}/api/recordings/session.m3u8?${p}`;
-
-    let hls: Hls | null = null;
-    if (Hls.isSupported()) {
-      hls = new Hls({
-        xhrSetup: (xhr) => { if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`); },
-        // Tight rolling buffer — server splits each 60-s segment into
-        // 6-s slices, so we only need 2-3 chunks ahead. On seek,
-        // hls.js downloads a single ~1.5 MB slice and starts decoding
-        // within ~500 ms instead of waiting for a whole 60-s file.
-        maxBufferLength: 12,
-        maxMaxBufferLength: 24,
-        backBufferLength: 12,
-        // Cap in-memory buffer to keep long sessions from ballooning.
-        maxBufferSize: 8 * 1024 * 1024,
-        // Fire the first XHR the moment a source is attached.
-        startFragPrefetch: true,
-        lowLatencyMode: false,
-      });
-      hls.on(Hls.Events.ERROR, (_e, data) => {
-        if (data.fatal) setError(`${data.type}: ${data.details}`);
-      });
-      hls.loadSource(src);
-      hls.attachMedia(video);
-    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      // Safari — can't add Auth header. Fall back to session-media MP4.
-      const mp4 = `${API_BASE}/api/recordings/session-media?${p}${token ? `&t=${encodeURIComponent(token)}` : ''}`;
-      video.src = mp4;
-    } else {
-      setError('This browser does not support HLS or Media Source Extensions.');
-    }
-    return () => { hls?.destroy(); };
-  }, [session.channelId, session.startedAt, session.endedAt]);
-
-  async function download() {
-    try {
-      const token = typeof window !== 'undefined' ? localStorage.getItem('demp.accessToken') : null;
-      const p = new URLSearchParams();
-      p.set('channelId', session.channelId);
-      p.set('from', session.startedAt);
-      p.set('to',   session.endedAt);
-      const r = await fetch(`${API_BASE}/api/recordings/session-media?${p}`, {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
-      });
-      const blob = await r.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `${session.channel.slug}_${new Date(session.startedAt).toISOString().slice(0, 19).replace(/[:T]/g, '-')}.mp4`;
-      document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
-      toast.success('Recording downloaded');
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : 'Failed');
-    }
-  }
-
-  return (
-    <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur flex items-center justify-center p-4" onClick={onClose}>
-      <div className="w-full max-w-5xl bg-panel rounded-xl shadow-lift overflow-hidden" onClick={(e) => e.stopPropagation()}>
-        <div className="flex items-center justify-between px-4 py-2 border-b border-line">
-          <div>
-            <div className="text-sm font-medium">
-              {session.channel.name} — {new Date(session.startedAt).toLocaleString(undefined, { hour12: false })}
-            </div>
-            <div className="text-[10px] text-muted-2 font-mono">
-              {fmtDurationMs(session.durationMs)} · {fmtBytes(Number(session.sizeBytes))} · {session.segmentCount} segments
-            </div>
-          </div>
-          <button onClick={onClose} className="text-muted hover:text-txt"><X className="h-5 w-5" /></button>
-        </div>
-        <div className="bg-black">
-          {error ? (
-            <div className="p-10 text-center text-sm text-accent-red">
-              Playback error: {error}
-            </div>
-          ) : (
-            <video ref={videoRef} controls autoPlay className="w-full h-auto max-h-[70vh]" />
-          )}
-        </div>
-        <div className="flex items-center justify-between px-4 py-2 border-t border-line">
-          <div className="text-[11px] text-muted-2">Streaming from segments — scrub anywhere, buffer catches up in the background.</div>
-          <Button size="sm" variant="secondary" onClick={download}>
-            <Download className="h-3.5 w-3.5" /> Download .mp4
-          </Button>
-        </div>
+      <div className="text-[11px] text-muted-2 text-center">
+        Tip: click a row to open it in the <Link href="/clips" className="text-brand hover:underline">Clip Editor</Link>.
       </div>
     </div>
   );

@@ -46,8 +46,9 @@ export default function DownloadsPage() {
           Downloads
         </h1>
         <p className="text-xs text-muted mt-1">
-          CMC Viewer — the desktop video wall. Plays every channel's satellite feed
-          directly at source quality, no browser codec limits.
+          CMC Video Wall — the desktop client that drives the operations-room wall.
+          Joins the satellite UDP multicast for every channel directly and composes
+          them into a Single, Dual, Mosaic-20, or Grid-32 layout.
         </p>
       </div>
 
@@ -57,11 +58,11 @@ export default function DownloadsPage() {
           <div>
             <CardTitle className="flex items-center gap-2">
               <Monitor className="h-4 w-4 text-brand" />
-              CMC Viewer for Windows
+              CMC Video Wall for Windows
             </CardTitle>
             <p className="text-xs text-muted mt-1 max-w-lg">
-              Self-contained. Bundles VLC + all Python dependencies — just
-              double-click to run.
+              Native Rust + GStreamer build. Portable ZIP — extract anywhere and
+              double-click. No installer, no admin rights, no external dependencies.
             </p>
           </div>
           <Badge variant="brand" className="uppercase">Windows 64-bit</Badge>
@@ -85,19 +86,23 @@ export default function DownloadsPage() {
           )}
 
           <div className="pt-2 border-t border-line">
-            <div className="text-[10px] uppercase tracking-widest text-muted-2 mb-2">Install</div>
+            <div className="text-[10px] uppercase tracking-widest text-muted-2 mb-2">Install &amp; run</div>
             <div className="space-y-2 text-sm">
               <Step n={1}>Click <b>Download</b> above.</Step>
-              <Step n={2}>Double-click the <span className="font-mono">CMC-Viewer.exe</span> file.</Step>
-              <Step n={3}>Windows may warn "unrecognised app" — click <b>More info → Run anyway</b> (it's unsigned; that's expected).</Step>
-              <Step n={4}>Sign in with the same email + password you use on this web app.</Step>
-              <Step n={5}>Pick a grid size from the toolbar. Right-click any tile to change its channel.</Step>
-              <Step n={6}>
-                Keys: <kbd className="rounded border border-line px-1.5 py-0.5 font-mono text-[10px] bg-panel2/70">F11</kbd> fullscreen,
+              <Step n={2}>Right-click the ZIP → <b>Properties → Unblock</b> (Windows "downloaded from internet" flag).</Step>
+              <Step n={3}>Extract the ZIP anywhere on a local drive — <span className="font-mono">C:\CMC-VideoWall\</span> is the convention.</Step>
+              <Step n={4}>Double-click <span className="font-mono">CMC-VideoWall.cmd</span>. First launch shows the sign-in dialog.</Step>
+              <Step n={5}>Sign in with your CMC credentials and the API address <span className="font-mono">http://10.51.80.202:4001</span>. Fill in <b>Multicast NIC IP</b> if the PC has more than one network card.</Step>
+              <Step n={6}>Pick a layout from the toolbar (Single / Dual / Mosaic-20 / Grid-32) then click <b>Start Fullscreen</b>.</Step>
+              <Step n={7}>
+                Keys inside fullscreen: <kbd className="rounded border border-line px-1.5 py-0.5 font-mono text-[10px] bg-panel2/70">F11</kbd> toggle,
                 {' '}<kbd className="rounded border border-line px-1.5 py-0.5 font-mono text-[10px] bg-panel2/70">Esc</kbd> exit,
-                {' '}<kbd className="rounded border border-line px-1.5 py-0.5 font-mono text-[10px] bg-panel2/70">Double-click</kbd> solo a tile.
+                {' '}<kbd className="rounded border border-line px-1.5 py-0.5 font-mono text-[10px] bg-panel2/70">Right-click</kbd> tile for Fill mode / Clear slot.
               </Step>
             </div>
+            <p className="text-[11px] text-muted-2 mt-3">
+              Preferences (which channel goes in which slot, fill modes) live in <span className="font-mono">%APPDATA%\CMC-VideoWall\</span> so upgrading is safe — just extract the new ZIP over the old folder.
+            </p>
           </div>
         </CardContent>
       </Card>

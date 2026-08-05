@@ -7,7 +7,7 @@ export const CHANNEL_LANGUAGES = ['EN', 'UR', 'AR', 'PA', 'OTHER'] as const;
 
 export const SOURCE_KINDS = ['UDP', 'SRT', 'RTSP', 'RTMP', 'HLS', 'FILE'] as const;
 
-export const CLIP_FORMATS = ['MP4', 'MOV', 'MKV', 'WEBM'] as const;
+export const CLIP_FORMATS = ['MP4', 'MOV', 'MKV'] as const;
 export const CLIP_RESOLUTIONS = ['3840x2160', '1920x1080', '1280x720', '854x480'] as const;
 
 export const ROLES = ['ADMIN', 'OPERATOR', 'ANALYST', 'VIEWER'] as const;

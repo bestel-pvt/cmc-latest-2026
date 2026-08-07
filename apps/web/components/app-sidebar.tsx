@@ -4,7 +4,7 @@ import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import {
   LayoutDashboard, Tv2, Film, ScrollText,
-  Users, Settings2, Scissors, Shield, Download,
+  Users, Settings2, Scissors, Shield, Download, LayoutGrid,
 } from 'lucide-react';
 import { WordMark, PoweredByAnalysys } from '@/components/brand-mark';
 import { cn } from '@/lib/utils';
@@ -22,6 +22,7 @@ interface NavItem {
 // controls. Simple channels + recordings + clips + admin.
 const NAV: NavItem[] = [
   { href: '/dashboard',   label: 'Dashboard',   icon: LayoutDashboard },
+  { href: '/multiviewer', label: 'Video Wall',  icon: LayoutGrid },
   { href: '/channels',    label: 'Channels',    icon: Tv2 },
   { href: '/recordings',  label: 'Recordings',  icon: Film },
   { href: '/clips',       label: 'Clips',       icon: Scissors },

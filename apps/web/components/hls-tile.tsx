@@ -1,0 +1,222 @@
+'use client';
+
+/**
+ * A single HLS-playback tile for the multiviewer wall.
+ *
+ * Reuses one hls.js instance per tile and swaps sources when the
+ * `channelSlug` prop changes so a template load doesn't tear down
+ * and rebuild every player. Muted by default and controls hidden —
+ * this is a monitoring surface, not an ergonomic desktop player.
+ */
+
+import { useEffect, useRef, useState } from 'react';
+import Hls from 'hls.js';
+import { X, Volume2, VolumeX } from 'lucide-react';
+import { cn } from '@/lib/utils';
+
+interface HlsTileProps {
+  slug: string | null;
+  channelName?: string | null;
+  logoUrl?: string | null;
+  /** Global audio state — tile is unmuted only when this matches this
+   * tile's id. Parent tracks which slot has audio so we can enforce
+   * "only one channel makes noise at a time". */
+  audioActive: boolean;
+  /** Called when the user clicks the volume icon on this tile. Parent
+   * flips the global audio slot: click a muted tile → this becomes
+   * active; click the active tile → all mute. */
+  onToggleAudio: () => void;
+  onClear?: () => void;
+  onPick?: () => void;
+  className?: string;
+}
+
+/**
+ * The API serves HLS at `<api-host>/hls/<slug>/live.m3u8`. We prefer
+ * NEXT_PUBLIC_API_URL (baked at build time), but if it's empty or
+ * absent — which happens the first time the web is built without the
+ * env being loaded — fall back to the SAME hostname the browser
+ * loaded the page from, on port 4001. That makes the wall keep
+ * working even when a rebuild forgot to pipe the env var through.
+ */
+function hlsUrl(slug: string): string {
+  let base = (process.env.NEXT_PUBLIC_API_URL ?? '').replace(/\/+$/, '');
+  if (!base && typeof window !== 'undefined') {
+    base = `${window.location.protocol}//${window.location.hostname}:4001`;
+  }
+  return `${base}/hls/${slug}/live.m3u8`;
+}
+
+export function HlsTile({
+  slug,
+  channelName,
+  logoUrl,
+  audioActive,
+  onToggleAudio,
+  onClear,
+  onPick,
+  className,
+}: HlsTileProps) {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const hlsRef = useRef<Hls | null>(null);
+  const [status, setStatus] = useState<'idle' | 'loading' | 'playing' | 'error'>('idle');
+
+  // Attach / re-attach the HLS source when the assigned channel changes.
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    // Empty slot: fully release the hls.js instance so we're not
+    // fetching a playlist we no longer show.
+    if (!slug) {
+      if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
+      video.removeAttribute('src');
+      video.load();
+      setStatus('idle');
+      return;
+    }
+
+    setStatus('loading');
+    const url = hlsUrl(slug);
+
+    // Safari can play HLS natively — skip hls.js there.
+    if (!Hls.isSupported() && video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = url;
+      video.play().catch(() => {});
+      setStatus('playing');
+      return;
+    }
+
+    if (hlsRef.current) { hlsRef.current.destroy(); }
+    const hls = new Hls({
+      // User accepts high latency in exchange for zero stalls.
+      // 6 s segments × liveSyncDurationCount 3 = start ~18 s behind live.
+      // Then a big forward buffer (120 s) fills in background so any
+      // network hiccup up to a couple of minutes is invisible.
+      liveDurationInfinity: true,
+      lowLatencyMode: false,
+      liveSyncDurationCount: 3,
+      liveMaxLatencyDurationCount: 40,     // let latency drift up to ~4 minutes before catching up
+      maxBufferLength: 120,                // 2 min forward buffer
+      maxMaxBufferLength: 240,             // 4 min ceiling
+      backBufferLength: 60,                // 1 min back-buffer
+      maxLiveSyncPlaybackRate: 1.05,       // gentle 5% catch-up if drifting
+      fragLoadingMaxRetry: 8,              // 8 retries per segment
+      fragLoadingRetryDelay: 500,
+      levelLoadingMaxRetry: 6,
+      manifestLoadingMaxRetry: 6,
+    });
+    hlsRef.current = hls;
+    hls.attachMedia(video);
+    hls.on(Hls.Events.MEDIA_ATTACHED, () => hls.loadSource(url));
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      video.play().catch(() => {});
+      setStatus('playing');
+    });
+    hls.on(Hls.Events.ERROR, (_evt, data) => {
+      if (data.fatal) {
+        setStatus('error');
+        // Try to recover network + media errors; give up on other-fatal.
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+          hls.startLoad();
+          setStatus('loading');
+        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+          hls.recoverMediaError();
+          setStatus('loading');
+        }
+      }
+    });
+
+    return () => {
+      hls.destroy();
+      hlsRef.current = null;
+    };
+  }, [slug]);
+
+  // Sync audio state with the media element. `audioActive` from the
+  // parent is the single source of truth — muted whenever another
+  // tile has audio, unmuted when this tile is the chosen one.
+  useEffect(() => {
+    if (videoRef.current) videoRef.current.muted = !audioActive;
+  }, [audioActive]);
+
+  return (
+    <div
+      className={cn(
+        'relative bg-black overflow-hidden group',
+        // Bright ring around a tile whose audio is currently ON so
+        // the operator can see at a glance which channel is audible.
+        audioActive && 'ring-2 ring-accent-orange ring-inset',
+        className,
+      )}
+    >
+      {slug ? (
+        <>
+          <video
+            ref={videoRef}
+            playsInline
+            muted
+            autoPlay
+            // object-fill: STRETCH to fill the tile without cropping or
+            // letterbox. The user tried `cover` and rejected it because
+            // it cropped the sides. `contain` shows the full frame but
+            // adds black bars. `fill` is the only remaining option that
+            // (a) shows the full source picture, (b) fills the tile,
+            // at the cost of aspect distortion. This is acceptable on a
+            // monitoring wall — the operator needs situational awareness
+            // of the whole frame, not a photographically-accurate image.
+            style={{ objectFit: 'fill' }}
+            className="w-full h-full"
+          />
+          {/* corner overlay: logo + name */}
+          <div className="absolute top-1 left-1 flex items-center gap-1.5 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white/90 backdrop-blur-sm">
+            {logoUrl ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img src={logoUrl} alt="" className="h-3 w-3 object-contain" />
+            ) : null}
+            <span className="truncate max-w-[10rem]">{channelName ?? slug}</span>
+          </div>
+          {/* status pill */}
+          {status !== 'playing' ? (
+            <div className="absolute top-1 right-1 rounded bg-black/60 px-1.5 py-0.5 text-[9px] uppercase tracking-wider text-white/70">
+              {status}
+            </div>
+          ) : null}
+          {/* hover controls */}
+          <div className="absolute inset-0 opacity-0 group-hover:opacity-100 transition bg-gradient-to-t from-black/50 via-transparent to-black/40 pointer-events-none">
+            <div className="pointer-events-auto absolute bottom-1 right-1 flex gap-1">
+              <button
+                onClick={onToggleAudio}
+                className={cn(
+                  'p-1 rounded text-white',
+                  audioActive
+                    ? 'bg-accent-orange hover:bg-accent-red'
+                    : 'bg-black/70 hover:bg-black/90',
+                )}
+                title={audioActive ? 'Mute (currently the audio channel)' : 'Play audio (mutes any other)'}
+              >
+                {audioActive ? <Volume2 className="h-3 w-3" /> : <VolumeX className="h-3 w-3" />}
+              </button>
+              {onClear ? (
+                <button
+                  onClick={onClear}
+                  className="p-1 rounded bg-black/70 text-white hover:bg-red-600"
+                  title="Remove channel from slot"
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              ) : null}
+            </div>
+          </div>
+        </>
+      ) : (
+        <button
+          onClick={onPick}
+          className="w-full h-full flex items-center justify-center border-2 border-dashed border-white/10 hover:border-white/30 text-white/40 hover:text-white/70 text-xs uppercase tracking-widest transition"
+        >
+          + Add
+        </button>
+      )}
+    </div>
+  );
+}

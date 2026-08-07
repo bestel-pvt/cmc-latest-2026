@@ -24,7 +24,16 @@ function dempUrlFor(slug: string, port?: number | null): string | null {
 }
 
 const routes: FastifyPluginAsync = async (app) => {
-  app.addHook('preHandler', app.authenticate);
+  app.addHook('preHandler', async (req, reply) => {
+    // Channel logo GETs are public — plain <img src> tags in the web
+    // wall / channel list can't attach a JWT bearer, and the logos
+    // aren't sensitive. Everything else in this router still requires
+    // authentication.
+    if (req.method === 'GET' && /^\/api\/channels\/[^/]+\/logo(\?|$)/.test(req.raw.url ?? '')) {
+      return;
+    }
+    return app.authenticate(req, reply);
+  });
 
   app.get('/', async (req) => {
     const q = (req.query as { q?: string; category?: string; language?: string; active?: string }) ?? {};

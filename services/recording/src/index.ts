@@ -88,8 +88,26 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
       const [proto, rest] = input.split('://', 2);
       input = `${proto!.toLowerCase()}://@${rest}`;
     }
-    if (!input.includes('?')) {
-      input = `${input}?fifo_size=100000&overrun_nonfatal=1&timeout=6000000`;
+    // Multi-NIC servers need `localaddr` pinned to the recording NIC
+    // (satellite feed lives on 10.51.80.202) — without it ffmpeg joins
+    // the multicast group on whichever NIC Windows picks first, gets
+    // no packets, times out with exit -5, and the supervisor loops
+    // forever. LOCALADDR env is set once in .env (same value the
+    // live-hls service uses).
+    const localaddr = process.env.LOCALADDR ?? '';
+    const hasQ = input.includes('?');
+    const parts: string[] = [];
+    if (!input.includes('fifo_size='))         parts.push('fifo_size=4000000');
+    if (!input.includes('overrun_nonfatal='))  parts.push('overrun_nonfatal=1');
+    // 60 s timeout so IGMP renegotiations / brief switch drops don't
+    // kill the recorder mid-session.
+    if (!input.includes('timeout='))           parts.push('timeout=60000000');
+    if (!input.includes('buffer_size='))       parts.push('buffer_size=8388608');
+    if (localaddr && !input.toLowerCase().includes('localaddr=')) {
+      parts.push(`localaddr=${localaddr}`);
+    }
+    if (parts.length) {
+      input = `${input}${hasQ ? '&' : '?'}${parts.join('&')}`;
     }
   }
 

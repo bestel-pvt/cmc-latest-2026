@@ -26,10 +26,10 @@ importers:
 
   apps/api:
     dependencies:
-      '@demp/db':
+      '@cmc/db':
         specifier: workspace:*
         version: link:../../packages/db
-      '@demp/shared':
+      '@cmc/shared':
         specifier: workspace:*
         version: link:../../packages/shared
       '@fastify/cors':
@@ -102,7 +102,7 @@ importers:
 
   apps/web:
     dependencies:
-      '@demp/shared':
+      '@cmc/shared':
         specifier: workspace:*
         version: link:../../packages/shared
       '@radix-ui/react-avatar':
@@ -326,7 +326,29 @@ importers:
 
   services/janitor:
     dependencies:
-      '@demp/db':
+      '@cmc/db':
+        specifier: workspace:*
+        version: link:../../packages/db
+      pino:
+        specifier: ^9.5.0
+        version: 9.14.0
+      pino-pretty:
+        specifier: ^11.3.0
+        version: 11.3.0
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.20.1
+      tsx:
+        specifier: ^4.19.2
+        version: 4.23.1
+      typescript:
+        specifier: ^5.6.3
+        version: 5.9.3
+
+  services/live-hls:
+    dependencies:
+      '@cmc/db':
         specifier: workspace:*
         version: link:../../packages/db
       pino:
@@ -348,10 +370,10 @@ importers:
 
   services/recording:
     dependencies:
-      '@demp/db':
+      '@cmc/db':
         specifier: workspace:*
         version: link:../../packages/db
-      '@demp/shared':
+      '@cmc/shared':
         specifier: workspace:*
         version: link:../../packages/shared
       chokidar:

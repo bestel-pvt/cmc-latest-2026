@@ -1,0 +1,23 @@
+[Unit]
+Description=CMC live-hls (per-channel ffmpeg remuxers → HLS playlists on disk)
+After=network-online.target
+PartOf=demp.target
+
+[Service]
+Type=simple
+User=demp
+Group=demp
+WorkingDirectory=/opt/demp
+Environment=NODE_ENV=production
+EnvironmentFile=/opt/demp/.env
+ExecStart=/usr/bin/pnpm --filter @cmc/live-hls start
+Restart=on-failure
+RestartSec=10
+# Each channel spawns one ffmpeg subprocess; raise file-descriptor limit
+# so 32+ concurrent ffmpegs plus their sockets stay comfortable.
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=demp.target

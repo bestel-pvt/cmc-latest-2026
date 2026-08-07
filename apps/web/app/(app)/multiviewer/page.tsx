@@ -71,9 +71,8 @@ function buildLayouts(): Layout[] {
     }
   }
 
-  // Grid32: 8 cols × 4 rows — matches a landscape TV wall aspect and
-  // makes each tile close to 16:9 so news content fits without giant
-  // letterbox bars.
+  // Grid32: 8 cols × 4 rows = 32 slots — user's original request,
+  // matches the standalone Rust wall.
   const grid32: Slot[] = [];
   for (let r = 0; r < 4; r++) {
     for (let c = 0; c < 8; c++) {

@@ -144,9 +144,14 @@ export function HlsTile({
     <div
       className={cn(
         'relative bg-black overflow-hidden group',
-        // Bright ring around a tile whose audio is currently ON so
-        // the operator can see at a glance which channel is audible.
-        audioActive && 'ring-2 ring-accent-orange ring-inset',
+        // Audio-active tile still elevates in z so the border-overlay
+        // (rendered below as its own absolute div) reads clearly above
+        // adjacent tiles when they touch. Actual border/glow is drawn
+        // by the overlay div — putting it as ring-inset on this parent
+        // would sit BEHIND the video (video is w-full h-full on top),
+        // so operators lost the highlight the moment a channel started
+        // playing.
+        audioActive && 'z-10',
         className,
       )}
     >
@@ -157,17 +162,24 @@ export function HlsTile({
             playsInline
             muted
             autoPlay
-            // object-fill: STRETCH to fill the tile without cropping or
-            // letterbox. The user tried `cover` and rejected it because
-            // it cropped the sides. `contain` shows the full frame but
-            // adds black bars. `fill` is the only remaining option that
-            // (a) shows the full source picture, (b) fills the tile,
-            // at the cost of aspect distortion. This is acceptable on a
-            // monitoring wall — the operator needs situational awareness
-            // of the whole frame, not a photographically-accurate image.
-            style={{ objectFit: 'fill' }}
+            // object-contain: preserve source aspect + show full frame.
+            // The grid layout is now 6×6 so each tile is exact 16:9 on
+            // a 1080p wall — no distortion, no crop, no visible letter-
+            // box because tile aspect matches source aspect. On non-
+            // 16:9 walls the tiny aspect drift falls back to letterbox
+            // (blends with the black wall bg) rather than a crop.
+            style={{ objectFit: 'contain' }}
             className="w-full h-full"
           />
+          {/* Audio-active border: rendered ABOVE the video so it stays
+              visible regardless of object-fit / video paint. Thick light
+              green with an outer glow — hard to miss on a busy wall. */}
+          {audioActive ? (
+            <div
+              className="pointer-events-none absolute inset-0 border-4 border-[#4ade80] z-20"
+              style={{ boxShadow: '0 0 18px 2px rgba(74,222,128,0.7)' }}
+            />
+          ) : null}
           {/* corner overlay: logo + name */}
           <div className="absolute top-1 left-1 flex items-center gap-1.5 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white/90 backdrop-blur-sm">
             {logoUrl ? (
@@ -190,7 +202,7 @@ export function HlsTile({
                 className={cn(
                   'p-1 rounded text-white',
                   audioActive
-                    ? 'bg-accent-orange hover:bg-accent-red'
+                    ? 'bg-[#4ade80] text-black hover:bg-[#22c55e]'
                     : 'bg-black/70 hover:bg-black/90',
                 )}
                 title={audioActive ? 'Mute (currently the audio channel)' : 'Play audio (mutes any other)'}

@@ -8,6 +8,8 @@
 //! so it doesn't block eframe. Communication with the config UI is
 //! via `WallCommand` on an mpsc channel.
 
+use std::sync::{Arc, Mutex};
+
 use anyhow::{anyhow, Context, Result};
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -23,6 +25,112 @@ use crate::api::Channel;
 use crate::config::{Config, FillMode};
 use crate::gst_pipeline;
 use crate::layouts::{by_id as layout_by_id, Slot};
+
+/// Per-tile handle stashed in the HWND USERDATA so the tile WndProc
+/// can toggle audio on double-click. Just the identity + URL needed
+/// by the audio controller — nothing else.
+struct TileHandle {
+    tile_id: usize,
+    channel_url: String,
+    localaddr: String,
+    audio: Arc<AudioController>,
+}
+
+/// One live audio-only GStreamer pipeline. Dropping the wrapper
+/// tears the pipeline down on a scratch thread so the caller (the
+/// WndProc on the UI thread) never blocks.
+struct AudioTap {
+    pipeline: gst::Pipeline,
+    tile_id: usize,
+}
+
+impl Drop for AudioTap {
+    fn drop(&mut self) {
+        let p = self.pipeline.clone();
+        std::thread::spawn(move || { let _ = p.set_state(gst::State::Null); });
+    }
+}
+
+/// Single global audio arbiter — at most ONE channel's audio plays at
+/// a time. Second double-click on the same tile mutes; double-click on
+/// a different tile switches. Video pipelines are never touched.
+struct AudioController {
+    active: Mutex<Option<AudioTap>>,
+}
+
+impl AudioController {
+    fn new() -> Self { Self { active: Mutex::new(None) } }
+
+    fn toggle(&self, tile_id: usize, url: &str, localaddr: &str) {
+        let mut slot = match self.active.lock() { Ok(g) => g, Err(_) => return };
+        if let Some(c) = slot.as_ref() {
+            if c.tile_id == tile_id {
+                *slot = None;
+                log::info!("audio: mute (tile {tile_id})");
+                return;
+            }
+        }
+        *slot = None;
+        match spawn_audio_tap(tile_id, url, localaddr) {
+            Ok(t) => { *slot = Some(t); log::info!("audio: unmute tile {tile_id} url={url}"); }
+            Err(e) => log::error!("audio: tap failed for tile {tile_id}: {e:#}"),
+        }
+    }
+}
+
+/// Programmatic audio pipeline: udpsrc → tsdemux → (pad-added filters
+/// to audio pad only) → decodebin → autoaudiosink. Built element by
+/// element rather than parse-launch so tsdemux's video pad can be left
+/// unlinked (parse-launch would try to plug it downstream and stall).
+fn spawn_audio_tap(tile_id: usize, url: &str, localaddr: &str) -> Result<AudioTap> {
+    let url_with_bind = if url.contains("localaddr=") {
+        url.to_string()
+    } else if !localaddr.is_empty() {
+        let sep = if url.contains('?') { '&' } else { '?' };
+        format!("{url}{sep}localaddr={localaddr}")
+    } else { url.to_string() };
+    let src = gst_pipeline::UdpSource::parse(&url_with_bind)?;
+
+    let pipeline = gst::Pipeline::new();
+    let udpsrc = gst::ElementFactory::make("udpsrc").build().context("make udpsrc")?;
+    udpsrc.set_property("address", &src.address);
+    udpsrc.set_property("port", src.port as i32);
+    udpsrc.set_property("buffer-size", 2_097_152_i32);
+    let caps = gst::Caps::builder("video/mpegts").field("systemstream", true).build();
+    udpsrc.set_property("caps", &caps);
+    if let Some(iface) = &src.bind_address { udpsrc.set_property("multicast-iface", iface); }
+    let queue = gst::ElementFactory::make("queue").build().context("make queue")?;
+    let tsdemux = gst::ElementFactory::make("tsdemux").build().context("make tsdemux")?;
+    pipeline.add_many([&udpsrc, &queue, &tsdemux]).context("add core")?;
+    gst::Element::link_many([&udpsrc, &queue, &tsdemux]).context("link core")?;
+
+    let pipeline_weak = pipeline.downgrade();
+    tsdemux.connect_pad_added(move |_demux, pad| {
+        let caps = match pad.current_caps().or_else(|| Some(pad.query_caps(None))) { Some(c) => c, None => return };
+        let is_audio = caps.structure(0).map(|s| s.name().starts_with("audio/")).unwrap_or(false);
+        if !is_audio { return; }
+        let Some(pipeline) = pipeline_weak.upgrade() else { return };
+        if pipeline.by_name("wall-audio-sink").is_some() { return; }
+        let Ok(dec) = gst::ElementFactory::make("decodebin").build() else { return };
+        let Ok(conv) = gst::ElementFactory::make("audioconvert").build() else { return };
+        let Ok(res) = gst::ElementFactory::make("audioresample").build() else { return };
+        let Ok(sink) = gst::ElementFactory::make("autoaudiosink").name("wall-audio-sink").build() else { return };
+        sink.set_property("sync", false);
+        if pipeline.add_many([&dec, &conv, &res, &sink]).is_err() { return; }
+        for e in [&dec, &conv, &res, &sink] { let _ = e.sync_state_with_parent(); }
+        if let Some(ds) = dec.static_pad("sink") { let _ = pad.link(&ds); }
+        let conv_c = conv.clone(); let res_c = res.clone(); let sink_c = sink.clone();
+        dec.connect_pad_added(move |_, dpad| {
+            let Some(cs) = conv_c.static_pad("sink") else { return };
+            if cs.is_linked() { return; }
+            let _ = dpad.link(&cs);
+            let _ = gst::Element::link_many([&conv_c, &res_c, &sink_c]);
+        });
+    });
+
+    pipeline.set_state(gst::State::Playing).context("audio set to Playing")?;
+    Ok(AudioTap { pipeline, tile_id })
+}
 
 /// Snapshot the UI hands to the wall process when Start Fullscreen
 /// is clicked. Serialized to a temp JSON file and passed to the
@@ -89,6 +197,7 @@ pub fn run_from_json(json_path: &str) -> Result<()> {
         start,
         parent: None,
         tiles: Vec::new(),
+        audio: Arc::new(AudioController::new()),
         tiles_realized: false,
     };
     event_loop
@@ -103,25 +212,23 @@ struct PlayingTile {
     /// windows on Windows without decorations).
     hwnd: isize,
     pipeline: gst::Pipeline,
+    /// Leaked `Box<TileHandle>` pointer stashed in the HWND's
+    /// GWLP_USERDATA — freed on Drop after DestroyWindow.
+    handle_ptr: usize,
 }
 
 impl Drop for PlayingTile {
     fn drop(&mut self) {
-        // Async pipeline shutdown — set_state(Null) can block for
-        // hundreds of ms per pipeline while GStreamer flushes its
-        // decoder threads. With 32 pipelines closed serially the
-        // process appears frozen ("Not Responding") for ~10 s. We
-        // pin the shutdown to a background thread so the drop
-        // itself returns immediately.
         let pipeline = self.pipeline.clone();
-        std::thread::spawn(move || {
-            let _ = pipeline.set_state(gst::State::Null);
-        });
+        std::thread::spawn(move || { let _ = pipeline.set_state(gst::State::Null); });
         #[cfg(windows)]
         unsafe {
             use windows::Win32::UI::WindowsAndMessaging::DestroyWindow;
             use windows::Win32::Foundation::HWND;
             let _ = DestroyWindow(HWND(self.hwnd as *mut _));
+        }
+        if self.handle_ptr != 0 {
+            unsafe { let _ = Box::from_raw(self.handle_ptr as *mut TileHandle); }
         }
     }
 }
@@ -130,6 +237,7 @@ struct WallApp {
     start: WallStart,
     parent: Option<Window>,
     tiles: Vec<Option<PlayingTile>>,
+    audio: Arc<AudioController>,
     /// True once we've created tiles for the actual fullscreen
     /// size. Windows fullscreen transitions are async — the parent
     /// window's `inner_size()` in `resumed()` is the pre-fullscreen
@@ -282,7 +390,7 @@ impl WallApp {
                 let url = c
                     .primary_url(&self.start.localaddr)
                     .unwrap_or_else(|| "<no url>".to_string());
-                match spawn_playing_tile(event_loop, parent_hwnd, c.clone(), &self.start.localaddr, rect, fm, downsample_to) {
+                match spawn_playing_tile(event_loop, parent_hwnd, idx, c.clone(), &self.start.localaddr, rect, fm, downsample_to, self.audio.clone()) {
                     Ok(t) => {
                         log::info!("slot {idx} {} → OK  url={url}", c.slug);
                         Some(t)
@@ -301,11 +409,13 @@ impl WallApp {
 fn spawn_playing_tile(
     _event_loop: &ActiveEventLoop,
     parent_hwnd: Option<isize>,
+    tile_id: usize,
     channel: Channel,
     localaddr: &str,
     rect: (i32, i32, u32, u32),
     fill: FillMode,
     downsample_to: u32,
+    audio: std::sync::Arc<AudioController>,
 ) -> Result<PlayingTile> {
     let parent = parent_hwnd.ok_or_else(|| anyhow!("no parent HWND"))?;
     let hwnd = create_child_hwnd(parent, rect)?;
@@ -315,39 +425,47 @@ fn spawn_playing_tile(
         .ok_or_else(|| anyhow!("no primary URL for {}", channel.slug))?;
     let src = gst_pipeline::UdpSource::parse(&url)?;
 
-    // Sink strategy — three-tier fallback so the wall works on any
-    // Windows host, from GPU-equipped operator PCs down to headless
-    // servers reached via RDP:
-    //   1. glimagesink (shared GL context) — O(1) driver cost
-    //      across N sinks; best for Grid32.
-    //   2. d3d11videosink — fast on GPU hosts, caps at ~20 sinks.
-    //   3. autovideosink — GStreamer picks whatever's actually
-    //      registered (directdrawsink / d3dvideosink) so headless /
-    //      RDP boxes without D3D11 or Mesa still render.
-    // decodebin3 auto-picks the decoder for any codec (H.264, H.265,
-    // MPEG-2).
-    let pipeline = build_pipeline(
-        &gst_pipeline::build_swdec_any_codec(&src, downsample_to, gst_pipeline::SinkKind::GlShared),
-        hwnd,
-    )
-    .or_else(|_| {
-        build_pipeline(
+    // HW-first. `decodebin` inside `udp_ts_d3d11` picks the d3d11
+    // decoder that matches the codec (H.264 for most channels, H.265
+    // for ARY / 365 News, MPEG-2 for anything old). If HW isn't
+    // available for any reason, fall through to SW tiers.
+    let pipeline = build_pipeline(&gst_pipeline::udp_ts_d3d11(&src), hwnd)
+        .or_else(|_| build_pipeline(
+            &gst_pipeline::build_swdec_any_codec(&src, downsample_to, gst_pipeline::SinkKind::GlShared),
+            hwnd,
+        ))
+        .or_else(|_| build_pipeline(
             &gst_pipeline::build_swdec_any_codec(&src, downsample_to, gst_pipeline::SinkKind::D3d11),
             hwnd,
-        )
-    })
-    .or_else(|_| {
-        build_pipeline(
+        ))
+        .or_else(|_| build_pipeline(
             &gst_pipeline::build_swdec_any_codec(&src, downsample_to, gst_pipeline::SinkKind::Auto),
             hwnd,
-        )
-    })
-    .with_context(|| format!("all sinks (GL + D3D11 + auto) failed for {}", channel.slug))?;
+        ))
+        .with_context(|| format!("all pipeline tiers failed for {}", channel.slug))?;
 
     if let Some(vsink) = pipeline.by_name("vsink") {
         apply_fill_mode(&vsink, fill);
     }
-    Ok(PlayingTile { hwnd, pipeline })
+
+    // Stash a TileHandle in the HWND USERDATA so the tile WndProc can
+    // toggle audio on double-click. Freed in PlayingTile::drop after
+    // DestroyWindow.
+    let handle = Box::new(TileHandle {
+        tile_id,
+        channel_url: url,
+        localaddr: localaddr.to_string(),
+        audio,
+    });
+    let handle_ptr = Box::into_raw(handle) as usize;
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{SetWindowLongPtrW, GWLP_USERDATA};
+        SetWindowLongPtrW(HWND(hwnd as *mut _), GWLP_USERDATA, handle_ptr as isize);
+    }
+
+    Ok(PlayingTile { hwnd, pipeline, handle_ptr })
 }
 
 /// Create a truly-borderless, no-decoration Win32 CHILD window using
@@ -393,8 +511,8 @@ fn ensure_tile_class_registered() -> Result<()> {
     use windows::Win32::Graphics::Gdi::CreateSolidBrush;
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{
-        DefWindowProcW, RegisterClassExW, HCURSOR, HICON, WNDCLASSEXW, WNDCLASS_STYLES,
-        WNDPROC, CS_HREDRAW, CS_VREDRAW,
+        DefWindowProcW, GetWindowLongPtrW, RegisterClassExW, HCURSOR, HICON, WNDCLASSEXW,
+        WNDCLASS_STYLES, WNDPROC, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
     };
     static REGISTERED: AtomicBool = AtomicBool::new(false);
     if REGISTERED.load(Ordering::Acquire) {
@@ -406,7 +524,7 @@ fn ensure_tile_class_registered() -> Result<()> {
     // what stops the transient black flashes users saw during
     // decoder jitter — the last-presented video frame stays on
     // screen until d3d11videosink flips a new one in.
-    use windows::Win32::UI::WindowsAndMessaging::WM_ERASEBKGND;
+    use windows::Win32::UI::WindowsAndMessaging::{WM_ERASEBKGND, WM_LBUTTONDBLCLK};
     unsafe extern "system" fn tile_wndproc(
         h: windows::Win32::Foundation::HWND,
         msg: u32,
@@ -416,17 +534,26 @@ fn ensure_tile_class_registered() -> Result<()> {
         if msg == 0x0014 /* WM_ERASEBKGND */ {
             return windows::Win32::Foundation::LRESULT(1);
         }
+        if msg == 0x0203 /* WM_LBUTTONDBLCLK */ {
+            let ptr = GetWindowLongPtrW(h, GWLP_USERDATA) as usize;
+            if ptr != 0 {
+                let handle = &*(ptr as *const TileHandle);
+                handle.audio.toggle(handle.tile_id, &handle.channel_url, &handle.localaddr);
+            }
+            return windows::Win32::Foundation::LRESULT(0);
+        }
         DefWindowProcW(h, msg, w, l)
     }
-    let _ = WM_ERASEBKGND; // silence unused warning if compiler picks the const path
+    let _ = (WM_ERASEBKGND, WM_LBUTTONDBLCLK);
     unsafe {
         let hinst = GetModuleHandleW(PCWSTR::null()).context("GetModuleHandle")?;
         let class_name: Vec<u16> = "CMCTile\0".encode_utf16().collect();
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            // CS_HREDRAW|CS_VREDRAW forces repaint on resize; needed
-            // so GStreamer's overlay noticing the geometry change.
-            style: WNDCLASS_STYLES(CS_HREDRAW.0 | CS_VREDRAW.0),
+            // CS_DBLCLKS is REQUIRED so Windows sends WM_LBUTTONDBLCLK
+            // — without it we'd only get pairs of WM_LBUTTONDOWN and
+            // the audio-toggle would never fire.
+            style: WNDCLASS_STYLES(CS_HREDRAW.0 | CS_VREDRAW.0 | CS_DBLCLKS.0),
             lpfnWndProc: Some(tile_wndproc),
             cbClsExtra: 0,
             cbWndExtra: 0,

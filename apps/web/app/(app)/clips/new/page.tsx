@@ -286,7 +286,10 @@ export default function NewClipPage() {
       body: {
         channelId, title, notes,
         startAt: startAtISO, endAt: endAtISO,
-        format, resolution,
+        // Format + resolution are locked to MP4 / 1920x1080 — the
+        // operator UI no longer surfaces the dropdowns. Server still
+        // accepts the fields for back-compat.
+        format: 'MP4', resolution: '1920x1080',
         watermarkText: `${user?.email ?? 'unknown'} - ${new Date().toISOString()}`,
       },
     }),
@@ -319,7 +322,7 @@ export default function NewClipPage() {
         </Button>
         <Button variant="gradient" onClick={() => exportMut.mutate()} disabled={!canExport || exportMut.isPending}>
           {exportMut.isPending ? <Loader2 className="animate-spin h-4 w-4" /> : <Download className="h-4 w-4" />}
-          Export {format}
+          Export MP4
         </Button>
       </div>
 
@@ -366,22 +369,7 @@ export default function NewClipPage() {
               className="mt-1.5 w-full rounded-md border border-border bg-panel2/50 p-2 text-sm resize-none"
             />
           </div>
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <Label>Format</Label>
-              <Select value={format} onValueChange={(v) => setFormat(v as typeof format)}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
-                <SelectContent>{CLIP_FORMATS.map((f) => <SelectItem key={f} value={f}>{f}</SelectItem>)}</SelectContent>
-              </Select>
-            </div>
-            <div>
-              <Label>Resolution</Label>
-              <Select value={resolution} onValueChange={setResolution}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
-                <SelectContent>{CLIP_RESOLUTIONS.map((r) => <SelectItem key={r} value={r}>{r}</SelectItem>)}</SelectContent>
-              </Select>
-            </div>
-          </div>
+          {/* Format + Resolution locked to MP4 1080p — dropdowns removed. */}
           <div className="pt-2 border-t border-border">
             <div className="text-[10px] uppercase tracking-widest text-muted-2 mb-2">Watermark</div>
             <div className="font-mono text-[11px] text-muted break-all">{user?.email} - {new Date().toISOString().slice(0, 19)}Z</div>

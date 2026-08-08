@@ -30,8 +30,26 @@ const REDIS_URL     = process.env.REDIS_URL     ?? 'redis://localhost:6380';
 const RECORDINGS    = resolve(process.env.RECORDINGS_DIR ?? './data/recordings');
 const CLIPS         = resolve(process.env.CLIPS_DIR      ?? './data/clips');
 const CLIP_ASSETS   = resolve(process.env.CLIP_ASSETS_DIR ?? './data/assets');
+// 60-second segments. Every minute ffmpeg closes the current .mp4 and
+// starts a new one; the closed file is SHA-256'd + inserted into the
+// RecordingSegment DB table within ~2 s (scanner). This means:
+//   * The Recordings page shows an ongoing recording after ~60 s, not
+//     after the operator stops.
+//   * The Clip Editor / session-media endpoint can stitch any date-
+//     time range on demand out of the per-minute .mp4 pieces (a
+//     Manager asking for "that news from 20 min ago" gets it while
+//     the channel is still recording).
+//   * 60 s × 30 channels × 30 days = ~1.3 M rows/month — fine for
+//     Postgres, still trivial for the disk (~2 Mbps × 60 s ≈ 15 MB
+//     per segment).
+// The old 86400 s (24 h) value was what broke visibility: the file
+// never closed unless the operator stopped, so nothing was ingested
+// and the Recordings page showed empty.
 const SEG_SECONDS   = Number(process.env.RECORDING_SEGMENT_SECONDS ?? 60);
 const V_BITRATE     = process.env.RECORDING_VIDEO_BITRATE ?? '2000k';
+// Kept for the clip renderer (which still re-encodes audio at export).
+// The live recorder no longer uses this because it pass-through
+// remuxes from live-hls's already-AAC output.
 const A_BITRATE     = process.env.RECORDING_AUDIO_BITRATE ?? '128k';
 const SIGN_KEY      = process.env.MANIFEST_SIGNING_KEY   ?? 'dev-only';
 const TITLE_CARD_SEC = 3;
@@ -76,59 +94,85 @@ function channelOutDir(channelId: string, when: Date = new Date()): string {
   );
 }
 
+// Slugs whose source has infrequent keyframes / non-progressive stream
+// so `-c copy` produces 0-byte segments (no I-frame to start on). For
+// these we transcode with libx264 ultrafast + `-force_key_frames` at
+// every segment boundary — one keyframe per 60 s guaranteed.
+const RECORDING_TRANSCODE_SLUGS = new Set(
+  (process.env.RECORDING_TRANSCODE_SLUGS ??
+    'cnn,365-news,gtv-news,samaa-news')
+    .split(',').map((s) => s.trim()).filter(Boolean),
+);
+
 function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: string): FF {
   mkdirSync(outDir, { recursive: true });
   const outPattern = join(outDir, '%M.mp4');
 
-  // Read the UDP multicast directly — no HLS, no transcoder dependency.
-  // For any RTSP/SRT source we take it as-is.
+  // ARCHITECTURE — 2026-08-08: back to UDP-direct after the HLS-tap
+  // approach failed. ffmpeg's HLS file demuxer stalls after the source
+  // playlist's `delete_segments` window slides past its read pointer:
+  // it opens seg_N.ts, reads it, tries to advance, next file has
+  // already been unlinked by live-hls, demuxer stops emitting frames.
+  // All 30 recorders froze at exactly the same second with the file
+  // handle still open. Reading UDP directly costs one extra multicast
+  // subscriber per channel but the CPU stays trivial (~1 % one core
+  // per stream with -c copy) and the pipeline never depends on
+  // another process's file-write cadence.
+  //
+  // NIC split: LOCALADDR (172.16.205.20) is what live-hls uses.
+  // Recording uses RECORDING_LOCALADDR when set (10.51.80.202 on the
+  // Storage2 NIC) so the two workloads land on separate physical
+  // ports — reduces IGMP-snooping load on any single switch port.
   let input = sourceUrl.trim();
   if (kind === 'UDP' || kind === 'RTP') {
     if (input.includes('://') && !input.split('://', 2)[1]!.startsWith('@')) {
       const [proto, rest] = input.split('://', 2);
       input = `${proto!.toLowerCase()}://@${rest}`;
     }
-    // Multi-NIC servers need `localaddr` pinned to the recording NIC
-    // (satellite feed lives on 10.51.80.202) — without it ffmpeg joins
-    // the multicast group on whichever NIC Windows picks first, gets
-    // no packets, times out with exit -5, and the supervisor loops
-    // forever. LOCALADDR env is set once in .env (same value the
-    // live-hls service uses).
-    const localaddr = process.env.LOCALADDR ?? '';
-    const hasQ = input.includes('?');
+    const localaddr = process.env.RECORDING_LOCALADDR ?? process.env.LOCALADDR ?? '';
     const parts: string[] = [];
-    if (!input.includes('fifo_size='))         parts.push('fifo_size=4000000');
+    // fifo_size = ffmpeg internal circular buffer (10 MB, safe to raise)
+    // buffer_size = SO_RCVBUF kernel socket buffer. Keep at 8 MB —
+    // Windows fails ANY new UDP bind with "Cannot allocate memory"
+    // when total pinned kernel socket buffers across all sockets
+    // exceed ~800 MB. 60 sockets × 16 MB tips the limit; 60 × 8 MB
+    // fits comfortably.
+    if (!input.includes('fifo_size='))         parts.push('fifo_size=10000000');
     if (!input.includes('overrun_nonfatal='))  parts.push('overrun_nonfatal=1');
-    // 60 s timeout so IGMP renegotiations / brief switch drops don't
-    // kill the recorder mid-session.
     if (!input.includes('timeout='))           parts.push('timeout=60000000');
     if (!input.includes('buffer_size='))       parts.push('buffer_size=8388608');
+    if (!input.includes('reuse='))             parts.push('reuse=1');
     if (localaddr && !input.toLowerCase().includes('localaddr=')) {
       parts.push(`localaddr=${localaddr}`);
     }
     if (parts.length) {
-      input = `${input}${hasQ ? '&' : '?'}${parts.join('&')}`;
+      input = `${input}${input.includes('?') ? '&' : '?'}${parts.join('&')}`;
     }
   }
 
-  // CMC: transcode video to 720p on record (was passthrough 1080p on DEMP).
-  // Cheaper storage per channel, matches PAK NAVY's target retention
-  // budget on a shared 32-channel server. veryfast keeps CPU at
-  // ~5-8% per channel × 32 = ~2 cores total on the R740XD2.
+  const transcodeThisSlug = RECORDING_TRANSCODE_SLUGS.has(slug);
+  const videoArgs = transcodeThisSlug
+    ? [
+        // Slow-keyframe / interlaced sources — libx264 ultrafast with a
+        // forced keyframe at every segment boundary so each 60 s .mp4
+        // is a self-contained playable file.
+        '-vf', 'yadif=0:-1:0',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
+        '-profile:v', 'main', '-pix_fmt', 'yuv420p',
+        '-b:v', '2000k', '-maxrate', '2500k', '-bufsize', '4000k',
+        '-force_key_frames', `expr:gte(t,n_forced*${SEG_SECONDS})`,
+      ]
+    : ['-c:v', 'copy'];
+
   const args = [
     '-hide_banner', '-loglevel', 'warning', '-nostdin',
     '-fflags', '+genpts+discardcorrupt',
     '-err_detect', 'ignore_err',
     ...(kind === 'UDP' || kind === 'RTP' ? ['-f', 'mpegts'] : []),
     '-i', input,
-    '-map', '0:v:0', '-map', '0:a:0?',
-    // 720p transcode with letterbox pad so aspect stays right for any source.
-    '-vf', 'scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2',
-    '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency',
-    '-profile:v', 'main', '-pix_fmt', 'yuv420p',
-    '-b:v', '2500k', '-maxrate', '3000k', '-bufsize', '5000k',
-    '-g', '50', '-keyint_min', '25', '-sc_threshold', '0',
-    '-c:a', 'aac', '-b:a', A_BITRATE, '-ac', '2', '-ar', '48000',
+    '-map', '0:v:0', '-map', '0:a?', '-dn', '-sn',
+    ...videoArgs,
+    '-c:a', 'aac', '-b:a', '128k', '-ac', '2', '-ar', '48000',
     '-f', 'segment',
     '-segment_time', String(SEG_SECONDS),
     '-segment_format', 'mp4',
@@ -147,13 +191,39 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
     outPattern.replace('%M', '%Y%m%dT%H%M%SZ'),
   ];
 
-  log.info({ slug, input, outDir }, 'recorder ffmpeg spawn');
-  const proc = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  log.info({ slug, input, outDir, outPattern }, 'recorder ffmpeg spawn');
+  // stdin: 'pipe' so we can send 'q' for graceful shutdown. On Windows
+  // SIGINT doesn't cleanly stop ffmpeg — the process just gets killed
+  // and the mp4 file may be corrupt. Sending 'q' to stdin flushes the
+  // muxer trailer, closes the file cleanly, and exits with code 255
+  // (which we treat as a clean stop in the exit handler).
+  const proc = spawn('ffmpeg', args, { stdio: ['pipe', 'pipe', 'pipe'] });
   proc.stderr.on('data', (b) => {
     const line = b.toString().trim();
     if (line && !line.startsWith('frame=')) log.debug({ slug }, line.slice(0, 200));
   });
   return proc;
+}
+
+/** Graceful stop for a recorder ffmpeg — send 'q' on stdin, then hard
+ *  kill after 3 s if it's still alive. Windows-safe (SIGINT via .kill
+ *  isn't reliable on Windows and can leave partial fMP4 files). */
+function stopFFmpegGracefully(sup: Supervisor): void {
+  const p = sup.proc;
+  if (!p) return;
+  try {
+    if (p.stdin && !p.stdin.destroyed) {
+      p.stdin.write('q\n');
+      p.stdin.end();
+    }
+  } catch { /* stdin already closed */ }
+  // Escalate to hard kill after 3 s.
+  setTimeout(() => {
+    if (sup.proc && sup.proc === p && p.exitCode === null && p.signalCode === null) {
+      log.warn({ slug: sup.slug }, 'ffmpeg did not exit on q, force killing');
+      try { p.kill('SIGKILL'); } catch { /* */ }
+    }
+  }, 3000);
 }
 
 async function sha256(path: string): Promise<string> {
@@ -272,9 +342,9 @@ async function refreshSupervisors() {
   // Stop supervisors for channels no longer marked to record.
   for (const [id, sup] of supervisors) {
     if (!activeIds.has(id)) {
-      log.info({ id }, 'stopping supervisor');
+      log.info({ id, slug: sup.slug }, 'stopping supervisor (recording toggled OFF)');
       (sup as Supervisor & { _stopped?: boolean })._stopped = true;   // suppress the auto-restart handler
-      try { sup.proc?.kill('SIGINT'); } catch { /* */ }
+      stopFFmpegGracefully(sup);
       supervisors.delete(id);
     }
   }
@@ -386,10 +456,12 @@ async function clipWorker(job: { clipId: string }) {
     ? String.raw`C\\:/Windows/Fonts/arial.ttf`
     : '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
 
-  const PAK_LOGO = join(CLIP_ASSETS, 'pak-navy-logo.png');
-  const ANL_LOGO = join(CLIP_ASSETS, 'powered-by-analysys.png');
-  const hasBranding = existsSync(PAK_LOGO) && existsSync(ANL_LOGO);
-  if (!hasBranding) log.warn({ PAK_LOGO, ANL_LOGO }, 'branding logos not found — falling back to text-only watermarks');
+  // Branding watermarks disabled per operator request. Clips get a
+  // single narrow bottom watermark strip carrying user + timestamp for
+  // chain-of-custody only — no PAK NAVY / Analysys logos, no big
+  // corner text.
+  const hasBranding = false;
+  void CLIP_ASSETS;
 
   // Only MP4 / MOV benefit from +faststart. MKV ignores it; WebM
   // would need libvpx-vp9 + libopus and is disabled at the UI layer.
@@ -405,35 +477,18 @@ async function clipWorker(job: { clipId: string }) {
 
   try {
     // ============================================================ Pass 1: main
-    // Centered PAK NAVY watermark @ 10% alpha, small Powered-by-Analysys
-    // lockup bottom-right, existing PAK NAVY top-right + operator strip.
+    // Clean video with just a discreet chain-of-custody watermark
+    // strip at the bottom (user email + timestamp). No PAK NAVY /
+    // Analysys logos anywhere — the operator asked for un-branded
+    // exports.
+    void FONT_BOLD;   // unused now (was for PAK NAVY corner text)
     const mainFilter: string[] = [
       `[0:v]scale=${w}:${h}:force_original_aspect_ratio=decrease,` +
-        `pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2[base]`,
+        `pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,` +
+      `drawbox=x=0:y=ih-24:w=iw:h=24:color=black@0.5:t=fill,` +
+      `drawtext=text='${wm}':fontcolor=white@0.8:fontsize=12:` +
+        `fontfile=${FONT_REG}:x=12:y=h-18[outv]`,
     ];
-    let vLabel = 'base';
-    if (hasBranding) {
-      // Center watermark: PAK NAVY crest, ~28% of frame width, alpha 10%.
-      mainFilter.push(
-        `[2:v]scale=${Math.round(w * 0.28)}:-1,format=rgba,` +
-          `colorchannelmixer=aa=0.10[wm]`,
-        `[${vLabel}][wm]overlay=(W-w)/2:(H-h)/2[v1]`,
-      );
-      vLabel = 'v1';
-      // Bottom-right: Powered-by-Analysys lockup at ~12% of frame width.
-      mainFilter.push(
-        `[3:v]scale=${Math.round(w * 0.12)}:-1[an]`,
-        `[${vLabel}][an]overlay=W-w-16:H-h-46[v2]`,
-      );
-      vLabel = 'v2';
-    }
-    mainFilter.push(
-      `[${vLabel}]drawtext=text='PAK NAVY':fontcolor=white@0.8:fontsize=42:` +
-        `fontfile=${FONT_BOLD}:x=w-tw-24:y=24,` +
-      `drawbox=x=0:y=ih-30:w=iw:h=30:color=0x0B1E3A@0.8:t=fill,` +
-      `drawtext=text='${wm}':fontcolor=white@0.85:fontsize=14:` +
-        `fontfile=${FONT_REG}:x=16:y=h-22[outv]`,
-    );
 
     const mainArgs: string[] = [
       '-hide_banner', '-loglevel', 'warning',
@@ -457,69 +512,12 @@ async function clipWorker(job: { clipId: string }) {
     log.info({ clipId: clip.id }, 'ffmpeg pass 1 — main content');
     await runFfmpeg(mainArgs, 'main');
 
-    // ============================================================ Pass 2: title
-    // 3-second white title card carrying PAK NAVY crest, clip title,
-    // channel/time metadata, and Powered-by-Analysys lockup.  Concat
-    // with the main pass output. Both segments re-encoded together so
-    // the timeline is continuous (no discontinuity glitch).
-    const title = escapeForDrawtext(clip.title.slice(0, 60));
-    const startedIso = clip.startAt.toISOString().slice(0, 19).replace('T', ' ') + ' UTC';
-    const meta = escapeForDrawtext(`${clip.channel.name} — ${startedIso}`);
-
-    const concatArgs: string[] = [
-      '-hide_banner', '-loglevel', 'warning',
-      // Input 0: white background for TITLE_CARD_SEC seconds.
-      '-f', 'lavfi', '-i', `color=white:s=${w}x${h}:d=${TITLE_CARD_SEC}`,
-      // Input 1: matching silent audio for TITLE_CARD_SEC seconds.
-      '-f', 'lavfi', '-t', String(TITLE_CARD_SEC), '-i', 'anullsrc=r=48000:cl=stereo',
-    ];
-    let tcVideoLabel = '0:v';
-    const tcFilter: string[] = [];
-    if (hasBranding) {
-      concatArgs.push('-i', PAK_LOGO, '-i', ANL_LOGO);
-      // Input 4: main pass output (added after the logos).
-      concatArgs.push('-i', mainPath);
-      // Layout tuned so the crest doesn't overlap the title text.
-      // Logo top ~5% down, ~16% of width; title lands cleanly below at
-      // ~58% Y; meta below title; Analysys lockup pinned to the bottom.
-      tcFilter.push(
-        `[2:v]scale=${Math.round(w * 0.16)}:-1[titleLogo]`,
-        `[${tcVideoLabel}][titleLogo]overlay=(W-w)/2:${Math.round(h * 0.06)}[t1]`,
-        // Clip title — navy on white, ~58% Y so it clears the logo.
-        `[t1]drawtext=text='${title}':fontcolor=0x0B1E3A:fontsize=44:` +
-          `fontfile=${FONT_BOLD}:x=(w-tw)/2:y=${Math.round(h * 0.58)}[t2]`,
-        // Channel + time metadata — grey, just below the title.
-        `[t2]drawtext=text='${meta}':fontcolor=0x5A6572:fontsize=22:` +
-          `fontfile=${FONT_REG}:x=(w-tw)/2:y=${Math.round(h * 0.68)}[t3]`,
-        // Powered-by-Analysys lockup — ~16% of width, pinned near bottom.
-        `[3:v]scale=${Math.round(w * 0.16)}:-1[titleAn]`,
-        `[t3][titleAn]overlay=(W-w)/2:H-h-${Math.round(h * 0.06)}[titleV]`,
-        // Concat title + main. Interleave streams:
-        //   [titleV][titleA][mainV][mainA] → [outv][outa]
-        `[titleV][1:a][4:v][4:a]concat=n=2:v=1:a=1[outv][outa]`,
-      );
-    } else {
-      concatArgs.push('-i', mainPath);
-      tcFilter.push(
-        `[${tcVideoLabel}]drawtext=text='${title}':fontcolor=0x0B1E3A:fontsize=44:` +
-          `fontfile=${FONT_BOLD}:x=(w-tw)/2:y=${Math.round(h * 0.44)}[t1]`,
-        `[t1]drawtext=text='${meta}':fontcolor=0x5A6572:fontsize=22:` +
-          `fontfile=${FONT_REG}:x=(w-tw)/2:y=${Math.round(h * 0.55)}[titleV]`,
-        // With no branding inputs, mainPath is input 2.
-        `[titleV][1:a][2:v][2:a]concat=n=2:v=1:a=1[outv][outa]`,
-      );
-    }
-
-    concatArgs.push(
-      '-filter_complex', tcFilter.join(';'),
-      '-map', '[outv]', '-map', '[outa]',
-      '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', V_BITRATE,
-      '-c:a', 'aac', '-b:a', A_BITRATE, '-ac', '2', '-ar', '48000',
-      ...(isMovLike ? ['-movflags', '+faststart'] : []),
-      '-y', outFile,
-    );
-    log.info({ clipId: clip.id }, 'ffmpeg pass 2 — title card + concat');
-    await runFfmpeg(concatArgs, 'concat');
+    // Title card pass removed 2026-08-08 — operator wants the raw
+    // clip video only, no PAK NAVY / Analysys title-card intro.
+    // The pass-1 output IS the final clip; just move it into place.
+    const { renameSync } = await import('node:fs');
+    try { renameSync(mainPath, outFile); }
+    catch { const { copyFileSync } = await import('node:fs'); copyFileSync(mainPath, outFile); }
 
     const size = statSync(outFile).size;
     const hash = await sha256(outFile);
@@ -552,6 +550,72 @@ async function main() {
     return;
   }
 
+  // Startup catch-up: Redis pub/sub is fire-and-forget. Any clip that
+  // was submitted while this service was down is stuck in QUEUED
+  // forever unless we re-process it. Sweep the DB on boot and enqueue
+  // every non-terminal clip so past bol-news style clips actually
+  // render out. Sequential to keep CPU sane; there are usually 0-5.
+  try {
+    const queued = await prisma.clip.findMany({
+      where: { status: { in: ['QUEUED', 'RENDERING'] } },
+      select: { id: true, title: true, status: true, createdAt: true },
+      orderBy: { createdAt: 'asc' },
+    });
+    if (queued.length) {
+      log.info({ count: queued.length }, 'catch-up: found queued clips, re-processing');
+      // If it was mid-render when we crashed, revert to QUEUED so
+      // clipWorker's own state transitions still fire.
+      const midRender = queued.filter((c) => c.status === 'RENDERING').map((c) => c.id);
+      if (midRender.length) {
+        await prisma.clip.updateMany({ where: { id: { in: midRender } }, data: { status: 'QUEUED' } });
+      }
+      // Fire and forget — each clipWorker is async.
+      for (const c of queued) void clipWorker({ clipId: c.id });
+    }
+  } catch (err) {
+    log.warn({ err }, 'catch-up sweep failed (non-fatal)');
+  }
+
+  // Periodic sweep — belt + suspenders against lost Redis pub/sub
+  // messages. Every 30 s look for any clip stuck in QUEUED or that has
+  // been "RENDERING" for over 5 min (dead worker). Re-enqueue by
+  // calling clipWorker directly. Dedup via activeClipIds so a clip
+  // that IS actively being processed isn't fired again.
+  const activeClipIds = new Set<string>();
+  async function sweepStuckClips(): Promise<void> {
+    try {
+      const stale = await prisma.clip.findMany({
+        where: {
+          OR: [
+            { status: 'QUEUED' },
+            // RENDERING clips whose row hasn't been touched in >5 min
+            // = worker died mid-render (updatedAt bumps on every state
+            // transition).
+            { status: 'RENDERING', updatedAt: { lt: new Date(Date.now() - 5 * 60_000) } },
+          ],
+        },
+        select: { id: true, status: true },
+        take: 20,
+      });
+      for (const c of stale) {
+        if (activeClipIds.has(c.id)) continue;
+        activeClipIds.add(c.id);
+        if (c.status === 'RENDERING') {
+          try { await prisma.clip.update({ where: { id: c.id }, data: { status: 'QUEUED' } }); } catch { /* */ }
+        }
+        log.info({ clipId: c.id, was: c.status }, 'sweep: reprocessing orphan clip');
+        void clipWorker({ clipId: c.id })
+          .finally(() => activeClipIds.delete(c.id));
+      }
+    } catch (err) {
+      log.warn({ err }, 'clip sweep failed');
+    }
+  }
+  setInterval(sweepStuckClips, 30_000);
+  // First sweep immediately on boot too (redundant with catch-up above,
+  // but harmless — dedup guard skips already-active clips).
+  setTimeout(sweepStuckClips, 5_000);
+
   // clip job queue + source-switch listener (recording resilience)
   await redisSub.subscribe('demp:jobs:clip', 'demp:events:source-switch');
   redisSub.on('message', (ch, raw) => {
@@ -566,7 +630,7 @@ async function main() {
         const sup = supervisors.get(ev.channelId);
         if (!sup) return;
         log.info({ channelId: ev.channelId }, 'source switched — restarting recorder cleanly');
-        try { sup.proc?.kill('SIGINT'); } catch { /* */ }
+        stopFFmpegGracefully(sup);
         // supervisor.proc.on('exit') will backoff-restart, which reads the
         // fresh active source URL from the channel row on refreshSupervisors.
       } catch (err) { log.warn({ err }, 'bad source-switch event'); }
@@ -575,7 +639,10 @@ async function main() {
   });
 
   await refreshSupervisors();
-  setInterval(refreshSupervisors, 15_000);
+  // 5 s so operator toggles on the channels page take effect within
+  // one refresh cycle (was 15 s — felt laggy after clicking "Start
+  // recording"). Cheap: just a Postgres SELECT on the channels table.
+  setInterval(refreshSupervisors, 5_000);
 
   // Periodically walk EVERY hour dir under EVERY channel and ingest any
   // .mp4 that isn't marked .recorded.

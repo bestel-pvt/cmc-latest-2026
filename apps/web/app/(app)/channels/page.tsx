@@ -4,7 +4,7 @@ import Link from 'next/link';
 import { useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useRouter } from 'next/navigation';
-import { Plus, Search, Filter, Download, Circle, CircleDot, Loader2 } from 'lucide-react';
+import { Plus, Search, Filter, Download, Circle, CircleDot, Loader2, Copy, Check, PlayCircle, StopCircle } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -13,7 +13,6 @@ import { Badge } from '@/components/ui/badge';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog';
 import { Label } from '@/components/ui/label';
-import { HealthMeter } from '@/components/health-meter';
 import { AuthImg } from '@/components/auth-img';
 import { api } from '@/lib/api';
 import { CHANNEL_CATEGORIES, CHANNEL_LANGUAGES } from '@cmc/shared';
@@ -23,11 +22,11 @@ interface Channel {
   id: string; slug: string; name: string;
   category: string; language: string; active: boolean;
   logoUrl: string | null;
-  aiFeaturesEnabled: boolean;
   recordingEnabled: boolean;
-  dempOutputUrl: string | null;                // UDP multicast rebroadcast
-  sources: Array<{ id: string; name: string; url: string; kind: string; isPrimary: boolean }>;
-  runtime?: { score: number | null; activeSourceId: string | null };
+  /** Single source per channel — CMC has no failover. `sourceUrl` is
+   * the raw UDP/RTP URL exactly as the operator entered it. */
+  sourceUrl: string | null;
+  sourceKind: string | null;
 }
 
 export default function ChannelsPage() {
@@ -58,6 +57,24 @@ export default function ChannelsPage() {
     onError: (e) => toast.error(e instanceof Error ? e.message : 'Failed'),
   });
 
+  const bulkRecordMut = useMutation({
+    mutationFn: async (enable: boolean) => {
+      const targets = rows.filter((c) => c.active && c.recordingEnabled !== enable);
+      // Parallel PATCH — 30 requests take ~1s all together.
+      await Promise.all(targets.map((c) =>
+        api(`/api/channels/${c.id}`, { method: 'PATCH', body: { recordingEnabled: enable } }),
+      ));
+      return targets.length;
+    },
+    onSuccess: (count, enable) => {
+      qc.invalidateQueries({ queryKey: ['channels'] });
+      toast.success(`${enable ? 'Started' : 'Stopped'} recording on ${count} channel${count === 1 ? '' : 's'}`);
+    },
+    onError: (e) => toast.error(e instanceof Error ? e.message : 'Bulk toggle failed'),
+  });
+
+  const recordingCount = useMemo(() => rows.filter((c) => c.recordingEnabled).length, [rows]);
+
   return (
     <div className="max-w-[1400px] mx-auto space-y-6">
       <div className="flex items-end justify-between gap-4 flex-wrap">
@@ -66,6 +83,30 @@ export default function ChannelsPage() {
           <p className="text-xs text-muted mt-0.5">Configure channels, sources, and failover.</p>
         </div>
         <div className="flex items-center gap-2">
+          <Button
+            variant="secondary"
+            className="text-green-600 hover:text-green-700"
+            onClick={() => bulkRecordMut.mutate(true)}
+            disabled={bulkRecordMut.isPending}
+            title="Enable recordingEnabled on every active channel"
+          >
+            {bulkRecordMut.isPending && bulkRecordMut.variables === true
+              ? <Loader2 className="h-4 w-4 animate-spin" />
+              : <PlayCircle className="h-4 w-4" />}
+            Start all recording
+          </Button>
+          <Button
+            variant="secondary"
+            className="text-red-600 hover:text-red-700"
+            onClick={() => bulkRecordMut.mutate(false)}
+            disabled={bulkRecordMut.isPending || recordingCount === 0}
+            title={recordingCount === 0 ? 'No channels are currently recording' : `Stop recording on all ${recordingCount} channels`}
+          >
+            {bulkRecordMut.isPending && bulkRecordMut.variables === false
+              ? <Loader2 className="h-4 w-4 animate-spin" />
+              : <StopCircle className="h-4 w-4" />}
+            Stop all recording ({recordingCount})
+          </Button>
           <Button variant="secondary" onClick={async () => {
             // Auth-aware CSV download: <a href> can't send Authorization
             // headers, so fetch as blob and save via anchor click.
@@ -129,8 +170,8 @@ export default function ChannelsPage() {
                 <th className="text-left px-4 py-2">Channel</th>
                 <th className="text-left px-4 py-2">Category</th>
                 <th className="text-left px-4 py-2">Lang</th>
-                <th className="text-left px-4 py-2 w-56">Health</th>
                 <th className="text-left px-4 py-2">Signal</th>
+                <th className="text-left px-4 py-2">Source URL</th>
                 <th className="text-left px-4 py-2">Recording</th>
               </tr>
             </thead>
@@ -141,23 +182,18 @@ export default function ChannelsPage() {
                 ))
               )}
               {!isLoading && rows.map((c) => {
-                const score = c.runtime?.score ?? null;
-                // CMC has no failover-controller running, so most channels
-                // arrive here with score=null. Treat active + sources as
-                // LIVE by default (trust operator config); only downgrade
-                // when we have an actual health signal saying so.
-                const hasSource = c.sources.length > 0;
-                const signal: 'LIVE' | 'DEGRADED' | 'OFFLINE' | 'DISABLED' =
-                  !c.active     ? 'DISABLED' :
-                  !hasSource    ? 'OFFLINE'  :
-                  score === null ? 'LIVE'    :
-                  score >= 0.5   ? 'LIVE'    :
-                  score >= 0.25  ? 'DEGRADED' :
-                                   'OFFLINE';
-                const signalVariant: 'green' | 'amber' | 'red' | 'default' =
-                  signal === 'LIVE' ? 'green' :
-                  signal === 'DEGRADED' ? 'amber' :
-                  signal === 'OFFLINE' ? 'red' : 'default';
+                // Unified two-state signal: LIVE iff operator marked
+                // the channel active AND a source URL is configured;
+                // otherwise OFFLINE. Previously we split OFFLINE (no
+                // source) vs DISABLED (active=false) but from an
+                // operational view a sourceless channel is just as
+                // offline regardless of the active flag — showing two
+                // different labels for the same practical state was
+                // just noise.
+                const hasSource = !!c.sourceUrl;
+                const live = c.active && hasSource;
+                const signal: 'LIVE' | 'OFFLINE' = live ? 'LIVE' : 'OFFLINE';
+                const signalVariant: 'green' | 'red' = live ? 'green' : 'red';
                 return (
                   <tr
                     key={c.id}
@@ -180,11 +216,13 @@ export default function ChannelsPage() {
                     </td>
                     <td className="px-4 py-3 text-muted"><Badge variant="outline">{c.category}</Badge></td>
                     <td className="px-4 py-3 text-muted"><Badge variant="outline">{c.language}</Badge></td>
-                    <td className="px-4 py-3"><HealthMeter value={score} label size="sm" /></td>
                     <td className="px-4 py-3">
                       <div className="flex flex-col gap-1 items-start">
                         <Badge variant={signalVariant}>{signal}</Badge>
                       </div>
+                    </td>
+                    <td className="px-4 py-3 max-w-[24rem]">
+                      <SourceUrlCell url={c.sourceUrl} kind={c.sourceKind} />
                     </td>
                     <td className="px-4 py-3">
                       <RecordingToggle channel={c} />
@@ -219,6 +257,16 @@ function CreateChannelDialog({
   onSubmit: (data: unknown) => void; submitting: boolean;
 }) {
   const [form, setForm] = useState({ name: '', slug: '', category: 'NEWS', language: 'UR' });
+  // Track whether the operator has manually edited the slug. Without
+  // this, the prior `slug: f.slug || derive(name)` shortcut froze the
+  // slug at the first character typed into name (because after the
+  // first update f.slug is truthy so subsequent name changes stop
+  // regenerating). Now: if the slug field is untouched, keep deriving
+  // from the name on every keystroke; if the user typed into slug
+  // themselves, respect their value.
+  const [slugTouched, setSlugTouched] = useState(false);
+  const deriveSlug = (name: string) =>
+    name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
   return (
     <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
       <DialogContent>
@@ -232,11 +280,29 @@ function CreateChannelDialog({
         >
           <div className="col-span-2 space-y-1.5">
             <Label>Name</Label>
-            <Input required value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value, slug: f.slug || e.target.value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') }))} placeholder="GEO News" />
+            <Input
+              required
+              value={form.name}
+              onChange={(e) => setForm((f) => ({
+                ...f,
+                name: e.target.value,
+                slug: slugTouched ? f.slug : deriveSlug(e.target.value),
+              }))}
+              placeholder="GEO News"
+            />
           </div>
           <div className="col-span-2 space-y-1.5">
             <Label>Slug</Label>
-            <Input required pattern="[a-z0-9-]+" value={form.slug} onChange={(e) => setForm((f) => ({ ...f, slug: e.target.value }))} placeholder="geo-news" />
+            <Input
+              required
+              pattern="[a-z0-9-]+"
+              value={form.slug}
+              onChange={(e) => {
+                setSlugTouched(true);
+                setForm((f) => ({ ...f, slug: e.target.value }));
+              }}
+              placeholder="geo-news"
+            />
           </div>
           <div className="space-y-1.5">
             <Label>Category</Label>
@@ -259,6 +325,67 @@ function CreateChannelDialog({
         </form>
       </DialogContent>
     </Dialog>
+  );
+}
+
+/** Truncated source URL + copy-to-clipboard button. Empty state shown
+ *  when no source is configured (channel row is effectively OFFLINE). */
+function SourceUrlCell({ url, kind }: { url: string | null; kind: string | null }) {
+  const [copied, setCopied] = useState(false);
+  if (!url) return <span className="text-xs text-muted-2 italic">no source</span>;
+  async function copy(e: React.MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!url) return;
+    // navigator.clipboard.writeText requires a secure context (HTTPS
+    // or localhost). The CMC wall runs on http://10.51.80.202:8080 so
+    // Chrome throws "The Clipboard API has been blocked because of a
+    // permissions policy" and our old copy() showed a false failure
+    // toast. Fallback to the older textarea + execCommand which every
+    // browser still supports and doesn't care about origin.
+    let ok = false;
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(url);
+        ok = true;
+      }
+    } catch { /* fall through to legacy */ }
+    if (!ok) {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = url;
+        ta.style.position = 'fixed';
+        ta.style.left = '-1000px';
+        ta.style.top = '0';
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+      } catch { ok = false; }
+    }
+    if (ok) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    } else {
+      toast.error('Copy failed — select and Ctrl+C manually');
+    }
+  }
+  return (
+    <div className="flex items-center gap-1.5 max-w-full">
+      {kind ? <Badge variant="outline" className="shrink-0">{kind}</Badge> : null}
+      <code className="text-[11px] font-mono text-muted truncate min-w-0 flex-1">{url}</code>
+      <button
+        onClick={copy}
+        className={cn(
+          'shrink-0 rounded p-1 transition',
+          copied ? 'text-green-500' : 'text-muted-2 hover:text-txt hover:bg-panel2',
+        )}
+        title={copied ? 'Copied' : 'Copy URL'}
+      >
+        {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+      </button>
+    </div>
   );
 }
 

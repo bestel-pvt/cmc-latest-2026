@@ -1,12 +1,12 @@
 'use client';
 
 import Link from 'next/link';
-import { usePathname } from 'next/navigation';
+import { usePathname, useRouter } from 'next/navigation';
 import {
   LayoutDashboard, Tv2, Film, ScrollText,
-  Users, Settings2, Scissors, Shield, Download, LayoutGrid,
+  Users, Scissors, LayoutGrid, Image as ImageIcon, KeyRound, LogOut,
 } from 'lucide-react';
-import { WordMark, PoweredByAnalysys } from '@/components/brand-mark';
+import { WordMark } from '@/components/brand-mark';
 import { cn } from '@/lib/utils';
 import { useAuth } from '@/lib/auth';
 
@@ -21,23 +21,26 @@ interface NavItem {
 // CMC (PAK NAVY) — trimmed navigation. No AI features, no failover
 // controls. Simple channels + recordings + clips + admin.
 const NAV: NavItem[] = [
-  { href: '/dashboard',   label: 'Dashboard',   icon: LayoutDashboard },
-  { href: '/multiviewer', label: 'Video Wall',  icon: LayoutGrid },
-  { href: '/channels',    label: 'Channels',    icon: Tv2 },
-  { href: '/recordings',  label: 'Recordings',  icon: Film },
-  { href: '/clips',       label: 'Clips',       icon: Scissors },
-  { href: '/downloads',   label: 'Downloads',   icon: Download },
+  { href: '/dashboard',   label: 'Dashboard',    icon: LayoutDashboard },
+  { href: '/multiviewer', label: 'Video Wall',   icon: LayoutGrid },
+  { href: '/channels',    label: 'Channels',     icon: Tv2 },
+  { href: '/recordings',  label: 'Recordings',   icon: Film },
+  { href: '/clips',       label: 'Clips',        icon: Scissors },
+  { href: '/frames',      label: 'Frames',       icon: ImageIcon },
 
-  { section: 'Admin', href: '/admin/users',     label: 'Users',       icon: Users,      roles: ['ADMIN'] },
-  { href: '/admin/audit',                       label: 'Audit Log',   icon: ScrollText, roles: ['ADMIN'] },
-  { href: '/admin/legal-holds',                 label: 'Legal Holds', icon: Shield,     roles: ['ADMIN','OPERATOR'] },
-  { href: '/admin/settings',                    label: 'Settings',    icon: Settings2,  roles: ['ADMIN'] },
+  { section: 'Admin', href: '/admin/users',     label: 'Users',           icon: Users,      roles: ['ADMIN'] },
+  { href: '/admin/audit',                       label: 'Audit Log',       icon: ScrollText, roles: ['ADMIN'] },
+  { href: '/admin/password',                    label: 'Change Password', icon: KeyRound },
 ];
 
 export function AppSidebar() {
   const pathname = usePathname();
+  const router = useRouter();
   const user = useAuth((s) => s.user);
+  const logout = useAuth((s) => s.logout);
   const role = user?.role ?? 'VIEWER';
+
+  function onLogout() { logout(); router.push('/login'); }
 
   return (
     <aside className="hidden lg:flex flex-col w-64 shrink-0 border-r border-line bg-white/70 backdrop-blur h-screen sticky top-0 z-40">
@@ -77,8 +80,23 @@ export function AppSidebar() {
         })}
       </nav>
 
-      <div className="px-4 py-4 border-t border-line flex justify-center">
-        <PoweredByAnalysys height={30} />
+      {/* Signed-in user card + logout. Powered-by-Analysys lives on the
+          top bar now (bigger, corporate-visible surface); this slot is
+          for the operator's own controls. */}
+      <div className="px-3 py-3 border-t border-line space-y-2">
+        {user ? (
+          <div className="px-2 py-1.5 text-xs">
+            <div className="font-medium truncate">{user.name}</div>
+            <div className="text-[10px] uppercase tracking-widest text-muted-2">{user.role}</div>
+          </div>
+        ) : null}
+        <button
+          onClick={onLogout}
+          className="w-full flex items-center gap-2.5 rounded-lg px-3 py-2 text-sm text-accent-red hover:bg-accent-red/10 transition-colors"
+        >
+          <LogOut className="h-4 w-4 shrink-0" />
+          <span>Sign out</span>
+        </button>
       </div>
     </aside>
   );

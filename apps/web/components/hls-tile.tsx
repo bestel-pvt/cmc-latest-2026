@@ -28,6 +28,10 @@ interface HlsTileProps {
   onToggleAudio: () => void;
   onClear?: () => void;
   onPick?: () => void;
+  /** Double-click on a filled tile → parent switches the wall into a
+   * solo/fullscreen view of just this channel. See the wall page's
+   * `enterSolo` for the layout snapshot + Esc-restore flow. */
+  onDoubleClick?: () => void;
   className?: string;
 }
 
@@ -55,11 +59,42 @@ export function HlsTile({
   onToggleAudio,
   onClear,
   onPick,
+  onDoubleClick,
   className,
 }: HlsTileProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hlsRef = useRef<Hls | null>(null);
   const [status, setStatus] = useState<'idle' | 'loading' | 'playing' | 'error'>('idle');
+
+  /** Single vs. double click disambiguation. A DOM `click` fires as
+   * part of a `dblclick` too, so we delay the single-click action by
+   * ~220 ms — if a second click arrives inside that window we cancel
+   * the timer and let dblclick handle it. Live-tuned: 220 ms is short
+   * enough to feel instant for audio-toggle, long enough that no
+   * accidental single-click fires before a genuine double.
+   *
+   * Cleared on unmount to avoid firing on a torn-down tile. */
+  const clickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (clickTimerRef.current) clearTimeout(clickTimerRef.current);
+  }, []);
+
+  function handleTileClick(): void {
+    if (!slug) return;                   // empty slot uses its own + Add button
+    if (clickTimerRef.current) return;   // already waiting for a possible double
+    clickTimerRef.current = setTimeout(() => {
+      clickTimerRef.current = null;
+      onToggleAudio();
+    }, 220);
+  }
+  function handleTileDoubleClick(): void {
+    if (!slug || !onDoubleClick) return;
+    if (clickTimerRef.current) {
+      clearTimeout(clickTimerRef.current);
+      clickTimerRef.current = null;
+    }
+    onDoubleClick();
+  }
 
   // Attach / re-attach the HLS source when the assigned channel changes.
   useEffect(() => {
@@ -142,6 +177,8 @@ export function HlsTile({
 
   return (
     <div
+      onClick={slug ? handleTileClick : undefined}
+      onDoubleClick={slug && onDoubleClick ? handleTileDoubleClick : undefined}
       className={cn(
         'relative bg-black overflow-hidden group',
         // Audio-active tile still elevates in z so the border-overlay
@@ -152,6 +189,7 @@ export function HlsTile({
         // so operators lost the highlight the moment a channel started
         // playing.
         audioActive && 'z-10',
+        slug && 'cursor-pointer',
         className,
       )}
     >
@@ -162,13 +200,11 @@ export function HlsTile({
             playsInline
             muted
             autoPlay
-            // object-contain: preserve source aspect + show full frame.
-            // The grid layout is now 6×6 so each tile is exact 16:9 on
-            // a 1080p wall — no distortion, no crop, no visible letter-
-            // box because tile aspect matches source aspect. On non-
-            // 16:9 walls the tiny aspect drift falls back to letterbox
-            // (blends with the black wall bg) rather than a crop.
-            style={{ objectFit: 'contain' }}
+            // object-fill: simple stretch to fill the tile. Whatever
+            // aspect the source arrives in, the video paints edge to
+            // edge. Reverted from cover/contain experiments — the
+            // stretch trade-off is the user's accepted final choice.
+            style={{ objectFit: 'fill' }}
             className="w-full h-full"
           />
           {/* Audio-active border: rendered ABOVE the video so it stays
@@ -198,7 +234,8 @@ export function HlsTile({
           <div className="absolute inset-0 opacity-0 group-hover:opacity-100 transition bg-gradient-to-t from-black/50 via-transparent to-black/40 pointer-events-none">
             <div className="pointer-events-auto absolute bottom-1 right-1 flex gap-1">
               <button
-                onClick={onToggleAudio}
+                onClick={(e) => { e.stopPropagation(); onToggleAudio(); }}
+                onDoubleClick={(e) => e.stopPropagation()}
                 className={cn(
                   'p-1 rounded text-white',
                   audioActive
@@ -211,7 +248,8 @@ export function HlsTile({
               </button>
               {onClear ? (
                 <button
-                  onClick={onClear}
+                  onClick={(e) => { e.stopPropagation(); onClear(); }}
+                  onDoubleClick={(e) => e.stopPropagation()}
                   className="p-1 rounded bg-black/70 text-white hover:bg-red-600"
                   title="Remove channel from slot"
                 >

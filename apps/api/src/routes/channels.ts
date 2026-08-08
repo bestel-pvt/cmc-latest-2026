@@ -1,26 +1,46 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { upsertChannelSchema } from '@cmc/shared';
+import { FRAMES_DIR, frameFilename, grabFrameFromHls } from './frames.js';
+import { mkdirSync, existsSync, statSync } from 'node:fs';
+import path from 'node:path';
 
 /**
- * CMC stream URL for a channel. Only the UDP multicast rebroadcast is
- * emitted — the video-wall client joins that UDP group directly (no
- * MediaMTX / RTSP hop). Same-LAN VLC can attach to the same URL.
+ * Whitelist of channel fields the API returns. CMC has NO AI features,
+ * NO ticker/flasher OCR, NO MediaMTX rebroadcast, and NO failover
+ * controller — the DB still carries those columns from the DEMP schema
+ * but they must not appear in API responses (they confuse the operator
+ * UI). Every channel-returning endpoint uses this projection.
  */
-function dempUrlsFor(_slug: string, port: number | null | undefined): {
-  udp: string | null;
+type Sourceish = { url: string; kind: string };
+function projectChannel<T extends {
+  id: string; slug: string; name: string; logoUrl: string | null;
+  category: string; language: string; active: boolean;
+  recordingEnabled: boolean; notes: string | null;
+  createdAt: Date; updatedAt: Date;
+  sources?: Sourceish[];
+}>(c: T): {
+  id: string; slug: string; name: string; logoUrl: string | null;
+  category: string; language: string; active: boolean;
+  recordingEnabled: boolean; notes: string | null;
+  createdAt: Date; updatedAt: Date;
+  sourceUrl: string | null; sourceKind: string | null;
 } {
-  let udp: string | null = null;
-  if (port) {
-    const octet = 100 + (port % 155);
-    udp = `udp://@239.7.${octet}.${port & 0xff}:${port}`;
-  }
-  return { udp };
-}
-
-/** Back-compat single-URL helper (used by CSV export). Returns the UDP
- * multicast URL when the channel has an output port, otherwise null. */
-function dempUrlFor(slug: string, port?: number | null): string | null {
-  return dempUrlsFor(slug, port ?? null).udp;
+  const primary = c.sources && c.sources.length > 0 ? c.sources[0]! : null;
+  return {
+    id: c.id,
+    slug: c.slug,
+    name: c.name,
+    logoUrl: c.logoUrl,
+    category: c.category,
+    language: c.language,
+    active: c.active,
+    recordingEnabled: c.recordingEnabled,
+    notes: c.notes,
+    createdAt: c.createdAt,
+    updatedAt: c.updatedAt,
+    sourceUrl: primary?.url ?? null,
+    sourceKind: primary?.kind ?? null,
+  };
 }
 
 const routes: FastifyPluginAsync = async (app) => {
@@ -48,36 +68,12 @@ const routes: FastifyPluginAsync = async (app) => {
 
     const channels = await app.prisma.channel.findMany({
       where,
-      include: { sources: { orderBy: [{ isPrimary: 'desc' }, { priority: 'desc' }] } },
+      // CMC = 1 source per channel (no failover). We still include the
+      // sources relation so projectChannel can flatten to sourceUrl.
+      include: { sources: { orderBy: [{ isPrimary: 'desc' }, { priority: 'desc' }], take: 1 } },
       orderBy: { name: 'asc' },
     });
-
-    // Attach hot health from Redis (best-effort). Wall clients join UDP
-    // multicast DIRECTLY, so the server has no rebroadcast-side signal
-    // to consult — operator `active` + failover-controller score are the
-    // only inputs.
-    const withHealth = await Promise.all(channels.map(async (c) => {
-      const state = await app.redis.hgetall(`demp:ch:${c.id}:state`);
-      const redisScore = state.score !== undefined && state.score !== '' ? Number(state.score) : null;
-      const urls = dempUrlsFor(c.slug, c.dempOutputPort);
-      // "online" drives grey-out in the web UI. Trust the operator's
-      // `active` flag as the source of truth; a positive failover-
-      // controller score only ever ADDS confidence, never subtracts.
-      // Channels that are genuinely dead get flipped to `active=false`
-      // in the admin UI.
-      const online = Boolean(c.active) || (redisScore !== null && redisScore > 0.2);
-      return {
-        ...c,
-        online,
-        dempOutputUrl: urls.udp,
-        runtime: {
-          activeSourceId: state.activeSourceId ?? null,
-          lastSwitchAt:   state.lastSwitchAt ? Number(state.lastSwitchAt) : null,
-          score: redisScore,
-        },
-      };
-    }));
-    return withHealth;
+    return channels.map(projectChannel);
   });
 
   /**
@@ -201,33 +197,24 @@ const routes: FastifyPluginAsync = async (app) => {
       .send(png);
   });
 
-  // CSV export of channels + sources + CMC output URLs.
+  // CSV export — same trimmed shape as JSON (one row per channel, one source).
   app.get('/export.csv', async (_req, reply) => {
     const channels = await app.prisma.channel.findMany({
-      include: { sources: { orderBy: [{ isPrimary: 'desc' }, { priority: 'desc' }] } },
+      include: { sources: { orderBy: [{ isPrimary: 'desc' }, { priority: 'desc' }], take: 1 } },
       orderBy: { name: 'asc' },
     });
-    const rows: string[] = [
-      'channel_name,slug,category,language,active,ai_features_enabled,demp_output_url,source_name,source_kind,source_url,is_primary,priority',
-    ];
+    const rows: string[] = ['channel_name,slug,category,language,active,recording_enabled,source_kind,source_url'];
     const esc = (v: unknown) => {
       const s = v === null || v === undefined ? '' : String(v);
       return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
     };
     for (const c of channels) {
-      const url = dempUrlFor(c.slug, c.dempOutputPort);
-      if (c.sources.length === 0) {
-        rows.push([c.name, c.slug, c.category, c.language, c.active, c.aiFeaturesEnabled, url, '', '', '', '', ''].map(esc).join(','));
-      } else {
-        for (const s of c.sources) {
-          rows.push([c.name, c.slug, c.category, c.language, c.active, c.aiFeaturesEnabled, url,
-                     s.notes ?? s.kind, s.kind, s.url, s.isPrimary, s.priority].map(esc).join(','));
-        }
-      }
+      const src = c.sources[0];
+      rows.push([c.name, c.slug, c.category, c.language, c.active, c.recordingEnabled, src?.kind ?? '', src?.url ?? ''].map(esc).join(','));
     }
     reply
       .header('Content-Type', 'text/csv; charset=utf-8')
-      .header('Content-Disposition', `attachment; filename="demp-channels-${new Date().toISOString().slice(0,10)}.csv"`);
+      .header('Content-Disposition', `attachment; filename="cmc-channels-${new Date().toISOString().slice(0,10)}.csv"`);
     return rows.join('\n');
   });
 
@@ -238,55 +225,50 @@ const routes: FastifyPluginAsync = async (app) => {
       include: { sources: { orderBy: [{ isPrimary: 'desc' }, { priority: 'desc' }] } },
     });
     if (!channel) return reply.notFound();
-
-    // Attach per-source health from Redis + computed CMC UDP URL
-    const sourcesWithHealth = await Promise.all(channel.sources.map(async (s) => {
-      const raw = await app.redis.get(`demp:src:${s.id}:health`);
-      return { ...s, health: raw ? JSON.parse(raw) : null };
-    }));
-    const state = await app.redis.hgetall(`demp:ch:${channel.id}:state`);
-    const _urls = dempUrlsFor(channel.slug, channel.dempOutputPort);
-    return {
-      ...channel,
-      dempOutputUrl: _urls.udp,
-      sources: sourcesWithHealth,
-      runtime: {
-        activeSourceId: state.activeSourceId ?? null,
-        lastSwitchAt: state.lastSwitchAt ? Number(state.lastSwitchAt) : null,
-        score: state.score ? Number(state.score) : null,
-      },
-    };
+    // Detail response keeps the full sources array so the channel-detail
+    // page can render its source-management UI (add / edit / delete).
+    // Every other DEMP-only field (ticker/flasher/AI/demp/runtime) still
+    // gets stripped by the same projection.
+    return { ...projectChannel(channel), sources: channel.sources };
   });
 
   app.post('/', { preHandler: [app.authorize(['ADMIN', 'OPERATOR'])] }, async (req, reply) => {
     const parsed = upsertChannelSchema.safeParse(req.body);
     if (!parsed.success) return reply.badRequest(parsed.error.message);
 
-    const created = await app.prisma.channel.create({ data: parsed.data as never });
+    const created = await app.prisma.channel.create({
+      data: parsed.data as never,
+      include: { sources: { orderBy: [{ isPrimary: 'desc' }, { priority: 'desc' }], take: 1 } },
+    });
     await app.audit(req, 'channel.create', { entityType: 'Channel', entityId: created.id, meta: { slug: created.slug } });
     (req as unknown as { auditWritten?: boolean }).auditWritten = true;
 
-    return reply.code(201).send(created);
+    return reply.code(201).send(projectChannel(created));
   });
 
   app.patch('/:id', { preHandler: [app.authorize(['ADMIN', 'OPERATOR'])] }, async (req, reply) => {
     const { id } = req.params as { id: string };
     const body = (req.body ?? {}) as Record<string, unknown>;
     const data: Record<string, unknown> = {};
-    for (const k of [
-      'name', 'category', 'language', 'active', 'notes', 'logoUrl', 'aiFeaturesEnabled', 'recordingEnabled',
-      'tickerCropRect', 'tickerPrimaryRect', 'tickerSecondaryRect', 'flasherLeftRect', 'flasherRightRect',
-    ] as const) {
+    // CMC: only fields that the operator UI can actually toggle. Ticker /
+    // flasher / AI / demp fields are not editable here.
+    for (const k of ['name', 'category', 'language', 'active', 'notes', 'logoUrl', 'recordingEnabled'] as const) {
       if (k in body) data[k] = body[k];
     }
-
-    // CMC: no demo scope gate — every channel can toggle recording +
-    // clipping freely.
-    const updated = await app.prisma.channel.update({ where: { id }, data: data as never });
+    const updated = await app.prisma.channel.update({
+      where: { id },
+      data: data as never,
+      include: { sources: { orderBy: [{ isPrimary: 'desc' }, { priority: 'desc' }], take: 1 } },
+    });
+    // Recording-toggle trace: user reported "start from web, stop, doesn't
+    // appear on recordings page". Log the PATCH so we can correlate with
+    // recording.log entries when reproducing.
+    if ('recordingEnabled' in data) {
+      req.log.info({ channelId: id, slug: updated.slug, recordingEnabled: data.recordingEnabled }, 'recording toggle changed');
+    }
     await app.audit(req, 'channel.update', { entityType: 'Channel', entityId: id, meta: { fields: Object.keys(data) } });
     (req as unknown as { auditWritten?: boolean }).auditWritten = true;
-
-    return updated;
+    return projectChannel(updated);
   });
 
   app.delete('/:id', { preHandler: [app.authorize(['ADMIN'])] }, async (req, reply) => {
@@ -295,6 +277,43 @@ const routes: FastifyPluginAsync = async (app) => {
     await app.audit(req, 'channel.delete', { entityType: 'Channel', entityId: id });
     (req as unknown as { auditWritten?: boolean }).auditWritten = true;
     return reply.code(204).send();
+  });
+
+  /**
+   * POST /api/channels/:id/snapshot — capture the live frame right
+   * now. Reads from the live-hls playlist on disk (~500 ms), writes a
+   * PNG under DATA_DIR/frames/<yyyy-mm-dd>/, returns the frame metadata.
+   */
+  app.post('/:id/snapshot', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const ch = await app.prisma.channel.findUnique({ where: { id }, select: { id: true, slug: true } });
+    if (!ch) return reply.notFound();
+
+    const HLS_DIR = path.resolve(process.env.HLS_DIR ?? './data/hls');
+    const playlist = path.join(HLS_DIR, ch.slug, 'live.m3u8');
+    if (!existsSync(playlist)) return reply.code(503).send({ error: 'no live playlist for this channel' });
+
+    const capturedAt = new Date();
+    const day = capturedAt.toISOString().slice(0, 10);
+    const dayDir = path.join(FRAMES_DIR, day);
+    mkdirSync(dayDir, { recursive: true });
+    const filename = frameFilename(ch.id, capturedAt);
+    const outPath = path.join(dayDir, filename);
+
+    const ok = await grabFrameFromHls(playlist, outPath);
+    if (!ok) return reply.code(500).send({ error: 'failed to capture frame' });
+
+    const frameId = `${day}/${filename}`;
+    await app.audit(req, 'frame.create', { entityType: 'Channel', entityId: ch.id, meta: { slug: ch.slug } });
+    (req as unknown as { auditWritten?: boolean }).auditWritten = true;
+    return reply.code(201).send({
+      id: frameId,
+      channelId: ch.id,
+      channelSlug: ch.slug,
+      capturedAt: capturedAt.toISOString(),
+      sizeBytes: statSync(outPath).size,
+      imageUrl: `/api/frames/${encodeURIComponent(frameId)}/image`,
+    });
   });
 
   // Force a source switch (operator override)

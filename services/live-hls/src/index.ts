@@ -103,7 +103,11 @@ function normaliseUrl(url: string, kind: string): string {
     // through any IGMP hiccup without exiting, but still catches a
     // genuinely dead source within a minute.
     const params: string[] = [];
-    if (!u.includes('fifo_size='))         params.push('fifo_size=4000000');
+    // fifo_size = ffmpeg internal buffer (10 MB). buffer_size = kernel
+    // SO_RCVBUF (8 MB). With 60 concurrent UDP subscribers on one NIC
+    // Windows fails NEW binds at ~800 MB total pinned kernel buffer;
+    // 60 * 16 MB tips over, 60 * 8 MB fits.
+    if (!u.includes('fifo_size='))         params.push('fifo_size=10000000');
     if (!u.includes('overrun_nonfatal='))  params.push('overrun_nonfatal=1');
     if (!u.includes('timeout='))           params.push('timeout=60000000');
     if (!u.includes('buffer_size='))       params.push('buffer_size=8388608');
@@ -143,7 +147,7 @@ function probeVideoCodec(url: string, kind: string): string | null {
   return m ? m[1]!.toLowerCase() : null;
 }
 
-function ffArgs(url: string, kind: string, outDir: string, transcodeVideo: boolean): string[] {
+function ffArgs(url: string, kind: string, outDir: string, transcodeVideo: boolean, slug: string): string[] {
   const commonInput = [
     '-hide_banner',
     '-nostdin',
@@ -166,32 +170,51 @@ function ffArgs(url: string, kind: string, outDir: string, transcodeVideo: boole
   //     preset keeps per-stream cost tiny; only 1-2 channels ever hit
   //     this branch, so total transcode CPU stays negligible.
   const videoArgs = transcodeVideo
-    ? [
+    ? (() => {
         // yadif: deinterlace (mode 0 = 1 frame per pair, cheapest).
         // Required for 1080i50 Pakistani HD channels — without it
-        // Chrome/Edge won't decode interlaced H.264 even after
-        // remux. Cost: ~5-10 % of one core per HD stream.
-        '-vf', 'yadif=0:-1:0',
-        '-c:v', 'libx264',
-        '-preset', 'ultrafast',
-        '-tune', 'zerolatency',
-        '-profile:v', 'main',
-        '-pix_fmt', 'yuv420p',
-        '-threads', '1',
-        '-b:v', '2500k',
-        '-maxrate', '3000k',
-        '-bufsize', '5000k',
-        // Emit a keyframe every HLS_SEGMENT_TIME s so segments align.
-        '-force_key_frames', `expr:gte(t,n_forced*${HLS_SEGMENT_TIME})`,
-      ]
+        // Chrome/Edge won't decode interlaced H.264 even after remux.
+        //
+        // CNN specifically is 1920×1080 CNNI EMEA HD with SCTE-35 +
+        // teletext streams; even multi-threaded ultrafast + yadif
+        // hits ~150 % of one core = jittery segments in browser.
+        // Downscaling to 1280×720 during encode cuts pixel count 55 %
+        // and drops CPU to ~60 %. Tiles on the wall are 240 px wide
+        // anyway — zero visual loss from 1080p→720p.
+        const isHeavyHDInterlaced = slug === 'cnn';
+        const vf = isHeavyHDInterlaced
+          ? 'yadif=0:-1:0,scale=1280:720:flags=fast_bilinear'
+          : 'yadif=0:-1:0';
+        return [
+          '-vf', vf,
+          '-c:v', 'libx264',
+          '-preset', 'ultrafast',
+          '-tune', 'zerolatency',
+          '-profile:v', 'main',
+          '-pix_fmt', 'yuv420p',
+          '-threads', '0',
+          '-b:v', isHeavyHDInterlaced ? '2000k' : '2500k',
+          '-maxrate', isHeavyHDInterlaced ? '2500k' : '3000k',
+          '-bufsize', isHeavyHDInterlaced ? '4000k' : '5000k',
+          '-force_key_frames', `expr:gte(t,n_forced*${HLS_SEGMENT_TIME})`,
+        ];
+      })()
     : ['-c:v', 'copy'];
 
   // Audio: always AAC. Browsers stall on MP2 inside HLS.
+  //
+  // -af aresample=async=1000  → resample-based drift correction. Fixes
+  //   CNN-style MP2 audio that arrives with irregular PTS (multi-audio
+  //   MPEG-TS + SCTE-35 breaks make the encoder starve for samples
+  //   which shows in the browser as "audio atakti"). 1000 samples/s
+  //   of stretch tolerance is enough for satellite drift without being
+  //   audible.
   const audioArgs = [
     '-c:a', 'aac',
     '-b:a', '96k',
     '-ac', '2',
     '-ar', '48000',
+    '-af', 'aresample=async=1000',
   ];
 
   const hlsArgs = [
@@ -248,7 +271,7 @@ function launch(sup: Sup): void {
     }
   }
 
-  const args = ffArgs(sup.url, sup.kind, outDir, sup.forceTranscode);
+  const args = ffArgs(sup.url, sup.kind, outDir, sup.forceTranscode, sup.slug);
   const proc = spawn(FFMPEG, args, { stdio: ['ignore', 'ignore', 'pipe'] });
   sup.proc = proc;
   sup.lastRestartAt = Date.now();

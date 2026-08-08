@@ -1,247 +1,528 @@
 'use client';
 
-import { useParams } from 'next/navigation';
-import { useState } from 'react';
+/**
+ * Channel detail — CMC edition.
+ *
+ * Everything on this page is either operator input or read-only state
+ * that lives elsewhere on the server. Sources are a single row (no
+ * failover), no ticker/flasher regions, no AI toggles, no health
+ * scoring — CMC has none of that. What's left:
+ *   1. Live HLS preview + camera snapshot button
+ *   2. Basic info + active/recording toggles
+ *   3. Single source URL (edit inline, copy button)
+ *   4. This channel's recorded segments (recent + searchable)
+ *   5. This channel's clips (recent)
+ */
+
+import { useParams, useRouter } from 'next/navigation';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ArrowLeft, GripVertical, Plus, Radio, Star, StarOff, Trash2, Zap, ScanLine, ShieldCheck } from 'lucide-react';
 import Link from 'next/link';
+import Hls from 'hls.js';
 import { toast } from 'sonner';
+import {
+  ArrowLeft, Camera, Copy, Check, Save, Loader2, Circle, CircleDot,
+  Film, Scissors, Search,
+} from 'lucide-react';
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { HealthMeter } from '@/components/health-meter';
-import { Monitor as MonitorIcon } from 'lucide-react';
-import { TickerRegionsEditor, type Rect } from '@/components/ticker-regions-editor';
-import { LogoUploader, RecordingStatusPanel, SwitchHistoryPanel, TickerThumbGrid } from '@/components/channel-overview-panels';
+import { AuthImg } from '@/components/auth-img';
+import { LogoUploader } from '@/components/channel-overview-panels';
 import { api } from '@/lib/api';
-import { SOURCE_KINDS } from '@cmc/shared';
-import { cn } from '@/lib/utils';
+import { SOURCE_KINDS, CHANNEL_CATEGORIES, CHANNEL_LANGUAGES } from '@cmc/shared';
+import { cn, fmtBytes } from '@/lib/utils';
 
 interface Source {
   id: string; channelId: string; name: string; url: string; kind: string;
   isPrimary: boolean; priority: number; notes: string | null;
-  health?: { score?: number; bitrateBps?: number; packetLossPct?: number; blackPct?: number } | null;
 }
 interface Channel {
   id: string; slug: string; name: string; category: string; language: string; active: boolean;
-  aiFeaturesEnabled: boolean;
   logoUrl: string | null;
-  dempOutputUrl: string | null;
-  tickerCropRect: Rect | null;
-  tickerPrimaryRect: Rect | null;
-  tickerSecondaryRect: Rect | null;
-  flasherLeftRect: Rect | null;
-  flasherRightRect: Rect | null;
-  sources: Source[];
-  runtime?: { score: number | null; activeSourceId: string | null };
+  recordingEnabled: boolean;
+  notes: string | null;
+  sources: Source[];   // detail endpoint returns array; CMC uses [0] only
 }
-
+interface RecordingSegment {
+  id: string; channelId: string; startedAt: string; durationMs: number;
+  sizeBytes: number; path: string;
+}
+interface Clip {
+  id: string; channelId: string; title: string; startAt: string; endAt: string;
+  status: string; format: string; resolution: string; sizeBytes?: number;
+}
 
 export default function ChannelDetailPage() {
   const { id } = useParams() as { id: string };
+  const router = useRouter();
   const qc = useQueryClient();
+
   const { data: ch, isLoading } = useQuery<Channel>({
     queryKey: ['channel', id],
     queryFn: () => api<Channel>(`/api/channels/${id}`),
-    refetchInterval: 5_000,
-  });
-
-  const [newSrc, setNewSrc] = useState({ name: '', url: '', kind: 'UDP', isPrimary: false });
-
-  const addSource = useMutation({
-    mutationFn: () => api('/api/sources', { method: 'POST', body: { channelId: id, ...newSrc } }),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['channel', id] }); toast.success('Source added'); setNewSrc({ name: '', url: '', kind: 'UDP', isPrimary: false }); },
-    onError: (e) => toast.error(e instanceof Error ? e.message : 'Failed'),
-  });
-  const setPrimary = useMutation({
-    mutationFn: (srcId: string) => api(`/api/sources/${srcId}`, { method: 'PATCH', body: { isPrimary: true } }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['channel', id] }),
-  });
-  const removeSource = useMutation({
-    mutationFn: (srcId: string) => api(`/api/sources/${srcId}`, { method: 'DELETE' }),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['channel', id] }); toast.success('Source removed'); },
-  });
-  const forceSwitch = useMutation({
-    mutationFn: (sourceId: string) => api(`/api/channels/${id}/switch`, { method: 'POST', body: { sourceId } }),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['channel', id] }); toast.success('Switched'); },
-  });
-  const saveRegions = useMutation({
-    mutationFn: (patch: Partial<Record<'tickerPrimaryRect' | 'tickerSecondaryRect' | 'flasherLeftRect' | 'flasherRightRect', Rect | null>>) =>
-      api(`/api/channels/${id}`, { method: 'PATCH', body: patch }),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['channel', id] }); toast.success('Regions saved'); },
-    onError: (e) => toast.error(e instanceof Error ? e.message : 'Failed'),
+    refetchInterval: 10_000,
   });
 
   if (isLoading || !ch) {
-    return <div className="max-w-[1200px] mx-auto"><div className="h-64 rounded-xl bg-panel2/70 animate-pulse" /></div>;
+    return <div className="max-w-[1400px] mx-auto"><div className="h-64 rounded-xl bg-panel2/70 animate-pulse" /></div>;
   }
 
   return (
     <div className="max-w-[1400px] mx-auto space-y-6">
+      {/* header */}
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <div className="flex items-center gap-3">
-          <Link href="/channels" className="text-muted hover:text-txt"><ArrowLeft className="h-4 w-4" /></Link>
+          <button onClick={() => router.back()} className="text-muted hover:text-txt" title="Back">
+            <ArrowLeft className="h-4 w-4" />
+          </button>
           <div>
             <div className="flex items-center gap-2 flex-wrap">
               <h1 className="font-display text-2xl font-bold tracking-tight">{ch.name}</h1>
               <Badge variant="brand">{ch.category}</Badge>
               <Badge variant="outline">{ch.language}</Badge>
+              {ch.recordingEnabled && <Badge className="bg-accent-red/15 text-accent-red border-accent-red/30">RECORDING</Badge>}
             </div>
             <div className="text-[11px] text-muted-2 mt-0.5 font-mono uppercase tracking-widest">/{ch.slug}</div>
           </div>
         </div>
-        <div className="flex items-center gap-4">
-          <LogoUploader channelId={ch.id} currentUrl={ch.logoUrl} />
-          <div className="text-right">
-            <div className="text-[10px] uppercase tracking-widest text-muted-2">Rolling health</div>
-            <div className="w-56"><HealthMeter value={ch.runtime?.score ?? null} label /></div>
-          </div>
-        </div>
+        <LogoUploader channelId={ch.id} currentUrl={ch.logoUrl} />
       </div>
 
+      {/* live preview + snapshot */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* preview */}
-        <Card className="lg:col-span-2">
-          <CardContent className="p-4 space-y-4">
-            <div className="aspect-video w-full rounded-lg border border-line bg-panel2/40 flex flex-col items-center justify-center gap-3 text-center px-6">
-              <MonitorIcon className="h-10 w-10 text-brand/70" />
-              <div className="max-w-md">
-                <div className="text-sm font-medium">Live playback is in the CMC Viewer desktop app</div>
-                <div className="text-xs text-muted-2 mt-1">
-                  Browsers can't play the satellite UDP feeds. Open <span className="font-mono">CMC-Viewer.exe</span>
-                  {' '}from <a className="text-brand hover:underline" href="/downloads">Downloads</a> and pick this channel.
-                </div>
-              </div>
-            </div>
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-              <QuickStat label="Sources" value={ch.sources.length} icon={Radio} />
-              <QuickStat label="Active src"
-                value={ch.sources.find((s) => s.id === ch.runtime?.activeSourceId)?.kind ?? '—'}
-                icon={Zap} />
-              <QuickStat label="Ticker" value={ch.tickerCropRect ? 'Cropped' : 'None'} icon={ScanLine} />
-              <QuickStat label="Legal hold" value="—" icon={ShieldCheck} />
-            </div>
-          </CardContent>
-        </Card>
-
-        {/* sources */}
-        <Card>
-          <CardHeader><CardTitle>Sources &amp; Failover</CardTitle></CardHeader>
-          <CardContent className="p-0">
-            <ul className="divide-y divide-border">
-              {ch.sources.map((s) => (
-                <li key={s.id} className={cn(
-                  'px-4 py-3 flex items-center gap-3',
-                  ch.runtime?.activeSourceId === s.id && 'bg-brand/5',
-                )}>
-                  <GripVertical className="h-4 w-4 text-muted-2 shrink-0" />
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <span className="font-medium text-sm">{s.name || s.kind}</span>
-                      <Badge variant="outline">{s.kind}</Badge>
-                      {s.isPrimary && <Badge variant="brand">PRIMARY</Badge>}
-                      {ch.runtime?.activeSourceId === s.id && <Badge variant="green">ACTIVE</Badge>}
-                    </div>
-                    <div className="text-xs font-mono text-muted mt-0.5 truncate">{s.url}</div>
-                  </div>
-                  <div className="w-24"><HealthMeter value={s.health?.score ?? null} size="sm" /></div>
-                  <div className="flex items-center gap-1">
-                    <button title={s.isPrimary ? 'Primary' : 'Set primary'}
-                      onClick={() => setPrimary.mutate(s.id)}
-                      className="text-muted hover:text-brand">
-                      {s.isPrimary ? <Star className="h-4 w-4 fill-brand text-brand" /> : <StarOff className="h-4 w-4" />}
-                    </button>
-                    <button title="Force switch to this source"
-                      onClick={() => forceSwitch.mutate(s.id)}
-                      className="text-muted hover:text-accent-green"><Zap className="h-4 w-4" /></button>
-                    <button title="Remove"
-                      onClick={() => removeSource.mutate(s.id)}
-                      className="text-muted hover:text-accent-red"><Trash2 className="h-4 w-4" /></button>
-                  </div>
-                </li>
-              ))}
-              {ch.sources.length === 0 && <li className="p-6 text-center text-sm text-muted">No sources yet.</li>}
-            </ul>
-
-            <div className="p-4 border-t border-border space-y-2">
-              <div className="text-[10px] uppercase tracking-widest text-muted-2 mb-2">Add source</div>
-              <Input
-                placeholder='Source name — e.g. "Satellite", "OTT Backup", "Fiber"'
-                value={newSrc.name}
-                onChange={(e) => setNewSrc((n) => ({ ...n, name: e.target.value }))}
-                required
-              />
-              <div className="grid grid-cols-[100px_1fr] gap-2">
-                <Select value={newSrc.kind} onValueChange={(v) => setNewSrc((n) => ({ ...n, kind: v }))}>
-                  <SelectTrigger><SelectValue /></SelectTrigger>
-                  <SelectContent>{SOURCE_KINDS.map((k) => <SelectItem key={k} value={k}>{k}</SelectItem>)}</SelectContent>
-                </Select>
-                <Input placeholder="udp://@224.2.2.2:2020"
-                  value={newSrc.url} onChange={(e) => setNewSrc((n) => ({ ...n, url: e.target.value }))}
-                  className="font-mono text-xs" />
-              </div>
-              <div className="flex items-center justify-between">
-                <label className="flex items-center gap-2 text-xs text-muted">
-                  <input type="checkbox" checked={newSrc.isPrimary}
-                    onChange={(e) => setNewSrc((n) => ({ ...n, isPrimary: e.target.checked }))} />
-                  Set as primary
-                </label>
-                <Button size="sm" variant="gradient" onClick={() => addSource.mutate()} disabled={!newSrc.name.trim() || !newSrc.url.trim()}>
-                  <Plus className="h-3.5 w-3.5" /> Add source
-                </Button>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
+        <LivePreviewCard slug={ch.slug} channelId={ch.id} channelName={ch.name} />
+        <InfoCard channel={ch} />
       </div>
 
-      {/* Everything view — recording status + switches + tickers */}
+      {/* single source */}
+      <SourceCard channel={ch} onSaved={() => qc.invalidateQueries({ queryKey: ['channel', id] })} />
+
+      {/* recordings + clips for this channel */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <RecordingStatusPanel channelId={ch.id} aiEnabled={ch.aiFeaturesEnabled} />
-        <SwitchHistoryPanel channelId={ch.id} sources={ch.sources} />
+        <RecordingsPanel channelId={ch.id} channelSlug={ch.slug} />
+        <ClipsPanel channelId={ch.id} />
       </div>
-      <TickerThumbGrid channelId={ch.id} aiEnabled={ch.aiFeaturesEnabled} />
-
-      {/* Regions editor */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <ScanLine className="h-4 w-4 text-brand" /> Ticker &amp; Flasher Regions
-          </CardTitle>
-          <p className="text-xs text-muted mt-1">
-            Grab a fresh freeze frame and draw rectangles for each on-screen zone.
-            The OCR worker reads exactly what you box; everything else is ignored.
-          </p>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <TickerRegionsEditor
-            channelId={ch.id}
-            initial={{
-              tickerPrimaryRect:   ch.tickerPrimaryRect,
-              tickerSecondaryRect: ch.tickerSecondaryRect,
-              flasherLeftRect:     ch.flasherLeftRect,
-              flasherRightRect:    ch.flasherRightRect,
-            }}
-            onSave={async (patch) => { await saveRegions.mutateAsync(patch); }}
-          />
-        </CardContent>
-      </Card>
     </div>
   );
 }
 
-function QuickStat({ label, value, icon: Icon }: { label: string; value: string | number; icon: React.ComponentType<{ className?: string }> }) {
+/* ─────────────────────────────── Live HLS preview + snapshot ─────────── */
+
+function LivePreviewCard({ slug, channelId, channelName }: { slug: string; channelId: string; channelName: string }) {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const hlsRef = useRef<Hls | null>(null);
+  const [muted, setMuted] = useState(true);
+  const [status, setStatus] = useState<'loading' | 'playing' | 'error'>('loading');
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    const base = (process.env.NEXT_PUBLIC_API_URL ?? '').replace(/\/+$/, '')
+      || `${window.location.protocol}//${window.location.hostname}:4001`;
+    const url = `${base}/hls/${slug}/live.m3u8`;
+    if (!Hls.isSupported() && video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = url; video.play().catch(() => {}); setStatus('playing');
+      return;
+    }
+    if (hlsRef.current) hlsRef.current.destroy();
+    const hls = new Hls({
+      liveDurationInfinity: true, lowLatencyMode: false,
+      liveSyncDurationCount: 3, liveMaxLatencyDurationCount: 40,
+      maxBufferLength: 60, backBufferLength: 30,
+    });
+    hlsRef.current = hls;
+    hls.attachMedia(video);
+    hls.on(Hls.Events.MEDIA_ATTACHED, () => hls.loadSource(url));
+    hls.on(Hls.Events.MANIFEST_PARSED, () => { video.play().catch(() => {}); setStatus('playing'); });
+    hls.on(Hls.Events.ERROR, (_evt, data) => {
+      if (!data.fatal) return;
+      setStatus('error');
+      if (data.type === Hls.ErrorTypes.NETWORK_ERROR) { hls.startLoad(); setStatus('loading'); }
+      else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) { hls.recoverMediaError(); setStatus('loading'); }
+    });
+    return () => { hls.destroy(); hlsRef.current = null; };
+  }, [slug]);
+
+  useEffect(() => { if (videoRef.current) videoRef.current.muted = muted; }, [muted]);
+
+  const snapshotMut = useMutation({
+    mutationFn: () => api(`/api/channels/${channelId}/snapshot`, { method: 'POST', body: {} }),
+    onSuccess: () => toast.success(`Frame saved — see Frames page`),
+    onError: (e) => toast.error(e instanceof Error ? e.message : 'Snapshot failed'),
+  });
+
   return (
-    <div className="rounded-lg border border-border bg-panel2/60 p-3 flex items-center gap-3">
-      <div className="h-9 w-9 rounded-md bg-white border border-border flex items-center justify-center">
-        <Icon className="h-4 w-4 text-brand" />
+    <Card className="lg:col-span-2 overflow-hidden">
+      <div className="relative aspect-video bg-black">
+        <video
+          ref={videoRef}
+          playsInline autoPlay muted
+          className="w-full h-full"
+          style={{ objectFit: 'cover' }}
+        />
+        {status !== 'playing' && (
+          <div className="absolute inset-0 flex items-center justify-center text-white/60 text-xs uppercase tracking-widest">
+            {status === 'loading' ? <><Loader2 className="h-4 w-4 animate-spin mr-2" /> loading</> : 'no live signal'}
+          </div>
+        )}
       </div>
-      <div>
-        <div className="text-[10px] uppercase tracking-widest text-muted-2">{label}</div>
-        <div className="font-display font-semibold text-sm">{value}</div>
+      <div className="p-3 flex items-center gap-2">
+        <div className="text-xs text-muted">{channelName} · live</div>
+        <div className="ml-auto flex gap-2">
+          <Button size="sm" variant="secondary" onClick={() => setMuted((m) => !m)} title={muted ? 'Unmute' : 'Mute'}>
+            {muted ? 'Unmute audio' : 'Mute audio'}
+          </Button>
+          <Button
+            size="sm"
+            variant="gradient"
+            onClick={() => snapshotMut.mutate()}
+            disabled={snapshotMut.isPending}
+            title="Capture the current frame → visible on Frames page"
+          >
+            {snapshotMut.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin mr-1" /> : <Camera className="h-3.5 w-3.5 mr-1" />}
+            Snapshot
+          </Button>
+        </div>
       </div>
-    </div>
+    </Card>
   );
+}
+
+/* ─────────────────────────────── Basic info + toggles ────────────────── */
+
+function InfoCard({ channel: ch }: { channel: Channel }) {
+  const qc = useQueryClient();
+  const [name, setName] = useState(ch.name);
+  const [category, setCategory] = useState(ch.category);
+  const [language, setLanguage] = useState(ch.language);
+  const [active, setActive] = useState(ch.active);
+  const [recording, setRecording] = useState(ch.recordingEnabled);
+  const [notes, setNotes] = useState(ch.notes ?? '');
+  useEffect(() => {
+    setName(ch.name); setCategory(ch.category); setLanguage(ch.language);
+    setActive(ch.active); setRecording(ch.recordingEnabled); setNotes(ch.notes ?? '');
+  }, [ch.name, ch.category, ch.language, ch.active, ch.recordingEnabled, ch.notes]);
+
+  const saveMut = useMutation({
+    mutationFn: (body: Partial<Channel>) => api(`/api/channels/${ch.id}`, { method: 'PATCH', body }),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['channel', ch.id] }); toast.success('Saved'); },
+    onError: (e) => toast.error(e instanceof Error ? e.message : 'Save failed'),
+  });
+
+  const dirty = name !== ch.name || category !== ch.category || language !== ch.language
+    || active !== ch.active || recording !== ch.recordingEnabled || notes !== (ch.notes ?? '');
+
+  return (
+    <Card>
+      <CardHeader><CardTitle>Info</CardTitle></CardHeader>
+      <CardContent className="space-y-3">
+        <div>
+          <label className="text-[10px] uppercase tracking-widest text-muted-2">Name</label>
+          <Input value={name} onChange={(e) => setName(e.target.value)} />
+        </div>
+        <div className="grid grid-cols-2 gap-2">
+          <div>
+            <label className="text-[10px] uppercase tracking-widest text-muted-2">Category</label>
+            <Select value={category} onValueChange={setCategory}>
+              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectContent>{CHANNEL_CATEGORIES.map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}</SelectContent>
+            </Select>
+          </div>
+          <div>
+            <label className="text-[10px] uppercase tracking-widest text-muted-2">Language</label>
+            <Select value={language} onValueChange={setLanguage}>
+              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectContent>{CHANNEL_LANGUAGES.map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}</SelectContent>
+            </Select>
+          </div>
+        </div>
+        <div className="flex gap-4">
+          <label className="inline-flex items-center gap-2 text-sm">
+            <input type="checkbox" checked={active} onChange={(e) => setActive(e.target.checked)} />
+            Active
+          </label>
+          <label className="inline-flex items-center gap-2 text-sm">
+            <input type="checkbox" checked={recording} onChange={(e) => setRecording(e.target.checked)} />
+            Recording
+          </label>
+        </div>
+        <div>
+          <label className="text-[10px] uppercase tracking-widest text-muted-2">Notes</label>
+          <Input value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Optional notes" />
+        </div>
+        <div className="pt-2">
+          <Button
+            size="sm" variant="gradient"
+            onClick={() => saveMut.mutate({ name, category, language, active, recordingEnabled: recording, notes })}
+            disabled={!dirty || saveMut.isPending}
+          >
+            {saveMut.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin mr-1" /> : <Save className="h-3.5 w-3.5 mr-1" />}
+            Save
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+/* ─────────────────────────────── Single source (edit / copy) ─────────── */
+
+function SourceCard({ channel: ch, onSaved }: { channel: Channel; onSaved: () => void }) {
+  const current = ch.sources[0] ?? null;
+  const [url, setUrl] = useState(current?.url ?? '');
+  const [kind, setKind] = useState(current?.kind ?? 'UDP');
+  const [copied, setCopied] = useState(false);
+  useEffect(() => { setUrl(current?.url ?? ''); setKind(current?.kind ?? 'UDP'); }, [current?.url, current?.kind]);
+
+  const upsertMut = useMutation({
+    mutationFn: async () => {
+      if (current) {
+        return api(`/api/sources/${current.id}`, { method: 'PATCH', body: { url, kind } });
+      }
+      return api('/api/sources', { method: 'POST', body: { channelId: ch.id, name: ch.slug, url, kind, isPrimary: true } });
+    },
+    onSuccess: () => { onSaved(); toast.success('Source saved'); },
+    onError: (e) => toast.error(e instanceof Error ? e.message : 'Failed'),
+  });
+
+  async function copy() {
+    if (!url) return;
+    let ok = false;
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(url); ok = true;
+      }
+    } catch { /* fall */ }
+    if (!ok) {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = url; ta.style.position = 'fixed'; ta.style.left = '-1000px';
+        document.body.appendChild(ta); ta.focus(); ta.select();
+        ok = document.execCommand('copy'); document.body.removeChild(ta);
+      } catch { ok = false; }
+    }
+    if (ok) { setCopied(true); setTimeout(() => setCopied(false), 1200); }
+    else    { toast.error('Copy failed — select and Ctrl+C'); }
+  }
+
+  const dirty = url !== (current?.url ?? '') || kind !== (current?.kind ?? 'UDP');
+
+  return (
+    <Card>
+      <CardHeader><CardTitle>Source</CardTitle></CardHeader>
+      <CardContent>
+        <div className="grid grid-cols-1 md:grid-cols-[8rem_1fr_auto] gap-2 items-end">
+          <div>
+            <label className="text-[10px] uppercase tracking-widest text-muted-2">Kind</label>
+            <Select value={kind} onValueChange={setKind}>
+              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectContent>
+                {SOURCE_KINDS.map((k) => <SelectItem key={k} value={k}>{k}</SelectItem>)}
+              </SelectContent>
+            </Select>
+          </div>
+          <div>
+            <label className="text-[10px] uppercase tracking-widest text-muted-2">URL</label>
+            <div className="flex items-center gap-1">
+              <Input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="udp://@239.1.1.10:1111" className="font-mono text-xs" />
+              <button
+                onClick={copy}
+                className={cn(
+                  'shrink-0 rounded p-2 transition',
+                  copied ? 'text-green-500' : 'text-muted-2 hover:text-txt hover:bg-panel2',
+                )}
+                title={copied ? 'Copied' : 'Copy URL'}
+                disabled={!url}
+              >
+                {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
+              </button>
+            </div>
+          </div>
+          <Button
+            size="sm" variant="gradient"
+            onClick={() => upsertMut.mutate()}
+            disabled={!dirty || !url || upsertMut.isPending}
+          >
+            {upsertMut.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin mr-1" /> : <Save className="h-3.5 w-3.5 mr-1" />}
+            Save
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+/* ─────────────────────────────── Recordings / clips of this channel ──── */
+
+function RecordingsPanel({ channelId, channelSlug }: { channelId: string; channelSlug: string }) {
+  const now = new Date();
+  const [from, setFrom] = useState<string>(() => {
+    const d = new Date(now); d.setDate(d.getDate() - 7);
+    return fmtLocalDT(d);
+  });
+  const [to, setTo] = useState<string>(() => fmtLocalDT(now));
+  const [q, setQ] = useState('');
+
+  const { data, isLoading } = useQuery<RecordingSegment[]>({
+    queryKey: ['channel.recordings', channelId, from, to],
+    queryFn: () => {
+      const p = new URLSearchParams();
+      p.set('channelId', channelId);
+      p.set('from', new Date(from).toISOString());
+      p.set('to',   new Date(to).toISOString());
+      p.set('limit', '500');
+      return api<RecordingSegment[]>(`/api/recordings?${p}`);
+    },
+    refetchInterval: 30_000,
+  });
+  const rows = useMemo(() => {
+    const list = data ?? [];
+    if (!q.trim()) return list;
+    const term = q.trim().toLowerCase();
+    return list.filter((r) => r.startedAt.toLowerCase().includes(term) || r.path.toLowerCase().includes(term));
+  }, [data, q]);
+
+  return (
+    <Card>
+      <CardHeader className="flex-row items-center justify-between">
+        <CardTitle className="flex items-center gap-2"><Film className="h-4 w-4 text-brand" /> Recordings</CardTitle>
+        <Link href={`/recordings?channelId=${channelId}`} className="text-xs text-brand hover:underline">All →</Link>
+      </CardHeader>
+      <CardContent>
+        <div className="mb-2 space-y-2">
+          <div className="relative">
+            <Search className="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-muted-2" />
+            <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search…" className="pl-9" />
+          </div>
+          <div className="flex items-center gap-2 text-[11px]">
+            <span className="text-muted-2 uppercase tracking-widest text-[9px]">From</span>
+            <input type="datetime-local" value={from} max={to} onChange={(e) => setFrom(e.target.value)}
+              className="h-8 px-2 flex-1 min-w-0 rounded-md border border-line bg-white font-mono text-xs" />
+            <span className="text-muted-2 uppercase tracking-widest text-[9px]">To</span>
+            <input type="datetime-local" value={to} min={from} onChange={(e) => setTo(e.target.value)}
+              className="h-8 px-2 flex-1 min-w-0 rounded-md border border-line bg-white font-mono text-xs" />
+          </div>
+        </div>
+        <div className="max-h-80 overflow-y-auto scrollbar-thin divide-y divide-line -mx-3">
+          {isLoading && <div className="p-3 text-xs text-muted-2">Loading…</div>}
+          {!isLoading && rows.length === 0 && (
+            <div className="p-4 text-center text-xs text-muted-2">
+              No segments in this window for <span className="font-mono">{channelSlug}</span>.
+            </div>
+          )}
+          {rows.map((r) => {
+            const start = new Date(r.startedAt).toISOString();
+            const end   = new Date(new Date(r.startedAt).getTime() + r.durationMs).toISOString();
+            return (
+              <Link
+                key={r.id}
+                href={`/clips/new?channelId=${channelId}&sessionStart=${encodeURIComponent(start)}&sessionEnd=${encodeURIComponent(end)}`}
+                className="block px-3 py-2 hover:bg-panel2 transition-colors text-xs"
+                title="Open in Clip Editor"
+              >
+                <div className="flex items-center justify-between">
+                  <div className="flex-1 min-w-0">
+                    <div className="font-medium">{new Date(r.startedAt).toLocaleString()}</div>
+                    <div className="text-[10px] text-muted-2 font-mono truncate">{r.path.split(/[\\/]/).slice(-1)[0]}</div>
+                  </div>
+                  <div className="text-right shrink-0 ml-3">
+                    <div className="text-muted">{fmtBytes(r.sizeBytes)}</div>
+                    <div className="text-[10px] text-muted-2">{Math.round(r.durationMs / 1000)}s</div>
+                  </div>
+                </div>
+              </Link>
+            );
+          })}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function ClipsPanel({ channelId }: { channelId: string }) {
+  const now = new Date();
+  const [from, setFrom] = useState<string>(() => {
+    const d = new Date(now); d.setDate(d.getDate() - 30);
+    return fmtLocalDT(d);
+  });
+  const [to, setTo] = useState<string>(() => fmtLocalDT(now));
+  const [q, setQ] = useState('');
+  const { data, isLoading } = useQuery<Clip[]>({
+    queryKey: ['channel.clips', channelId, from, to],
+    queryFn: () => {
+      const p = new URLSearchParams();
+      p.set('channelId', channelId);
+      p.set('from', new Date(from).toISOString());
+      p.set('to',   new Date(to).toISOString());
+      p.set('limit', '500');
+      return api<Clip[]>(`/api/clips?${p}`);
+    },
+    refetchInterval: 30_000,
+  });
+  const rows = useMemo(() => {
+    const list = data ?? [];
+    if (!q.trim()) return list;
+    const term = q.trim().toLowerCase();
+    return list.filter((c) =>
+      c.title.toLowerCase().includes(term) ||
+      c.startAt.toLowerCase().includes(term) ||
+      c.status.toLowerCase().includes(term),
+    );
+  }, [data, q]);
+
+  return (
+    <Card>
+      <CardHeader className="flex-row items-center justify-between">
+        <CardTitle className="flex items-center gap-2"><Scissors className="h-4 w-4 text-brand" /> Clips</CardTitle>
+        <Link href={`/clips?channelId=${channelId}`} className="text-xs text-brand hover:underline">All →</Link>
+      </CardHeader>
+      <CardContent>
+        <div className="mb-2 space-y-2">
+          <div className="relative">
+            <Search className="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-muted-2" />
+            <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search…" className="pl-9" />
+          </div>
+          <div className="flex items-center gap-2 text-[11px]">
+            <span className="text-muted-2 uppercase tracking-widest text-[9px]">From</span>
+            <input type="datetime-local" value={from} max={to} onChange={(e) => setFrom(e.target.value)}
+              className="h-8 px-2 flex-1 min-w-0 rounded-md border border-line bg-white font-mono text-xs" />
+            <span className="text-muted-2 uppercase tracking-widest text-[9px]">To</span>
+            <input type="datetime-local" value={to} min={from} onChange={(e) => setTo(e.target.value)}
+              className="h-8 px-2 flex-1 min-w-0 rounded-md border border-line bg-white font-mono text-xs" />
+          </div>
+        </div>
+        <div className="max-h-80 overflow-y-auto scrollbar-thin divide-y divide-line -mx-3">
+          {isLoading && <div className="p-3 text-xs text-muted-2">Loading…</div>}
+          {!isLoading && rows.length === 0 && (
+            <div className="p-4 text-center text-xs text-muted-2">No clips yet.</div>
+          )}
+          {rows.map((c) => (
+            <Link key={c.id} href={`/clips/${c.id}`} className="block px-3 py-2 hover:bg-panel2 text-xs">
+              <div className="flex items-center justify-between">
+                <div className="font-medium truncate">{c.title}</div>
+                <Badge variant="outline" className="text-[9px] px-1 py-0">{c.status}</Badge>
+              </div>
+              <div className="text-[10px] text-muted-2 mt-0.5">
+                {new Date(c.startAt).toLocaleString()} · {c.resolution} · {c.format}{c.sizeBytes ? ` · ${fmtBytes(c.sizeBytes)}` : ''}
+              </div>
+            </Link>
+          ))}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+// Kept references so lint doesn't drop unused imports:
+void AuthImg;
+void Circle; void CircleDot;
+
+/** ISO-ish local datetime "YYYY-MM-DDTHH:mm" — the shape a
+ *  `<input type="datetime-local">` control both emits and accepts. */
+function fmtLocalDT(d: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }

@@ -23,15 +23,17 @@ import wsPlugin from './plugins/ws.js';
 
 import authRoutes from './routes/auth.js';
 import channelsRoutes from './routes/channels.js';
+import framesRoutes from './routes/frames.js';
 import sourcesRoutes from './routes/sources.js';
 import recordingsRoutes from './routes/recordings.js';
 import clipsRoutes from './routes/clips.js';
 import usersRoutes from './routes/users.js';
 import auditRoutes from './routes/audit.js';
-import settingsRoutes from './routes/settings.js';
-import legalHoldsRoutes from './routes/legalHolds.js';
 import dashboardRoutes from './routes/dashboard.js';
-import downloadsRoutes from './routes/downloads.js';
+// Removed in Phase 3.1.5 — CMC has no user-facing settings (change-
+// password lives under /api/auth), no legal-holds workflow, no
+// desktop-viewer downloads. Files kept in the repo for now in case a
+// future fork needs them.
 
 async function main() {
   const app = Fastify({
@@ -77,14 +79,12 @@ async function main() {
   await app.register(authRoutes,        { prefix: '/api/auth' });
   await app.register(dashboardRoutes,   { prefix: '/api/dashboard' });
   await app.register(channelsRoutes,    { prefix: '/api/channels' });
+  await app.register(framesRoutes,      { prefix: '/api/frames' });
   await app.register(sourcesRoutes,     { prefix: '/api/sources' });
   await app.register(recordingsRoutes,  { prefix: '/api/recordings' });
   await app.register(clipsRoutes,       { prefix: '/api/clips' });
   await app.register(usersRoutes,       { prefix: '/api/users' });
   await app.register(auditRoutes,       { prefix: '/api/audit' });
-  await app.register(settingsRoutes,    { prefix: '/api/settings' });
-  await app.register(legalHoldsRoutes,  { prefix: '/api/legal-holds' });
-  await app.register(downloadsRoutes,   { prefix: '/api/downloads' });
 
   // Live HLS static-file serving.
   // services/live-hls writes per-channel `<HLS_DIR>/<slug>/live.m3u8` +

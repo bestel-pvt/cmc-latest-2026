@@ -25,6 +25,67 @@ const routes: FastifyPluginAsync = async (app) => {
   });
 
   /**
+   * GET /api/recordings/status — live per-channel recording status.
+   *
+   * Recording flag alone isn't enough: recordingEnabled=true could
+   * mean the ffmpeg died silently. So for every recording-enabled
+   * channel we walk today's dir on disk and check the mtime of the
+   * newest .mp4. Fresh (<90 s) = actively writing. 90 s-5 min = idle
+   * (segment IO paused, source hiccup). >5 min = stalled/failed.
+   *
+   * This is O(active-channels), typically 30 stats. ~10 ms total.
+   */
+  app.get('/status', async () => {
+    const { existsSync, statSync, readdirSync } = await import('node:fs');
+    const path = await import('node:path');
+    const RECORDINGS_DIR = path.resolve(process.env.RECORDINGS_DIR ?? './data/recordings');
+
+    const channels = await app.prisma.channel.findMany({
+      where: { recordingEnabled: true, active: true },
+      select: { id: true, name: true, slug: true },
+    });
+
+    const now = Date.now();
+    const results = channels.map((c) => {
+      const chDir = path.join(RECORDINGS_DIR, c.id);
+      if (!existsSync(chDir)) {
+        return { ...c, status: 'not-started' as const, sizeBytes: 0, lastWriteAt: null, ageSec: null };
+      }
+      // Find the newest .mp4 anywhere in the channel dir (year/month/day/hour).
+      let newest: { path: string; mtime: number; size: number } | null = null;
+      function walk(dir: string) {
+        let entries: import('node:fs').Dirent[] = [];
+        try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+        for (const e of entries) {
+          const full = path.join(dir, e.name);
+          if (e.isDirectory()) walk(full);
+          else if (e.isFile() && e.name.endsWith('.mp4')) {
+            const st = statSync(full);
+            if (!newest || st.mtimeMs > newest.mtime) newest = { path: full, mtime: st.mtimeMs, size: st.size };
+          }
+        }
+      }
+      walk(chDir);
+      if (!newest) {
+        return { ...c, status: 'not-started' as const, sizeBytes: 0, lastWriteAt: null, ageSec: null };
+      }
+      const ageSec = Math.round((now - (newest as { mtime: number }).mtime) / 1000);
+      const status: 'recording' | 'idle' | 'failed' | 'not-started' =
+        ageSec < 90    ? 'recording' :
+        ageSec < 300   ? 'idle'      :
+                         'failed';
+      return {
+        ...c, status,
+        sizeBytes: (newest as { size: number }).size,
+        lastWriteAt: new Date((newest as { mtime: number }).mtime).toISOString(),
+        ageSec,
+      };
+    });
+
+    return results;
+  });
+
+  /**
    * Group contiguous 60 s segments into logical "sessions" (one row per
    * recording that the operator started/stopped, not one per segment).
    * A gap ≥ 3 minutes ends a session. Response shape suits the

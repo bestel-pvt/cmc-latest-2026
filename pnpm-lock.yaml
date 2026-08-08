@@ -166,7 +166,7 @@ importers:
         specifier: ^4.1.0
         version: 4.4.0
       hls.js:
-        specifier: ^1.5.17
+        specifier: ^1.6.16
         version: 1.6.16
       jose:
         specifier: ^5.9.6
@@ -264,62 +264,6 @@ importers:
       '@types/node':
         specifier: ^22.10.2
         version: 22.20.1
-      typescript:
-        specifier: ^5.6.3
-        version: 5.9.3
-
-  services/ai-scheduler:
-    dependencies:
-      '@demp/db':
-        specifier: workspace:*
-        version: link:../../packages/db
-      ioredis:
-        specifier: ^5.4.1
-        version: 5.11.1
-      pino:
-        specifier: ^9.5.0
-        version: 9.14.0
-      pino-pretty:
-        specifier: ^11.3.0
-        version: 11.3.0
-    devDependencies:
-      '@types/node':
-        specifier: ^22.10.2
-        version: 22.20.1
-      tsx:
-        specifier: ^4.19.2
-        version: 4.23.1
-      typescript:
-        specifier: ^5.6.3
-        version: 5.9.3
-
-  services/failover-controller:
-    dependencies:
-      '@demp/db':
-        specifier: workspace:*
-        version: link:../../packages/db
-      '@demp/shared':
-        specifier: workspace:*
-        version: link:../../packages/shared
-      ioredis:
-        specifier: ^5.4.1
-        version: 5.11.1
-      pino:
-        specifier: ^9.5.0
-        version: 9.14.0
-      pino-pretty:
-        specifier: ^11.3.0
-        version: 11.3.0
-      undici:
-        specifier: ^7.1.0
-        version: 7.29.0
-    devDependencies:
-      '@types/node':
-        specifier: ^22.10.2
-        version: 22.20.1
-      tsx:
-        specifier: ^4.19.2
-        version: 4.23.1
       typescript:
         specifier: ^5.6.3
         version: 5.9.3

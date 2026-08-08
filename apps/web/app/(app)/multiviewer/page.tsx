@@ -24,6 +24,7 @@ import { Input } from '@/components/ui/input';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { cn } from '@/lib/utils';
+import { toast } from 'sonner';
 
 /* ------------------------------------------------------------------ */
 /* Layouts                                                            */
@@ -144,6 +145,11 @@ export default function MultiviewerPage() {
    * different tile's volume icon switches audio to that tile and
    * mutes the previous. */
   const [audioSlotIdx, setAudioSlotIdx] = useState<number | null>(null);
+  /** Snapshot of layout+assignments taken when the operator double-clicks
+   * a tile to solo it. `null` = not in solo mode. Esc restores from this. */
+  const [soloRestore, setSoloRestore] = useState<
+    { layoutId: Layout['id']; assignments: Record<string, string>; audioSlotIdx: number | null } | null
+  >(null);
   const wallRef = useRef<HTMLDivElement | null>(null);
 
   const layout = useMemo(
@@ -216,27 +222,101 @@ export default function MultiviewerPage() {
     else document.exitFullscreen().catch(() => {});
   }, []);
 
+  /** Double-click a tile → solo that channel using the single-layout.
+   *  Saves current layout+assignments+audio so Esc can restore. */
+  const enterSolo = useCallback((slug: string) => {
+    setSoloRestore((prev) => prev ?? {
+      layoutId,
+      assignments: { ...assignments },
+      audioSlotIdx,
+    });
+    setLayoutId('single');
+    setAssignments({ '0': slug });
+    // Solo audio ON by default — operator dove into this channel to
+    // listen to it. If they had another channel's audio on, that's
+    // preserved in the restore snapshot.
+    setAudioSlotIdx(0);
+  }, [layoutId, assignments, audioSlotIdx]);
+
+  /** Restore the pre-solo layout snapshot. */
+  const exitSolo = useCallback(() => {
+    setSoloRestore((snap) => {
+      if (!snap) return null;
+      setLayoutId(snap.layoutId);
+      setAssignments(snap.assignments);
+      setAudioSlotIdx(snap.audioSlotIdx);
+      return null;
+    });
+  }, []);
+
+  /** Esc while soloing → exit solo. `s` in solo OR single-layout →
+   *  POST /api/channels/:id/snapshot to grab a still frame. */
+  useEffect(() => {
+    const inSolo = !!soloRestore;
+    const inSingle = layout.id === 'single';
+    if (!inSolo && !inSingle) return;
+    const onKey = (e: KeyboardEvent) => {
+      // Ignore key events from form fields
+      const tag = (e.target as HTMLElement | null)?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement)?.isContentEditable) return;
+      if (e.key === 'Escape' && inSolo) { exitSolo(); return; }
+      if (e.key === 's' || e.key === 'S') {
+        const slug = assignments['0'];
+        if (!slug) return;
+        const c = channelBySlug.get(slug);
+        if (!c) return;
+        // Fire and forget — the recording server captures locally, no
+        // wait needed. Toast shows completion / failure.
+        (async () => {
+          try {
+            // Empty {} body forces the api() helper to send a
+            // Content-Type header. Fastify rejects body-less POSTs
+            // with 415 by default; the empty object satisfies that.
+            await api(`/api/channels/${c.id}/snapshot`, { method: 'POST', body: {} });
+            toast.success(`Frame saved: ${c.name}`);
+          } catch (err) {
+            toast.error(err instanceof Error ? err.message : 'Snapshot failed');
+          }
+        })();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [soloRestore, exitSolo, layout.id, assignments, channelBySlug]);
+
   return (
     <div className="flex flex-col h-[calc(100vh-4rem)]">
       {/* Top bar */}
       <div className="flex flex-wrap items-center gap-2 px-4 py-3 border-b border-line bg-white/60">
-        <div className="text-sm text-muted">Layout:</div>
-        <div className="flex gap-1">
-          {LAYOUTS.map((l) => (
-            <button
-              key={l.id}
-              onClick={() => setLayoutId(l.id)}
-              className={cn(
-                'px-2.5 py-1 text-xs rounded-md ring-1 transition',
-                layoutId === l.id
-                  ? 'bg-primary text-white ring-primary'
-                  : 'bg-panel2 text-txt ring-line hover:bg-panel2/80',
-              )}
-            >
-              {l.label}
-            </button>
-          ))}
-        </div>
+        {soloRestore ? (
+          <button
+            onClick={exitSolo}
+            className="px-3 py-1 text-xs rounded-md ring-1 ring-primary bg-primary text-white hover:opacity-90 transition"
+            title="Restore your previous layout (Esc)"
+          >
+            ← Back to layout (Esc)
+          </button>
+        ) : (
+          <>
+            <div className="text-sm text-muted">Layout:</div>
+            <div className="flex gap-1">
+              {LAYOUTS.map((l) => (
+                <button
+                  key={l.id}
+                  onClick={() => setLayoutId(l.id)}
+                  className={cn(
+                    'px-2.5 py-1 text-xs rounded-md ring-1 transition',
+                    layoutId === l.id
+                      ? 'bg-primary text-white ring-primary'
+                      : 'bg-panel2 text-txt ring-line hover:bg-panel2/80',
+                  )}
+                >
+                  {l.label}
+                </button>
+              ))}
+            </div>
+          </>
+        )}
 
         <div className="mx-2 h-5 border-l border-line" />
 
@@ -322,6 +402,7 @@ export default function MultiviewerPage() {
                   onToggleAudio={() => toggleAudio(idx)}
                   onClear={() => assignSlot(idx, null)}
                   onPick={() => setPickerSlotIdx(idx)}
+                  onDoubleClick={slug ? () => enterSolo(slug) : undefined}
                   className="w-full h-full"
                 />
               </div>

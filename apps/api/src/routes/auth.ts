@@ -54,6 +54,29 @@ const authRoutes: FastifyPluginAsync = async (app) => {
     // Stateless JWT — client should drop tokens. Session revocation TBD (Phase 2).
     return { ok: true };
   });
+
+  /** POST /api/auth/change-password — self-service password change for
+   *  the currently signed-in user. Requires the current password to
+   *  guard against session hijack. */
+  app.post('/change-password', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const body = (req.body ?? {}) as { currentPassword?: string; newPassword?: string };
+    if (!body.currentPassword || !body.newPassword) return reply.badRequest('currentPassword and newPassword required');
+    if (body.newPassword.length < 8) return reply.badRequest('new password must be at least 8 characters');
+
+    const user = await app.prisma.user.findUnique({ where: { id: req.user.id } });
+    if (!user) return reply.unauthorized();
+
+    const ok = await bcrypt.compare(body.currentPassword, user.passwordHash);
+    if (!ok) {
+      await app.audit(req, 'auth.change-password.failed', { entityType: 'User', entityId: user.id, meta: { reason: 'bad-current' } });
+      return reply.unauthorized('Current password is incorrect');
+    }
+
+    const passwordHash = await bcrypt.hash(body.newPassword, 10);
+    await app.prisma.user.update({ where: { id: user.id }, data: { passwordHash } });
+    await app.audit(req, 'auth.change-password', { entityType: 'User', entityId: user.id });
+    return { ok: true };
+  });
 };
 
 export default authRoutes;

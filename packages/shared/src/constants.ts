@@ -54,33 +54,46 @@ export const OCR_LANGUAGES = [
  * Persisted on User.permissions as a list of "feature:action" strings, e.g.
  *   ["channels:write", "tickers:read", "gpt:read"]
  */
+// Only pages/features that actually exist in the CMC build today.
+// DEMP had AI, ticker/flasher OCR, alerts, legal-holds, DEMP-GPT — all
+// stripped from this fork. If we add a feature back, add its key here
+// and the Add-User dialog + defaultPermissionsForRole pick it up.
 export const PERMISSION_FEATURES = [
-  { key: 'channels',    label: 'Channels' },
-  { key: 'multiviewer', label: 'Multiviewer' },
-  { key: 'recordings',  label: 'Recordings' },
-  { key: 'clips',       label: 'Clips' },
-  { key: 'tickers',     label: 'Tickers' },
-  { key: 'flashers',    label: 'Flashers' },
-  { key: 'transcripts', label: 'Transcripts' },
-  { key: 'alerts',      label: 'Alerts' },
-  { key: 'gpt',         label: 'DEMP GPT' },
-  { key: 'ai-health',   label: 'AI Health' },
-  { key: 'users',       label: 'Users' },
-  { key: 'audit',       label: 'Audit Log' },
-  { key: 'legal-holds', label: 'Legal Holds' },
-  { key: 'settings',    label: 'Settings' },
+  { key: 'dashboard',    label: 'Dashboard' },
+  { key: 'multiviewer',  label: 'Video Wall' },
+  { key: 'channels',     label: 'Channels' },
+  { key: 'recordings',   label: 'Recordings' },
+  { key: 'clips',        label: 'Clips' },
+  { key: 'frames',       label: 'Frames' },
+  { key: 'users',        label: 'Users (Admin)' },
+  { key: 'audit',        label: 'Audit Log (Admin)' },
 ] as const;
 
 export const PERMISSION_ACTIONS = [
   { key: 'read',  label: 'View' },
   { key: 'write', label: 'Modify' },
-  { key: 'admin', label: 'Admin' },
 ] as const;
 
+/** Preset permission sets for the 3 built-in roles. Custom roleName +
+ *  permissions array override this in the Add-User dialog. */
 export function defaultPermissionsForRole(role: 'ADMIN' | 'OPERATOR' | 'ANALYST' | 'VIEWER'): string[] {
-  const all = PERMISSION_FEATURES.map((f) => f.key);
-  if (role === 'ADMIN')    return all.flatMap((f) => [`${f}:read`, `${f}:write`, `${f}:admin`]);
-  if (role === 'OPERATOR') return all.flatMap((f) => [`${f}:read`, `${f}:write`]).filter((p) => !p.startsWith('users:') && !p.startsWith('audit:') && !p.startsWith('settings:'));
-  if (role === 'ANALYST')  return ['channels','multiviewer','recordings','clips','tickers','flashers','transcripts','alerts','gpt','ai-health'].flatMap((f) => [`${f}:read`]).concat(['clips:write','gpt:write','alerts:write']);
-  return ['channels:read','multiviewer:read','recordings:read','clips:read','tickers:read','flashers:read','transcripts:read','alerts:read','gpt:read'];
+  const NON_ADMIN = ['dashboard','multiviewer','channels','recordings','clips','frames'];
+  const ADMIN_ONLY = ['users','audit'];
+  if (role === 'ADMIN') {
+    // full read+write on every feature
+    return [...NON_ADMIN, ...ADMIN_ONLY].flatMap((f) => [`${f}:read`, `${f}:write`]);
+  }
+  if (role === 'OPERATOR') {
+    // read+write on operational surfaces, no admin pages
+    return NON_ADMIN.flatMap((f) => [`${f}:read`, `${f}:write`]);
+  }
+  if (role === 'ANALYST') {
+    // read everything operational + can edit clips + frames only
+    return [
+      ...NON_ADMIN.map((f) => `${f}:read`),
+      'clips:write', 'frames:write',
+    ];
+  }
+  // VIEWER — read-only operational
+  return NON_ADMIN.map((f) => `${f}:read`);
 }

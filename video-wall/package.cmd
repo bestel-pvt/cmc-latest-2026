@@ -54,6 +54,13 @@ for %%D in (
     gstmpegts-1.0-0.dll
     gstgl-1.0-0.dll
     gstglproto-1.0-0.dll
+    gstd3d11-1.0-0.dll
+    gstd3dshader-1.0-0.dll
+    gstcodecs-1.0-0.dll
+    gstdxva-1.0-0.dll
+    epoxy-0.dll
+    jpeg8.dll
+    png16.dll
     glib-2.0-0.dll
     gobject-2.0-0.dll
     gio-2.0-0.dll
@@ -116,6 +123,10 @@ for %%P in (
     gstaudioconvert.dll
     gstaudioresample.dll
     gstaudioparsers.dll
+    gstwasapi.dll
+    gstwasapi2.dll
+    gstdirectsound.dll
+    gstvolume.dll
 ) do (
     if exist "%GST%\lib\gstreamer-1.0\%%P" (
         copy /y "%GST%\lib\gstreamer-1.0\%%P" "%STAGE%\gst-plugins\" >nul
@@ -146,16 +157,16 @@ for %%R in (
     )
 )
 
-echo === Copying Mesa OpenGL fallback ===
-REM opengl32.dll MUST live next to the exe — Windows treats
-REM opengl32 as a KnownDLL and would otherwise load the System32
-REM copy (which on Basic Display Adapter hosts fails egui_glow's
-REM OpenGL 2.0+ check and silently exits the exe). Putting it in
-REM a bin/ subdir doesn't work; app-directory is the only override.
-if exist "%MESA%\opengl32.dll" (
-    copy /y "%MESA%\opengl32.dll" "%STAGE%\opengl32.dll" >nul
-    copy /y "%MESA%\libgallium_wgl.dll" "%STAGE%\libgallium_wgl.dll" >nul
-)
+echo === Skipping Mesa OpenGL (real-GPU hosts must use system opengl32) ===
+REM DO NOT bundle Mesa's opengl32.dll. If it sits next to the exe,
+REM Windows loads it BEFORE the GPU driver's opengl32 from
+REM System32. Mesa then tries to init against the real display and
+REM crashes gstopengl.dll's plugin_init — cascading into
+REM gstd3d11.dll also getting blacklisted. Result on operator PCs:
+REM no HW decode / render, everything falls to software D3D9.
+REM
+REM With no bundled opengl32.dll: PCs with a real GPU load the
+REM system OpenGL cleanly, plugins register cleanly.
 
 echo === Writing README ===
 > "%STAGE%\README.txt" echo CMC Video Wall - PAK NAVY

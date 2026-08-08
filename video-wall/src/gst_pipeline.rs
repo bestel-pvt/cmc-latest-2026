@@ -76,12 +76,15 @@ pub fn udp_ts_d3d11(src: &UdpSource) -> String {
         .as_ref()
         .map(|a| format!(" multicast-iface={a}"))
         .unwrap_or_default();
+    // Minimal HW pipeline. `decodebin` auto-picks d3d11h264dec /
+    // d3d11h265dec / d3d11mpeg2dec by rank, so H.264 and H.265 (ARY /
+    // 365 News) both HW-decode with the same pipeline string.
     format!(
         "udpsrc address={addr} port={port}{bind} caps=\"video/mpegts,systemstream=(boolean)true\" \
-             buffer-size=2097152 \
+             buffer-size=8388608 \
+         ! queue max-size-time=1000000000 leaky=downstream \
          ! tsdemux \
-         ! h264parse config-interval=-1 \
-         ! d3d11h264dec \
+         ! decodebin \
          ! d3d11convert \
          ! d3d11videosink name=vsink sync=false",
         addr = src.address,

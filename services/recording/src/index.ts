@@ -104,6 +104,41 @@ const RECORDING_TRANSCODE_SLUGS = new Set(
     .split(',').map((s) => s.trim()).filter(Boolean),
 );
 
+/** Probe primary video codec of a UDP MPEG-TS source (~3 s, once at
+ *  supervisor start). Returns "h264" / "hevc" / "mpeg2video" / etc.
+ *  or null on failure. Needed so recordings from non-H.264 channels
+ *  (e.g. MPEG-2 ARY / SD feeds) get transcoded to H.264 — otherwise
+ *  the .mp4 has an audio-only playable track in Chrome/Edge/hls.js. */
+function probeVideoCodec(sourceUrl: string, kind: string): string | null {
+  let input = sourceUrl.trim();
+  if (kind === 'UDP' || kind === 'RTP') {
+    if (input.includes('://') && !input.split('://', 2)[1]!.startsWith('@')) {
+      const [proto, rest] = input.split('://', 2);
+      input = `${proto!.toLowerCase()}://@${rest}`;
+    }
+    const localaddr = process.env.RECORDING_LOCALADDR ?? process.env.LOCALADDR ?? '';
+    const parts: string[] = ['fifo_size=10000000', 'overrun_nonfatal=1', 'reuse=1'];
+    if (localaddr) parts.push(`localaddr=${localaddr}`);
+    input = `${input}${input.includes('?') ? '&' : '?'}${parts.join('&')}`;
+  }
+  const args = [
+    '-hide_banner', '-nostdin', '-loglevel', 'info',
+    '-analyzeduration', '3000000', '-probesize', '3000000',
+    '-t', '2',
+    '-f', 'mpegts',
+    '-i', input,
+    '-f', 'null', '-',
+  ];
+  const res = spawnSync('ffmpeg', args, { encoding: 'utf8', timeout: 8000 });
+  const stderr = res.stderr ?? '';
+  const m = stderr.match(/Stream #\d+:\d+[^\n]*Video:\s*([a-z0-9_]+)/i);
+  return m ? m[1]!.toLowerCase() : null;
+}
+
+// Persistent per-channel codec cache — avoid re-probing on every
+// supervisor restart. Populated on first spawn per channel.
+const channelCodec = new Map<string, string | null>();
+
 function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: string): FF {
   mkdirSync(outDir, { recursive: true });
   const outPattern = join(outDir, '%M.mp4');
@@ -150,29 +185,64 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
     }
   }
 
-  const transcodeThisSlug = RECORDING_TRANSCODE_SLUGS.has(slug);
-  const videoArgs = transcodeThisSlug
-    ? [
-        // Slow-keyframe / interlaced sources — libx264 ultrafast with a
-        // forced keyframe at every segment boundary so each 60 s .mp4
-        // is a self-contained playable file.
-        '-vf', 'yadif=0:-1:0',
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
-        '-profile:v', 'main', '-pix_fmt', 'yuv420p',
-        '-b:v', '2000k', '-maxrate', '2500k', '-bufsize', '4000k',
-        '-force_key_frames', `expr:gte(t,n_forced*${SEG_SECONDS})`,
-      ]
-    : ['-c:v', 'copy'];
+  // Decide transcode:
+  //   1. Slug in RECORDING_TRANSCODE_SLUGS (slow-KF sources) → always transcode
+  //   2. Source codec is not H.264 (probed once) → transcode
+  //      (otherwise browser + hls.js can't play the recording — audio only)
+  //   3. Otherwise `-c copy` (cheapest)
+  const slugForced = RECORDING_TRANSCODE_SLUGS.has(slug);
+  if (!slugForced && !channelCodec.has(slug)) {
+    log.info({ slug }, 'probing source codec (once)');
+    const codec = probeVideoCodec(sourceUrl, kind);
+    channelCodec.set(slug, codec);
+    log.info({ slug, codec }, 'source codec detected');
+  }
+  // Every channel is transcoded to stay under the 5 MB / minute file
+  // size budget. -c copy previously passed through native source bitrates
+  // (3-5 Mbps → 20-40 MB/min segments) which busted the archive budget.
+  //
+  // Math for the ceiling: 5 MB × 8 bits/byte ÷ 60 s = ~667 kbps total.
+  // We target 500 kbps video + 64 kbps audio + ~30 kbps mux overhead
+  // = ~594 kbps × 60 s ÷ 8 ÷ 1024 = ~4.35 MB per minute (safe margin).
+  // Actual size stays under 5 MB even during high-motion scenes because
+  // maxrate=700k + bufsize=1400k clamps the instantaneous bitrate.
+  //
+  // 640×360 (nHD 16:9) at 500 kbps gives passable archive quality —
+  // faces + tickers readable at native playback size.
+  // veryfast preset — CABAC + subpel motion enabled so text stays
+  // sharp at the low bitrate. -threads 2 caps per-encoder parallelism
+  // so 30 concurrent encoders do not fight for cores on the 56-core box.
+  //
+  // slugForced / cachedCodec were used by the old copy-vs-transcode
+  // gate. Kept the map warm so codec-probe (which runs at spawn time
+  // for future switching) still runs — but we always transcode now.
+  void slugForced;
+  void (channelCodec.get(slug));
+  const videoArgs = [
+    '-vf', 'yadif=0:-1:0,scale=640:360:force_original_aspect_ratio=decrease:flags=lanczos,pad=640:360:(ow-iw)/2:(oh-ih)/2',
+    '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency',
+    '-profile:v', 'main', '-pix_fmt', 'yuv420p',
+    '-threads', '2',
+    '-b:v', '500k', '-maxrate', '700k', '-bufsize', '1400k',
+    '-force_key_frames', `expr:gte(t,n_forced*${SEG_SECONDS})`,
+  ];
 
   const args = [
     '-hide_banner', '-loglevel', 'warning', '-nostdin',
     '-fflags', '+genpts+discardcorrupt',
     '-err_detect', 'ignore_err',
+    // Bigger input queue absorbs source hiccups (IGMP renegotiation,
+    // NIC-driver interrupt storm) without dropping segments.
+    '-thread_queue_size', '1024',
     ...(kind === 'UDP' || kind === 'RTP' ? ['-f', 'mpegts'] : []),
     '-i', input,
     '-map', '0:v:0', '-map', '0:a?', '-dn', '-sn',
     ...videoArgs,
-    '-c:a', 'aac', '-b:a', '128k', '-ac', '2', '-ar', '48000',
+    // AAC 64k stereo — half the previous 128k rate. Still clean
+    // speech + music at 64k for archive playback and keeps us inside
+    // the 5 MB/min ceiling (500 kbps video + 64 kbps audio + overhead
+    // ≈ 4.35 MB/min).
+    '-c:a', 'aac', '-b:a', '64k', '-ac', '2', '-ar', '48000',
     '-f', 'segment',
     '-segment_time', String(SEG_SECONDS),
     '-segment_format', 'mp4',
@@ -267,9 +337,14 @@ async function ingestClosedSegments(sup: Supervisor) {
 
     try {
       const hash = await sha256(full);
+      // ffmpeg's `-strftime 1` uses LOCAL time on Windows even though
+      // our filename template ends in `Z`. Was: parse as UTC which
+      // shifted every startedAt by the server's UTC offset (PKT = +5 h)
+      // and made "last 10 minutes" filters miss all fresh recordings.
+      // Now: parse the digits as local time to match what ffmpeg wrote.
       const m = f.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z\.mp4$/);
       const startedAt = m
-        ? new Date(Date.UTC(+m[1]!, +m[2]! - 1, +m[3]!, +m[4]!, +m[5]!, +m[6]!))
+        ? new Date(+m[1]!, +m[2]! - 1, +m[3]!, +m[4]!, +m[5]!, +m[6]!)
         : new Date(st.mtimeMs - SEG_SECONDS * 1000);
       const durationMs = SEG_SECONDS * 1000;
 
@@ -638,11 +713,29 @@ async function main() {
     }
   });
 
-  await refreshSupervisors();
-  // 5 s so operator toggles on the channels page take effect within
-  // one refresh cycle (was 15 s — felt laggy after clicking "Start
-  // recording"). Cheap: just a Postgres SELECT on the channels table.
-  setInterval(refreshSupervisors, 5_000);
+  // Heartbeat + self-heal: track the last successful refresh tick and
+  // force-exit the process if it hasn't advanced in 5 min. Prevents
+  // the zombie state we hit (process alive but event loop wedged on
+  // a hung Prisma query — uncaughtException guard kept the process up
+  // but supervisors stopped spawning, all 30 recordings silently
+  // stalled for 13 h). Scheduled task respawns cleanly on exit.
+  let lastTick = Date.now();
+  await refreshSupervisors(); lastTick = Date.now();
+  setInterval(async () => {
+    try {
+      await refreshSupervisors();
+      lastTick = Date.now();
+    } catch (err) {
+      log.error({ err }, 'refreshSupervisors threw — will retry next tick');
+    }
+  }, 5_000);
+  setInterval(() => {
+    const stale = Date.now() - lastTick;
+    if (stale > 300_000) {
+      log.error({ staleMs: stale }, 'refreshSupervisors loop wedged >5 min — force-exiting so watchdog can respawn');
+      process.exit(1);
+    }
+  }, 30_000);
 
   // Periodically walk EVERY hour dir under EVERY channel and ingest any
   // .mp4 that isn't marked .recorded.
@@ -701,3 +794,14 @@ main().catch((err) => { log.error(err); process.exit(1); });
 
 process.on('SIGINT',  () => { for (const s of supervisors.values()) s.proc?.kill('SIGINT');  process.exit(0); });
 process.on('SIGTERM', () => { for (const s of supervisors.values()) s.proc?.kill('SIGTERM'); process.exit(0); });
+
+// LAST-LINE-OF-DEFENCE. A Prisma error thrown from a timer callback
+// or a setInterval-invoked scan can otherwise kill the whole recording
+// process and stop ALL 30 channels from recording (this happened at
+// ~50 min of stalled recordings). We'd rather log and keep going.
+process.on('uncaughtException', (err) => {
+  log.error({ err }, 'uncaughtException — keeping process alive');
+});
+process.on('unhandledRejection', (reason) => {
+  log.error({ reason }, 'unhandledRejection — keeping process alive');
+});

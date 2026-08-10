@@ -99,11 +99,14 @@ function RecordingsInner() {
     return m;
   }, [channels]);
 
-  // Live per-channel recording status — poll every 5 s.
+  // Live per-channel recording status — poll every 15 s. 5 s hammered
+  // the API on top of 30-tile wall polls + /sessions poll and made the
+  // page feel sluggish. 15 s is still fast enough that the operator sees
+  // a channel drop within one blink of the "In progress" card.
   const { data: liveStatus } = useQuery<LiveStatus[]>({
     queryKey: ['recordings.status'],
     queryFn: () => api<LiveStatus[]>('/api/recordings/status'),
-    refetchInterval: 5_000,
+    refetchInterval: 15_000,
   });
 
   const { data: sessions, isLoading } = useQuery<Session[]>({

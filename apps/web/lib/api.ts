@@ -9,6 +9,13 @@ function getToken(): string | null {
   return localStorage.getItem('demp.accessToken');
 }
 
+// One-shot redirect guard. Without this, every failing poll after a token
+// expires fires window.location.href = '/login' and the browser thrashes
+// between navigations — the operator sees the page "refresh" every second.
+// We flip this once, redirect once, and swallow subsequent 401s until the
+// login page mounts and clears the flag.
+let redirectingToLogin = false;
+
 export async function api<T = unknown>(path: string, opts: Opts = {}): Promise<T> {
   const token = getToken();
   const headers: HeadersInit = {
@@ -26,12 +33,14 @@ export async function api<T = unknown>(path: string, opts: Opts = {}): Promise<T
     let msg = `HTTP ${res.status}`;
     try {
       const j = await res.json();
-      // Prefer human `message` over machine `error` code.
       msg = (j?.message ?? j?.error ?? msg) as string;
     } catch { /* keep default */ }
-    if (res.status === 401 && typeof window !== 'undefined') {
-      localStorage.removeItem('demp.accessToken');
-      if (!path.startsWith('/api/auth/')) window.location.href = '/login';
+    if (res.status === 401 && typeof window !== 'undefined' && !path.startsWith('/api/auth/')) {
+      if (!redirectingToLogin && window.location.pathname !== '/login') {
+        redirectingToLogin = true;
+        localStorage.removeItem('demp.accessToken');
+        window.location.href = '/login';
+      }
     }
     throw new Error(msg);
   }

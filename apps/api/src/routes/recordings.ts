@@ -69,11 +69,17 @@ const routes: FastifyPluginAsync = async (app) => {
       if (!newest) {
         return { ...c, status: 'not-started' as const, sizeBytes: 0, lastWriteAt: null, ageSec: null };
       }
-      const ageSec = Math.round((now - (newest as { mtime: number }).mtime) / 1000);
+      const n = newest as { mtime: number; size: number };
+      const ageSec = Math.round((now - n.mtime) / 1000);
+      // A file that ffmpeg has JUST opened is < 4 KB and mtime looks
+      // fresh — but no video has landed yet. Treat those as "starting"
+      // so the operator sees the difference between "healthy" and
+      // "spinning up / never got a keyframe".
       const status: 'recording' | 'idle' | 'failed' | 'not-started' =
-        ageSec < 90    ? 'recording' :
-        ageSec < 300   ? 'idle'      :
-                         'failed';
+        ageSec < 90 && n.size > 4096 ? 'recording' :
+        ageSec < 90                  ? 'idle'      :   // fresh mtime, empty file = starting/stalled
+        ageSec < 300                 ? 'idle'      :
+                                       'failed';
       return {
         ...c, status,
         sizeBytes: (newest as { size: number }).size,
@@ -95,13 +101,27 @@ const routes: FastifyPluginAsync = async (app) => {
     const q = (req.query as { channelId?: string; from?: string; to?: string; limit?: string }) ?? {};
     const from = q.from ? new Date(q.from) : new Date(Date.now() - 30 * 24 * 3600 * 1000);
     const to   = q.to   ? new Date(q.to)   : new Date();
-    const segments = await app.prisma.recordingSegment.findMany({
+    // OVERLAP filter, not strict-started-in-window.
+    // Otherwise a "last 10 minutes" filter on an ongoing 30-min session
+    // that started 15 min ago returns nothing — the SESSION's startedAt
+    // is 15 min ago, so a strict `startedAt >= from` filter excludes it.
+    // What the operator actually wants: any segment whose
+    // [startedAt, startedAt+duration] overlaps the picked window.
+    // Prisma doesn't do arithmetic in where clauses, so we widen the
+    // startedAt >= bound by one segment length and post-filter to keep
+    // the query planner-friendly.
+    const widenMs = (Number(process.env.RECORDING_SEGMENT_SECONDS ?? 60) + 5) * 1000;
+    const segments = (await app.prisma.recordingSegment.findMany({
       where: {
         ...(q.channelId ? { channelId: q.channelId } : {}),
-        startedAt: { gte: from, lte: to },
+        startedAt: { gte: new Date(from.getTime() - widenMs), lte: to },
       },
       include: { channel: { select: { id: true, name: true, slug: true } } },
       orderBy: [{ channelId: 'asc' }, { startedAt: 'asc' }],
+    })).filter((s) => {
+      // exact overlap check now that segments are in hand
+      const segEnd = s.startedAt.getTime() + s.durationMs;
+      return segEnd >= from.getTime() && s.startedAt <= to;
     });
     // Bucket into sessions by (channelId, gap ≥ 3 min)
     const GAP_MS = 3 * 60 * 1000;

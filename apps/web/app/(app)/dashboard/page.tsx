@@ -45,12 +45,12 @@ export default function DashboardPage() {
   const { data: kpis } = useQuery<Kpis>({
     queryKey: ['dashboard.kpis'],
     queryFn: () => api<Kpis>('/api/dashboard/kpis'),
-    refetchInterval: 10_000,
+    refetchInterval: 30_000,
   });
   const { data: res } = useQuery<Resources>({
     queryKey: ['dashboard.resources'],
     queryFn: () => api<Resources>('/api/dashboard/resources'),
-    refetchInterval: 10_000,
+    refetchInterval: 30_000,
   });
 
   // Same unified 2-state model as the channels page: LIVE iff active

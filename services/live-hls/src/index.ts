@@ -22,7 +22,7 @@
  */
 
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { mkdirSync, statSync, unlinkSync } from 'node:fs';
+import { mkdirSync, readdirSync, statSync, unlinkSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import pino from 'pino';
 import { prisma } from '@cmc/db';
@@ -39,7 +39,12 @@ const HLS_SEGMENT_TIME    = Number(process.env.HLS_SEGMENT_TIME ?? 6);
 // 60 segments in playlist = ~6 minutes of history. User accepts high
 // latency in exchange for zero stalls; a browser that falls 5 minutes
 // behind live edge still finds its segments available.
-const HLS_LIST_SIZE       = Number(process.env.HLS_LIST_SIZE   ?? 60);
+// 10 = ~60 s window. Was 60 = ~6 min window, which caused hls.js
+// to hesitate on where the live edge actually is (default expects
+// 6-10 segments in a live playlist). 10 is the standard IPTV live
+// setting and lets the player start playing within one segment
+// fetch instead of stalling after a single initial segment.
+const HLS_LIST_SIZE       = Number(process.env.HLS_LIST_SIZE   ?? 10);
 const FFMPEG              = process.env.FFMPEG_PATH ?? 'ffmpeg';
 const RESCAN_INTERVAL_MS  = Number(process.env.LIVE_HLS_RESCAN_MS ?? 30_000);
 /** IPv4 address of the NIC that receives the satellite multicast feed.
@@ -154,10 +159,28 @@ function ffArgs(url: string, kind: string, outDir: string, transcodeVideo: boole
     '-loglevel', 'warning',
     '-fflags', '+discardcorrupt+igndts+genpts',
     '-err_detect', 'ignore_err',
+    // Bigger input queue between demuxer and encoder/muxer. Default is
+    // 8 packets; brief source stalls (IGMP renegotiation, wall PC
+    // reconnect, driver interrupt storm) can back-pressure onto the
+    // demuxer and cause it to bail. 1024 packets buffer roughly 1-2 s
+    // of TS which absorbs those hiccups without visible glitch.
+    '-thread_queue_size', '1024',
     '-f', 'mpegts',
     '-i', normaliseUrl(url, kind),
     '-map', '0:v:0',
     '-map', '0:a:0?',
+    // Explicitly strip subtitle + data streams (SCTE-35 splice cues,
+    // teletext, PSI-P tables). CNN specifically carries these and the
+    // browser's Media Source Extensions decoder stalls when it sees a
+    // segment with a "text" or "data" track it doesn't recognise —
+    // the segments keep loading (visible in DevTools network tab) but
+    // video freezes on the last decoded frame. -sn/-dn drops them at
+    // the encoder so the HLS segments never contain them.
+    '-sn', '-dn',
+    // Bigger muxer queue so audio and video can drift briefly without
+    // dropping frames. Default 1024 is fine for progressive H.264 but
+    // slow-KF sources with SCTE-35 (CNN) sometimes need more headroom.
+    '-max_muxing_queue_size', '4096',
   ];
 
   // Simple by design.
@@ -181,21 +204,38 @@ function ffArgs(url: string, kind: string, outDir: string, transcodeVideo: boole
         // Downscaling to 1280×720 during encode cuts pixel count 55 %
         // and drops CPU to ~60 %. Tiles on the wall are 240 px wide
         // anyway — zero visual loss from 1080p→720p.
-        const isHeavyHDInterlaced = slug === 'cnn';
-        const vf = isHeavyHDInterlaced
-          ? 'yadif=0:-1:0,scale=1280:720:flags=fast_bilinear'
-          : 'yadif=0:-1:0';
+        // ENCODER QUALITY — the operator verified that layout does not
+        // change the wall's ticker sharpness, so the bottleneck is
+        // here. Two changes vs. the old "-preset ultrafast + scaler
+        // fast_bilinear" config that were both blurring tickers:
+        //   1. preset ultrafast -> veryfast
+        //      ultrafast disables in-loop deblocking, CABAC and sub-pel
+        //      motion — great for CPU but produces visibly blocky text
+        //      and mosquito noise around ticker letters. veryfast keeps
+        //      all three enabled at ~2 × CPU. On the 56-core box with
+        //      12 concurrent encoders and -threads 2 cap this is fine.
+        //   2. scale flag fast_bilinear -> lanczos
+        //      fast_bilinear is the cheapest scaler and specifically
+        //      smears high-contrast horizontal edges (ticker text).
+        //      lanczos preserves those edges with a small CPU hit.
+        // Resolution kept at 960×540 — bumping higher is thrown away
+        // by the wall's 1920×1080 signal budget.
+        // Wall encode bumped to 720p — 540p was visibly soft on 1080p
+        // tile displays and blurry on 4K wall (2-4x upscale). 720p at
+        // 3 Mbps gives crisp text + faces even after wall scaling.
+        // CPU cost: ~1.8x per encoder vs 540p, still well under budget.
+        const vf = 'yadif=0:-1:0,scale=1280:720:force_original_aspect_ratio=decrease:flags=lanczos,pad=1280:720:(ow-iw)/2:(oh-ih)/2';
         return [
           '-vf', vf,
           '-c:v', 'libx264',
-          '-preset', 'ultrafast',
+          '-preset', 'veryfast',
           '-tune', 'zerolatency',
           '-profile:v', 'main',
           '-pix_fmt', 'yuv420p',
-          '-threads', '0',
-          '-b:v', isHeavyHDInterlaced ? '2000k' : '2500k',
-          '-maxrate', isHeavyHDInterlaced ? '2500k' : '3000k',
-          '-bufsize', isHeavyHDInterlaced ? '4000k' : '5000k',
+          '-threads', '2',
+          '-b:v',       '3000k',   // 720p at 3 Mbps = broadcast quality
+          '-maxrate',   '3800k',
+          '-bufsize',   '6000k',
           '-force_key_frames', `expr:gte(t,n_forced*${HLS_SEGMENT_TIME})`,
         ];
       })()
@@ -237,13 +277,14 @@ function launch(sup: Sup): void {
   const outDir = join(HLS_DIR, sup.slug);
   mkdirSync(outDir, { recursive: true });
 
-  // Delete any stale live.m3u8 from a prior run. Otherwise the
-  // stuck-ffmpeg watchdog reads its ancient mtime (possibly hours
-  // old) and, once its 60 s runway expires, thinks the freshly-
-  // launched ffmpeg is stuck — killing it. That put us in an
-  // endless spawn→kill→spawn loop on cold start. Removing the
-  // file forces the watchdog into its "no m3u8 yet" branch, which
-  // has the same 60 s runway from launch time only.
+  // Delete only the stale live.m3u8 so the stuck-watchdog does not
+  // read an ancient mtime. Do NOT purge .ts files here — that added
+  // per-launch disk churn (delete all + recreate) which under a
+  // chronic-offender restart loop hammered file I/O and starved the
+  // kernel non-paged pool → new ffmpeg spawns started failing with
+  // ENOMEM. Orphan .ts files from prior runs get cleaned up by the
+  // ffmpeg delete_segments flag as segment numbering catches up, and
+  // by the periodic housekeeping at service startup.
   try { unlinkSync(join(outDir, 'live.m3u8')); } catch { /* not there = fine */ }
 
   // First launch OR previously-forced transcode: pick which command shape.
@@ -288,12 +329,32 @@ function launch(sup: Sup): void {
     sup.proc = null;
     if (sup.stop) return;
     sup.restarts += 1;
-    const wait = Math.min(30_000, 1000 * Math.pow(2, Math.min(sup.restarts, 5)));
+    // Extended cool-down after excessive respawns. A source that has
+    // exited 20+ times without ever staying alive long is bad. The
+    // sub-second-per-crash storm we saw overnight (92-news restarted
+    // 103 × in a few hours) can also exhaust Windows pipe handles and
+    // eventually make Node's spawn() itself throw UNKNOWN — which
+    // takes the ENTIRE service down. Cap backoff at 5 minutes for
+    // channels with runaway crash counts so the parent stays healthy.
+    const wait = sup.restarts > 20
+      ? 300_000                                      // 5 min for chronic offenders
+      : Math.min(30_000, 1000 * Math.pow(2, Math.min(sup.restarts, 5)));
     log.warn(
       { slug: sup.slug, code, sig, restarts: sup.restarts, wait },
       'ffmpeg exited, will restart',
     );
-    setTimeout(() => launch(sup), wait);
+    // Wrap the deferred launch so a spawn() throw does NOT bubble to
+    // Node's uncaughtException. Was the root cause of the overnight
+    // service death: `Error: spawn UNKNOWN` thrown here after
+    // ~150 rapid respawns crashed the entire live-hls process, taking
+    // all 30 channels offline.
+    setTimeout(() => {
+      try { launch(sup); }
+      catch (err) {
+        log.error({ err, slug: sup.slug, restarts: sup.restarts }, 'launch threw — will retry in 60 s');
+        setTimeout(() => { try { launch(sup); } catch (e) { log.error({ e, slug: sup.slug }, 'launch failed twice, giving up until manual restart'); } }, 60_000);
+      }
+    }, wait);
   });
 }
 
@@ -309,26 +370,52 @@ function launch(sup: Sup): void {
  * often has malformed NALs that libx264 re-encoding cleans up.
  */
 function checkStuckFFmpegs(): void {
-  // Loose threshold: with `-c copy` and 6 s segments the m3u8 typically
-  // updates every 6-12 s. 3 min of no update = source has genuinely
-  // gone quiet; anything shorter risks killing a stream that is just
-  // waiting on the next keyframe of a slow-GOP source.
+  // A channel is REALLY stuck only if NEITHER the m3u8 nor any segment
+  // file has been written in the last 3 min. Just checking m3u8 was
+  // too aggressive:
+  //   - some sources have GOP > 60 s → first m3u8 takes >120 s to
+  //     appear, blowing past the 60 s runway → mass false-kill;
+  //   - ffmpeg atomically rewrites the m3u8 (temp + rename), so a
+  //     stat during the rename window throws → false-kill;
+  //   - our own delete of stale m3u8 in launch() plus a slow first
+  //     segment created a spawn→kill→spawn loop that took out all
+  //     30 channels roughly every 3-5 h.
+  // New logic: FRESH SEGMENTS = ALIVE. If any seg_*.ts was written
+  // in the last 30 s, the stream is fine regardless of m3u8 state.
   const STALE_MS = 180_000;
+  const RUNWAY_MS = 120_000;        // was 60 000; slow-KF sources need more
+  const RECENT_SEG_MS = 30_000;
+
   for (const sup of supervisors.values()) {
     if (!sup.proc || sup.stop) continue;
-    // Give the ffmpeg 60 s of runway after (re)launch before judging.
-    if (Date.now() - sup.lastRestartAt < 60_000) continue;
-    const mp = join(HLS_DIR, sup.slug, 'live.m3u8');
+    if (Date.now() - sup.lastRestartAt < RUNWAY_MS) continue;
+
+    const outDir = join(HLS_DIR, sup.slug);
+
+    // The authoritative liveness signal: newest .ts segment mtime.
+    let newestSegMtime = 0;
     try {
-      const st = statSync(mp);
-      if (Date.now() - st.mtimeMs > STALE_MS) {
-        log.warn({ slug: sup.slug, stale_ms: Date.now() - st.mtimeMs }, 'ffmpeg stuck — killing to restart');
-        try { sup.proc.kill('SIGKILL'); } catch { /* noop */ }
+      const files = readdirSync(outDir);
+      for (const f of files) {
+        if (!f.endsWith('.ts')) continue;
+        try { const s = statSync(join(outDir, f)); if (s.mtimeMs > newestSegMtime) newestSegMtime = s.mtimeMs; } catch { /* */ }
       }
-    } catch {
-      // No m3u8 yet AND ffmpeg has been running for >60 s → probably
-      // stuck before it wrote the first playlist. Kill it.
-      log.warn({ slug: sup.slug }, 'no m3u8 written yet — killing to restart');
+    } catch { /* dir might not exist yet — falls through */ }
+
+    if (newestSegMtime > 0 && Date.now() - newestSegMtime < RECENT_SEG_MS) {
+      // A fresh segment exists → ffmpeg is happily producing data.
+      // Do NOT kill regardless of what the m3u8 file looks like.
+      continue;
+    }
+
+    // No fresh segment either. Cross-check the m3u8 mtime.
+    const mp = join(outDir, 'live.m3u8');
+    let m3u8Age = Infinity;
+    try { m3u8Age = Date.now() - statSync(mp).mtimeMs; } catch { /* file missing */ }
+
+    if (m3u8Age > STALE_MS) {
+      const seg = newestSegMtime === 0 ? 'no-segs' : `${Math.round((Date.now() - newestSegMtime)/1000)}s`;
+      log.warn({ slug: sup.slug, m3u8_age_s: m3u8Age === Infinity ? 'missing' : Math.round(m3u8Age/1000), newest_seg: seg }, 'ffmpeg genuinely stuck — killing to restart');
       try { sup.proc.kill('SIGKILL'); } catch { /* noop */ }
     }
   }
@@ -391,12 +478,43 @@ async function rescan(): Promise<void> {
 async function main(): Promise<void> {
   log.info({ HLS_DIR, HLS_SEGMENT_TIME, HLS_LIST_SIZE, FFMPEG }, 'live-hls starting');
   mkdirSync(HLS_DIR, { recursive: true });
-  await rescan();
-  setInterval(() => {
-    rescan().catch((err) => log.error({ err }, 'rescan failed'));
+
+  // ONE-TIME housekeeping at service startup: remove every .ts file
+  // from every channel dir so we start with a clean slate. Old files
+  // from a previous run's counter would otherwise pile up. Runs ONCE
+  // (not on every ffmpeg respawn) so it does not thrash disk / kernel
+  // pool when a chronic-offender channel restart-loops.
+  try {
+    for (const chDir of readdirSync(HLS_DIR)) {
+      const full = join(HLS_DIR, chDir);
+      try {
+        for (const f of readdirSync(full)) {
+          if (f.endsWith('.ts')) { try { unlinkSync(join(full, f)); } catch { /* */ } }
+        }
+      } catch { /* */ }
+    }
+    log.info('startup: cleaned orphan .ts segments across all channel dirs');
+  } catch { /* */ }
+
+
+  // Heartbeat + self-heal: force-exit if the rescan loop wedges >5 min
+  // so the scheduled task can respawn cleanly. Guards against the
+  // "process alive but event loop stuck" failure mode (Prisma pool
+  // hang under uncaughtException guard).
+  let lastTick = Date.now();
+  await rescan(); lastTick = Date.now();
+  setInterval(async () => {
+    try { await rescan(); lastTick = Date.now(); }
+    catch (err) { log.error({ err }, 'rescan failed'); }
   }, RESCAN_INTERVAL_MS);
-  // Watchdog: kill ffmpegs whose live.m3u8 hasn't updated in >60 s.
-  // Every 15 s so we catch a stuck ffmpeg within ~75 s of hanging.
+  setInterval(() => {
+    if (Date.now() - lastTick > 300_000) {
+      log.error({ staleMs: Date.now() - lastTick }, 'rescan loop wedged >5 min — force-exiting so watchdog can respawn');
+      process.exit(1);
+    }
+  }, 30_000);
+
+  // Watchdog: kill ffmpegs whose output has genuinely gone quiet.
   setInterval(() => {
     try { checkStuckFFmpegs(); } catch (err) { log.warn({ err }, 'stuck-check failed'); }
   }, 15_000);
@@ -413,6 +531,19 @@ function shutdown(): void {
 }
 process.on('SIGINT',  shutdown);
 process.on('SIGTERM', shutdown);
+// LAST-LINE-OF-DEFENCE handlers so no single error can take the
+// whole live-hls service down and blackhole all 30 channels. Any
+// throw from a setTimeout callback or promise rejection is now
+// logged instead of killing the process. Fixed the overnight
+// blackout where Error: spawn UNKNOWN inside the ffmpeg-exit
+// restart timer crashed the parent + left all channels dead
+// until manual restart.
+process.on('uncaughtException', (err) => {
+  log.error({ err }, 'uncaughtException — keeping process alive');
+});
+process.on('unhandledRejection', (reason) => {
+  log.error({ reason }, 'unhandledRejection — keeping process alive');
+});
 
 main().catch((err) => {
   log.error(err);

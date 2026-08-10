@@ -72,8 +72,11 @@ function buildLayouts(): Layout[] {
     }
   }
 
-  // Grid32: 8 cols × 4 rows = 32 slots — user's original request,
-  // matches the standalone Rust wall.
+  // Grid32: 8 cols × 4 rows = 32 slots. Operator verified that layout
+  // aspect does not visibly change wall text sharpness — that is
+  // dominated by the ENCODER preset + scaler on the server. Tiles use
+  // object-fit: fill for maximum screen use; text sharpness comes
+  // from live-hls (`-preset veryfast -vf …flags=lanczos`).
   const grid32: Slot[] = [];
   for (let r = 0; r < 4; r++) {
     for (let c = 0; c < 8; c++) {
@@ -377,7 +380,13 @@ export default function MultiviewerPage() {
         </div>
       </div>
 
-      {/* Wall */}
+      {/* Wall — grid32 renders as an 8×8 slot matrix on the 1920×1080
+          signal that the wall controller receives from the PC HDMI.
+          Signal aspect = 16:9, tile aspect = 240×135 = 16:9 → perfect
+          match. Container just fills the browser viewport; the wall
+          controller then splits the signal across 8 physical screens
+          (each showing a 2×4 slice = 8 tiles). Non-grid32 layouts
+          behave identically — 16:9 tiles inside a 16:9 container. */}
       <div className="flex-1 bg-black overflow-hidden" ref={wallRef}>
         <div className="relative w-full h-full">
           {layout.slots.map((slot, idx) => {

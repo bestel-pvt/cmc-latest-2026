@@ -119,9 +119,16 @@ const routes: FastifyPluginAsync = async (app) => {
       const p = path.join(dir, `${id}.${ext}`);
       if (existsSync(p)) {
         const type = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg';
+        // URL already carries ?v=<timestamp> from the upload endpoint,
+        // so every logo URL is unique per version — safe to tell the
+        // browser this bytes-for-this-URL will never change. Was 300 s
+        // (5 min) which meant the channels page re-fetched all 30
+        // logos on every reload and queued them 6 at a time behind
+        // HTTP/1.1's per-origin connection cap. That was the 6-second
+        // logo load the operator reported.
         reply
           .header('Content-Type', type)
-          .header('Cache-Control', 'public, max-age=300')
+          .header('Cache-Control', 'public, max-age=31536000, immutable')
           .header('Content-Length', statSync(p).size);
         return reply.send(createReadStream(p));
       }

@@ -20,11 +20,12 @@ const CLIPS_DIR      = process.env.CLIPS_DIR      ? path.resolve(process.env.CLI
 const FRAMES_ROOT    = process.env.FRAMES_DIR     ? path.resolve(process.env.FRAMES_DIR)     : path.join(DATA_DIR, 'frames');
 
 /** Instant CPU utilisation across every core.
- *  Takes two `os.cpus()` snapshots ~500 ms apart, computes the delta
- *  of busy-time vs total-time. Cross-platform, no `loadavg` (which is
- *  0 on Windows). Cost: 500 ms per call — dashboard refreshes every
- *  5-10 s so this is fine. */
-async function cpuUsagePercent(sampleMs = 500): Promise<number> {
+ *  Takes two `os.cpus()` snapshots ~150 ms apart. Was 500 ms which
+ *  dominated /resources latency (500 of 648 ms) and blocked the event
+ *  loop; 150 ms is still stable enough to average out one scheduling
+ *  quantum. The 10 s response cache below means we only sample once
+ *  per 10 s regardless of client polling frequency. */
+async function cpuUsagePercent(sampleMs = 150): Promise<number> {
   const start = os.cpus().map((c) => c.times);
   await new Promise((r) => setTimeout(r, sampleMs));
   const end = os.cpus().map((c) => c.times);
@@ -185,18 +186,23 @@ const routes: FastifyPluginAsync = async (app) => {
   /**
    * GET /api/dashboard/resources — live CPU / memory / disk snapshot
    * with per-directory storage breakdown (recordings / clips / frames).
-   * Refreshed on demand — the dashboard polls this every 10 s.
+   *
+   * Result cached for 10 s: the recursive dirSize walk over the whole
+   * recordings tree is O(files) and used to run per request, blocking
+   * the event loop for hundreds of ms and starving every other API
+   * call while the dashboard tab was open. Now we compute once every
+   * 10 s at most; the client polls at 30 s but multiple tabs / hot
+   * reload all share the same cached response.
    */
   app.get('/resources', async () => {
-    // Directory sizes CAN be expensive on TB-scale data. Cap the scan
-    // to top-level accounting only for now: sum files at top of each
-    // dir plus one level deep. If perf becomes an issue, we can cache.
-    // Currently:
-    //   data/recordings/<channelId>/<yyyy>/<mm>/<dd>/<hh>/*.mp4
-    //   data/clips/*.mp4|.mov|.mkv
-    //   data/frames/<yyyy-mm-dd>/*.png
-    // Per-workload sizes — from CONFIGURED paths, so recordings on
-    // D:\cmc\recordings + clips on D:\cmc\clips are correctly summed.
+    const CACHE_MS = 10_000;
+    const nowMs = Date.now();
+    if (resourcesCache && nowMs - resourcesCache.at < CACHE_MS) {
+      return resourcesCache.value;
+    }
+    // Directory sizes CAN be expensive on TB-scale data — 480 files
+    // was ~140 ms; 100 K files can push several seconds. Cache above
+    // keeps that from happening every 10 s poll.
     const recordingsBytes = dirSize(RECORDINGS_DIR);
     const clipsBytes      = dirSize(CLIPS_DIR);
     const framesBytes     = dirSize(FRAMES_ROOT);
@@ -205,7 +211,7 @@ const routes: FastifyPluginAsync = async (app) => {
     const totalMem = os.totalmem();
     const freeMem  = os.freemem();
     const usedMem  = totalMem - freeMem;
-    const cpuPct   = await cpuUsagePercent(500);
+    const cpuPct   = await cpuUsagePercent(150);
 
     // Show ALL fixed drives, biggest first — the actual storage
     // hardware. The single "primary" (biggest, i.e. the recording
@@ -216,7 +222,7 @@ const routes: FastifyPluginAsync = async (app) => {
     const primary = disks[0] ?? diskUsage(DATA_DIR);
     const primaryMount = disks[0]?.mount ?? DATA_DIR;
 
-    return {
+    const payload = {
       at: new Date().toISOString(),
       cpu: {
         cores: cpus.length,
@@ -235,21 +241,22 @@ const routes: FastifyPluginAsync = async (app) => {
         usedBytes: primary.used,
         freeBytes: primary.free,
         usedPct: primary.total > 0 ? Math.round((primary.used / primary.total) * 100) : 0,
-        // Per-workload footprint — reads from CONFIGURED paths so
-        // recordings sitting on D: are counted even though the
-        // primary "used" is measured for the D: drive as a whole.
         breakdown: {
           recordingsBytes,
           clipsBytes,
           framesBytes,
           otherBytes: Math.max(0, primary.used - recordingsBytes - clipsBytes - framesBytes),
         },
-        // Every drive so the operator sees the whole system.
         volumes: disks,
       },
       uptimeSec: Math.round(os.uptime()),
     };
+    resourcesCache = { at: nowMs, value: payload };
+    return payload;
   });
 };
+
+// Module-scope cache — one API process shares it across all clients.
+let resourcesCache: { at: number; value: unknown } | null = null;
 
 export default routes;

@@ -4,7 +4,7 @@
  * Video-wall multiviewer.
  *
  * Matches the standalone CMC video-wall app conceptually:
- *   - 4 layouts (single, dual, mosaic-20, grid-32)
+ *   - 5 layouts (single, dual, grid-8, mosaic-20, grid-32)
  *   - assign a channel per slot from a searchable channel list
  *   - save / load / delete named templates (localStorage; per-browser)
  *   - fullscreen mode
@@ -38,7 +38,7 @@ interface Slot {
 }
 
 interface Layout {
-  id: 'single' | 'dual' | 'mosaic' | 'grid32';
+  id: 'single' | 'dual' | 'grid8' | 'mosaic' | 'grid32';
   label: string;
   slots: Slot[];
 }
@@ -53,6 +53,15 @@ function buildLayouts(): Layout[] {
     { x: 0.0, y: 0, w: 0.5, h: 1 },
     { x: 0.5, y: 0, w: 0.5, h: 1 },
   ];
+
+  // Grid8: 2 rows × 4 cols = 8 tiles. Same 16:9 tile aspect the wall
+  // encoder produces, so no letterboxing/pillarboxing at any wall size.
+  const grid8: Slot[] = [];
+  for (let r = 0; r < 2; r++) {
+    for (let c = 0; c < 4; c++) {
+      grid8.push({ x: c / 4, y: r / 2, w: 1 / 4, h: 1 / 2 });
+    }
+  }
 
   // Mosaic-20: 4 big tiles across the top row + 16 quadrants below.
   const mosaic: Slot[] = [];
@@ -87,8 +96,9 @@ function buildLayouts(): Layout[] {
   return [
     { id: 'single', label: '1 · Single',       slots: single },
     { id: 'dual',   label: '2 · Dual',         slots: dual },
-    { id: 'mosaic', label: '3 · Mosaic (20)',  slots: mosaic },
-    { id: 'grid32', label: '4 · Grid (32)',    slots: grid32 },
+    { id: 'grid8',  label: '3 · Grid (8)',     slots: grid8 },
+    { id: 'mosaic', label: '4 · Mosaic (20)',  slots: mosaic },
+    { id: 'grid32', label: '5 · Grid (32)',    slots: grid32 },
   ];
 }
 
@@ -156,7 +166,7 @@ export default function MultiviewerPage() {
   const wallRef = useRef<HTMLDivElement | null>(null);
 
   const layout = useMemo(
-    () => LAYOUTS.find((l) => l.id === layoutId) ?? LAYOUTS[2]!,
+    () => LAYOUTS.find((l) => l.id === layoutId) ?? LAYOUTS.find((l) => l.id === 'mosaic')!,
     [layoutId],
   );
 

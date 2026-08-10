@@ -1,5 +1,5 @@
 import type { FastifyPluginAsync } from 'fastify';
-import { createReadStream, statSync, writeFileSync, mkdirSync, existsSync, readdirSync } from 'node:fs';
+import { createReadStream, statSync, writeFileSync, mkdirSync, existsSync, readdirSync, unlinkSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import os, { tmpdir } from 'node:os';
@@ -312,11 +312,22 @@ const routes: FastifyPluginAsync = async (app) => {
             '-c:a', 'aac', '-b:a', '64k', '-ac', '2', '-ar', '48000',
             '-movflags', '+faststart',
             outPath,
-          ], { stdio: 'ignore' });
+          ], { stdio: ['ignore', 'ignore', 'pipe'] });
           if (ff.pid) {
             try { os.setPriority(ff.pid, os.constants.priority.PRIORITY_BELOW_NORMAL); } catch { /* best-effort */ }
           }
-          ff.on('exit', (code) => code === 0 ? resolve() : reject(new Error(`ffmpeg exit ${code}`)));
+          // -loglevel error emits ~zero output when things are fine,
+          // so stderr chunks rarely wake the event loop. On failure
+          // we get the last 800 chars back into the reject so the
+          // 500 body tells the user WHY.
+          let tail = '';
+          ff.stderr?.on('data', (b) => {
+            tail += b.toString();
+            if (tail.length > 4000) tail = tail.slice(-2000);
+          });
+          ff.on('exit', (code) => code === 0
+            ? resolve()
+            : reject(new Error(`ffmpeg exit ${code}: ${tail.slice(-800) || '(no stderr)'}`)));
           ff.on('error', reject);
         });
       } finally {
@@ -327,7 +338,12 @@ const routes: FastifyPluginAsync = async (app) => {
         throw new Error('ffmpeg produced empty output');
       }
       return outPath;
-    })().finally(() => setTimeout(() => buildLocks.delete(key), 1000));
+    })().catch((err) => {
+      // Wipe partial file so the NEXT click retries from scratch
+      // instead of the existsSync check up top returning a stale broken cache.
+      try { if (existsSync(outPath)) unlinkSync(outPath); } catch { /* */ }
+      throw err;
+    }).finally(() => setTimeout(() => buildLocks.delete(key), 1000));
 
     buildLocks.set(key, p);
     return p;

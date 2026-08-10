@@ -421,6 +421,19 @@ async function refreshSupervisors() {
       (sup as Supervisor & { _stopped?: boolean })._stopped = true;   // suppress the auto-restart handler
       stopFFmpegGracefully(sup);
       supervisors.delete(id);
+      continue;
+    }
+    // Safety net: if a supervisor is present but its proc died and
+    // the exit handler didn't respawn (e.g. handler regression, spawn
+    // exception, unhandled event), drop the map entry so the next block
+    // recreates it from scratch on this same tick.
+    const p = sup.proc;
+    const dead = !p || p.exitCode !== null || p.signalCode !== null;
+    const idleSince = Date.now() - sup.lastRestartAt;
+    if (dead && idleSince > 60_000) {
+      log.warn({ id, slug: sup.slug, exitCode: p?.exitCode, signalCode: p?.signalCode, idleSince },
+               'supervisor has no live proc — reseeding');
+      supervisors.delete(id);
     }
   }
 
@@ -431,23 +444,35 @@ async function refreshSupervisors() {
     const primary = c.sources[0]!;
     const outDir = channelOutDir(c.id);
     const sup: Supervisor & { _stopped?: boolean } = { channelId: c.id, slug: c.slug, proc: null, outDir, restarts: 0, lastRestartAt: 0 };
-    sup.proc = spawnFFmpeg(c.slug, primary.url, primary.kind, outDir);
-    sup.proc.on('exit', (code) => {
-      // If refreshSupervisors marked this stopped (user turned off
-      // recordingEnabled), don't respawn. Was: exit handler always
-      // respawned → toggle-off never actually stopped the recorder.
-      if (sup._stopped) return;
-      log.warn({ slug: c.slug, code }, 'recorder ffmpeg exited');
-      const now = Date.now();
-      sup.restarts = now - sup.lastRestartAt > 30_000 ? 0 : sup.restarts + 1;
-      const delay = Math.min(30_000, 500 * 2 ** sup.restarts);
-      setTimeout(() => {
-        if (sup._stopped) return;                                     // in case toggle-off happened during backoff
-        sup.outDir = channelOutDir(sup.channelId);
-        sup.lastRestartAt = Date.now();
-        sup.proc = spawnFFmpeg(c.slug, primary.url, primary.kind, sup.outDir);
-      }, delay);
-    });
+
+    // Wraps spawn + attaches the exit handler in one place so respawns
+    // don't drop the handler. Was: handler attached ONCE on the initial
+    // proc; the setTimeout respawn reassigned sup.proc without wiring a
+    // new handler → second ffmpeg died silently → whole channel stalled.
+    const spawnAndWatch = () => {
+      sup.outDir = channelOutDir(sup.channelId);
+      sup.lastRestartAt = Date.now();
+      const p = spawnFFmpeg(c.slug, primary.url, primary.kind, sup.outDir);
+      sup.proc = p;
+      p.on('exit', (code) => {
+        if (sup._stopped) return;
+        log.warn({ slug: c.slug, code }, 'recorder ffmpeg exited');
+        const now = Date.now();
+        sup.restarts = now - sup.lastRestartAt > 30_000 ? 0 : sup.restarts + 1;
+        const delay = Math.min(30_000, 500 * 2 ** sup.restarts);
+        setTimeout(() => {
+          if (sup._stopped) return;
+          try { spawnAndWatch(); }
+          catch (err) { log.error({ err, slug: c.slug }, 'respawn threw — will retry on next refresh tick'); }
+        }, delay);
+      });
+      p.on('error', (err) => {
+        log.warn({ err, slug: c.slug }, 'ffmpeg spawn error');
+      });
+    };
+
+    try { spawnAndWatch(); }
+    catch (err) { log.error({ err, slug: c.slug }, 'initial spawn threw'); }
     supervisors.set(c.id, sup);
   }
 }

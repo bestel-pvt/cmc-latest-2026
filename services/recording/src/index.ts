@@ -218,9 +218,16 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
   // for future switching) still runs — but we always transcode now.
   void slugForced;
   void (channelCodec.get(slug));
+  // preset ultrafast (was veryfast). At 640x360 the visual gap between
+  // ultrafast and veryfast is barely detectable for archive playback,
+  // but per-encoder CPU roughly halves. With 30 concurrent recorders
+  // this is the difference between the server having comfortable
+  // headroom and Windows firing "close programs" low-memory warnings
+  // when all recordings are ON simultaneously.
+  // scaler kept at lanczos (only ~2% cost at 360p) so text stays readable.
   const videoArgs = [
     '-vf', 'yadif=0:-1:0,scale=640:360:force_original_aspect_ratio=decrease:flags=lanczos,pad=640:360:(ow-iw)/2:(oh-ih)/2',
-    '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency',
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
     '-profile:v', 'main', '-pix_fmt', 'yuv420p',
     '-threads', '2',
     '-b:v', '500k', '-maxrate', '700k', '-bufsize', '1400k',

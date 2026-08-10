@@ -224,7 +224,13 @@ function ffArgs(url: string, kind: string, outDir: string, transcodeVideo: boole
         // tile displays and blurry on 4K wall (2-4x upscale). 720p at
         // 3 Mbps gives crisp text + faces even after wall scaling.
         // CPU cost: ~1.8x per encoder vs 540p, still well under budget.
-        const vf = 'yadif=0:-1:0,scale=1280:720:force_original_aspect_ratio=decrease:flags=lanczos,pad=1280:720:(ow-iw)/2:(oh-ih)/2';
+        // Fill mode (was pad-fit before). increase+crop scales the
+        // source until BOTH dims are >=target then crops the excess.
+        // For 16:9 sources this is a no-op. For 4:3 sources (Aaj/ARY)
+        // it removes the left/right black pillar bars by scaling up and
+        // trimming top+bottom instead. Ticker content is typically in
+        // the bottom-center so a small crop there is invisible.
+        const vf = 'yadif=0:-1:0,scale=1280:720:force_original_aspect_ratio=increase:flags=lanczos,crop=1280:720';
         return [
           '-vf', vf,
           '-c:v', 'libx264',

@@ -112,10 +112,15 @@ function normaliseUrl(url: string, kind: string): string {
     // SO_RCVBUF (8 MB). With 60 concurrent UDP subscribers on one NIC
     // Windows fails NEW binds at ~800 MB total pinned kernel buffer;
     // 60 * 16 MB tips over, 60 * 8 MB fits.
-    if (!u.includes('fifo_size='))         params.push('fifo_size=10000000');
+    // fifo_size dropped from 10 MB to 4 MB (still absorbs 3-5 s of a
+    // 5 Mbps stream), buffer_size 4 MB (kernel). At 60 concurrent
+    // encoders that's 480 MB of pinned buffers up front — the previous
+    // 10 MB per encoder × 60 = 1.08 GB baseline was contributing to
+    // the OOM state we hit after 3 h.
+    if (!u.includes('fifo_size='))         params.push('fifo_size=4000000');
     if (!u.includes('overrun_nonfatal='))  params.push('overrun_nonfatal=1');
     if (!u.includes('timeout='))           params.push('timeout=60000000');
-    if (!u.includes('buffer_size='))       params.push('buffer_size=8388608');
+    if (!u.includes('buffer_size='))       params.push('buffer_size=4194304');
     if (!u.includes('reuse='))             params.push('reuse=1');
     if (LOCALADDR && !u.toLowerCase().includes('localaddr=')) {
       params.push(`localaddr=${LOCALADDR}`);
@@ -164,7 +169,10 @@ function ffArgs(url: string, kind: string, outDir: string, transcodeVideo: boole
     // reconnect, driver interrupt storm) can back-pressure onto the
     // demuxer and cause it to bail. 1024 packets buffer roughly 1-2 s
     // of TS which absorbs those hiccups without visible glitch.
-    '-thread_queue_size', '1024',
+    // -thread_queue_size default is 8; bump only modestly. 1024 was
+    // over-provisioned and let internal queues grow to hundreds of MB
+    // over multi-hour runs.
+    '-thread_queue_size', '128',
     '-f', 'mpegts',
     '-i', normaliseUrl(url, kind),
     '-map', '0:v:0',
@@ -180,7 +188,9 @@ function ffArgs(url: string, kind: string, outDir: string, transcodeVideo: boole
     // Bigger muxer queue so audio and video can drift briefly without
     // dropping frames. Default 1024 is fine for progressive H.264 but
     // slow-KF sources with SCTE-35 (CNN) sometimes need more headroom.
-    '-max_muxing_queue_size', '4096',
+    // Muxing queue: default 1024. 4096 was unnecessarily large and
+    // holds bounded but non-trivial memory per encoder.
+    '-max_muxing_queue_size', '1024',
   ];
 
   // Simple by design.
@@ -427,6 +437,49 @@ function checkStuckFFmpegs(): void {
   }
 }
 
+/**
+ * Memory-hog watchdog. libx264 encoders leak slowly on this box —
+ * observed 300-500 MB per encoder after 3-4 h, which added up to
+ * 10+ GB across 60 encoders and OOM'd the whole box (new ffmpeg
+ * spawns failed with -12/ENOMEM, wall tiles went dark).
+ *
+ * Runs every 60 s. Anything over MEMORY_KILL_MB gets SIGKILL'd; the
+ * exit handler respawns in <2 s = one tile blinks briefly, rest of
+ * the wall keeps playing untouched. Reactive not scheduled: only
+ * fires when a leak actually happens, so a healthy 24/7 stream is
+ * never touched.
+ */
+const MEMORY_KILL_MB = 250;
+async function checkFatFFmpegs(): Promise<void> {
+  const wmic = spawn('wmic', ['process', 'where', "name='ffmpeg.exe'", 'get', 'ProcessId,WorkingSetSize', '/format:csv'],
+    { stdio: ['ignore', 'pipe', 'ignore'] });
+  let out = '';
+  wmic.stdout.on('data', (b) => { out += b.toString(); });
+  await new Promise<void>((res) => { wmic.on('exit', () => res()); wmic.on('error', () => res()); });
+
+  const wsByPid = new Map<number, number>();
+  for (const line of out.split(/\r?\n/)) {
+    const parts = line.split(',');
+    if (parts.length < 3) continue;
+    const pid = Number(parts[1]);
+    const ws = Number(parts[2]);
+    if (!isNaN(pid) && !isNaN(ws)) wsByPid.set(pid, ws);
+  }
+
+  for (const sup of supervisors.values()) {
+    if (!sup.proc || sup.stop) continue;
+    const pid = sup.proc.pid;
+    if (!pid) continue;
+    const ws = wsByPid.get(pid);
+    if (!ws) continue;
+    const mb = Math.round(ws / 1024 / 1024);
+    if (mb > MEMORY_KILL_MB) {
+      log.warn({ slug: sup.slug, pid, mb }, `ffmpeg over ${MEMORY_KILL_MB} MB — recycling`);
+      try { sup.proc.kill('SIGKILL'); } catch { /* noop */ }
+    }
+  }
+}
+
 async function rescan(): Promise<void> {
   let channels: Array<{ id: string; slug: string; active: boolean; sources: Array<{ url: string; kind: string; isPrimary: boolean; priority: number }> }>;
   try {
@@ -524,6 +577,11 @@ async function main(): Promise<void> {
   setInterval(() => {
     try { checkStuckFFmpegs(); } catch (err) { log.warn({ err }, 'stuck-check failed'); }
   }, 15_000);
+  // Memory watchdog: recycle any single ffmpeg that leaks past 250 MB.
+  // Runs every 60 s — cheap; wmic call takes ~50 ms.
+  setInterval(() => {
+    checkFatFFmpegs().catch((err) => log.warn({ err }, 'fat-check failed'));
+  }, 60_000);
   // Keep the event loop alive.
   process.stdin.resume();
 }

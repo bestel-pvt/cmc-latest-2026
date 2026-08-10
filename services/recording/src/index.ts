@@ -120,7 +120,7 @@ function probeVideoCodec(sourceUrl: string, kind: string): string | null {
       input = `${proto!.toLowerCase()}://@${rest}`;
     }
     const localaddr = process.env.RECORDING_LOCALADDR ?? process.env.LOCALADDR ?? '';
-    const parts: string[] = ['fifo_size=10000000', 'overrun_nonfatal=1', 'reuse=1'];
+    const parts: string[] = ['fifo_size=4000000', 'overrun_nonfatal=1', 'reuse=1'];
     if (localaddr) parts.push(`localaddr=${localaddr}`);
     input = `${input}${input.includes('?') ? '&' : '?'}${parts.join('&')}`;
   }
@@ -175,10 +175,10 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
     // when total pinned kernel socket buffers across all sockets
     // exceed ~800 MB. 60 sockets × 16 MB tips the limit; 60 × 8 MB
     // fits comfortably.
-    if (!input.includes('fifo_size='))         parts.push('fifo_size=10000000');
+    if (!input.includes('fifo_size='))         parts.push('fifo_size=4000000');
     if (!input.includes('overrun_nonfatal='))  parts.push('overrun_nonfatal=1');
     if (!input.includes('timeout='))           parts.push('timeout=60000000');
-    if (!input.includes('buffer_size='))       parts.push('buffer_size=8388608');
+    if (!input.includes('buffer_size='))       parts.push('buffer_size=4194304');
     if (!input.includes('reuse='))             parts.push('reuse=1');
     if (localaddr && !input.toLowerCase().includes('localaddr=')) {
       parts.push(`localaddr=${localaddr}`);
@@ -243,7 +243,7 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
     '-err_detect', 'ignore_err',
     // Bigger input queue absorbs source hiccups (IGMP renegotiation,
     // NIC-driver interrupt storm) without dropping segments.
-    '-thread_queue_size', '1024',
+    '-thread_queue_size', '128',
     ...(kind === 'UDP' || kind === 'RTP' ? ['-f', 'mpegts'] : []),
     '-i', input,
     '-map', '0:v:0', '-map', '0:a?', '-dn', '-sn',
@@ -770,6 +770,40 @@ async function main() {
       process.exit(1);
     }
   }, 30_000);
+
+  // Memory-hog watchdog. Reactive per-encoder recycle if a single
+  // ffmpeg leaks past 250 MB. Only fires when a leak actually happens;
+  // healthy 24/7 encoders are untouched. spawnAndWatch's exit handler
+  // respawns automatically. Same design as live-hls's watchdog.
+  setInterval(() => {
+    const MEMORY_KILL_MB = 250;
+    const wmic = spawn('wmic', ['process', 'where', "name='ffmpeg.exe'", 'get', 'ProcessId,WorkingSetSize', '/format:csv'],
+      { stdio: ['ignore', 'pipe', 'ignore'] });
+    let out = '';
+    wmic.stdout.on('data', (b) => { out += b.toString(); });
+    wmic.on('exit', () => {
+      const wsByPid = new Map<number, number>();
+      for (const line of out.split(/\r?\n/)) {
+        const parts = line.split(',');
+        if (parts.length < 3) continue;
+        const pid = Number(parts[1]);
+        const ws = Number(parts[2]);
+        if (!isNaN(pid) && !isNaN(ws)) wsByPid.set(pid, ws);
+      }
+      for (const sup of supervisors.values()) {
+        const pid = sup.proc?.pid;
+        if (!pid) continue;
+        const ws = wsByPid.get(pid);
+        if (!ws) continue;
+        const mb = Math.round(ws / 1024 / 1024);
+        if (mb > MEMORY_KILL_MB) {
+          log.warn({ slug: sup.slug, pid, mb }, `recording ffmpeg over ${MEMORY_KILL_MB} MB — recycling`);
+          try { sup.proc?.kill('SIGKILL'); } catch { /* noop */ }
+        }
+      }
+    });
+    wmic.on('error', () => { /* wmic missing — skip */ });
+  }, 60_000);
 
   // Periodically walk EVERY hour dir under EVERY channel and ingest any
   // .mp4 that isn't marked .recorded.

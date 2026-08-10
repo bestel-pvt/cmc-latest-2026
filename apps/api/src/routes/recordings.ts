@@ -258,12 +258,31 @@ const routes: FastifyPluginAsync = async (app) => {
       const lines = playable.map((path) => `file '${path.replace(/'/g, "'\\''")}'`).join('\n');
       writeFileSync(listPath, lines);
 
+      // Download-time transcode: recordings are now stored -c copy at
+      // native source resolution + bitrate (moved off the 24/7 encoder
+      // load that saturated the box). The 5 MB/min user budget is
+      // enforced HERE, on-demand, per download.
+      //
+      // Segments may span old-transcoded 640x360 + new native mixed
+      // resolutions — concat -c copy fails on that mismatch, so we
+      // re-encode everything through a normaliser: scale to 640x360,
+      // libx264 500k VBR-capped, AAC 64k. Result: ~4.35 MB/min = a 60s
+      // clip is well under 5 MB, a 2-min clip well under 10 MB, etc.
+      //
+      // ultrafast preset — downloads are on-demand + serialised by
+      // buildLocks, so CPU cost per download is one-shot, not
+      // sustained. Users see a few-second render before download.
       await new Promise<void>((resolve, reject) => {
         const ff = spawn('ffmpeg', [
           '-hide_banner', '-loglevel', 'error', '-y',
           '-err_detect', 'ignore_err',
+          '-fflags', '+genpts+discardcorrupt',
           '-f', 'concat', '-safe', '0', '-i', listPath,
-          '-c', 'copy',
+          '-vf', 'yadif=0:-1:0,scale=640:360:force_original_aspect_ratio=decrease:flags=lanczos,pad=640:360:(ow-iw)/2:(oh-ih)/2',
+          '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
+          '-profile:v', 'main', '-pix_fmt', 'yuv420p',
+          '-b:v', '500k', '-maxrate', '700k', '-bufsize', '1400k',
+          '-c:a', 'aac', '-b:a', '64k', '-ac', '2', '-ar', '48000',
           '-movflags', '+faststart',
           outPath,
         ], { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -667,6 +686,18 @@ const routes: FastifyPluginAsync = async (app) => {
     if (!outPath) return reply.notFound('no segments cover this range');
 
     const stat = statSync(outPath);
+    // Filename: <slug>_<startISO>.mp4 — nice for the operator to search
+    // downloaded files later. slug comes from a lookup because we only
+    // have channelId in the query.
+    let filename = `recording-${q.from}.mp4`;
+    try {
+      const ch = await app.prisma.channel.findUnique({ where: { id: q.channelId }, select: { slug: true } });
+      if (ch) {
+        const stamp = q.from.replace(/[:.]/g, '-').replace('T', '_').slice(0, 19);
+        filename = `${ch.slug}_${stamp}.mp4`;
+      }
+    } catch { /* fall back to default filename */ }
+
     const range = (req.headers.range as string | undefined) ?? '';
     if (range) {
       const [startStr, endStr] = range.replace(/bytes=/, '').split('-');
@@ -677,13 +708,15 @@ const routes: FastifyPluginAsync = async (app) => {
         .header('Content-Range', `bytes ${start}-${end}/${stat.size}`)
         .header('Accept-Ranges', 'bytes')
         .header('Content-Length', end - start + 1)
-        .header('Content-Type', 'video/mp4');
+        .header('Content-Type', 'video/mp4')
+        .header('Content-Disposition', `attachment; filename="${filename}"`);
       return reply.send(createReadStream(outPath, { start, end }));
     }
     reply
       .header('Content-Length', stat.size)
       .header('Content-Type', 'video/mp4')
-      .header('Accept-Ranges', 'bytes');
+      .header('Accept-Ranges', 'bytes')
+      .header('Content-Disposition', `attachment; filename="${filename}"`);
     return reply.send(createReadStream(outPath));
   });
 

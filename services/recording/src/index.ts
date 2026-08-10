@@ -46,11 +46,14 @@ const CLIP_ASSETS   = resolve(process.env.CLIP_ASSETS_DIR ?? './data/assets');
 // never closed unless the operator stopped, so nothing was ingested
 // and the Recordings page showed empty.
 const SEG_SECONDS   = Number(process.env.RECORDING_SEGMENT_SECONDS ?? 60);
-const V_BITRATE     = process.env.RECORDING_VIDEO_BITRATE ?? '2000k';
+// Download budget: 500k video + 64k audio + ~30k mux overhead
+// = ~594 kbps × 60s / 8 / 1024 ≈ 4.35 MB per minute. Safely under
+// the 5 MB/min user requirement (1 min = 5 MB, 2 min = 10 MB, ...).
+const V_BITRATE     = process.env.RECORDING_VIDEO_BITRATE ?? '500k';
 // Kept for the clip renderer (which still re-encodes audio at export).
 // The live recorder no longer uses this because it pass-through
 // remuxes from live-hls's already-AAC output.
-const A_BITRATE     = process.env.RECORDING_AUDIO_BITRATE ?? '128k';
+const A_BITRATE     = process.env.RECORDING_AUDIO_BITRATE ?? '64k';
 const SIGN_KEY      = process.env.MANIFEST_SIGNING_KEY   ?? 'dev-only';
 const TITLE_CARD_SEC = 3;
 
@@ -197,42 +200,29 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
     channelCodec.set(slug, codec);
     log.info({ slug, codec }, 'source codec detected');
   }
-  // Every channel is transcoded to stay under the 5 MB / minute file
-  // size budget. -c copy previously passed through native source bitrates
-  // (3-5 Mbps → 20-40 MB/min segments) which busted the archive budget.
+  // RECORDING = -c copy (remux only, ZERO encoder CPU).
   //
-  // Math for the ceiling: 5 MB × 8 bits/byte ÷ 60 s = ~667 kbps total.
-  // We target 500 kbps video + 64 kbps audio + ~30 kbps mux overhead
-  // = ~594 kbps × 60 s ÷ 8 ÷ 1024 = ~4.35 MB per minute (safe margin).
-  // Actual size stays under 5 MB even during high-motion scenes because
-  // maxrate=700k + bufsize=1400k clamps the instantaneous bitrate.
+  // Prior design transcoded every source to 640x360 @ 500k so each
+  // 60s segment fit under the 5 MB/min user budget. Downside: 30
+  // concurrent libx264 encoders + the wall encoders saturated CPU
+  // + kernel scheduler, dragging LAN ping to 1000-2400 ms and
+  // triggering Windows "low on memory" toasts. Server unusable.
   //
-  // 640×360 (nHD 16:9) at 500 kbps gives passable archive quality —
-  // faces + tickers readable at native playback size.
-  // veryfast preset — CABAC + subpel motion enabled so text stays
-  // sharp at the low bitrate. -threads 2 caps per-encoder parallelism
-  // so 30 concurrent encoders do not fight for cores on the 56-core box.
+  // New split:
+  //   - Recording writes native-bitrate mp4 segments at the source's
+  //     own resolution + codec (h264/aac remux, no re-encode).
+  //     Storage ~15-25 MB/min per channel. For 32 channels 24/7 that
+  //     is ~1-1.4 TB/day, i.e. 50-75 days retention on the 78 TB
+  //     volume — well above the 30-day target.
+  //   - The 5 MB/min budget is enforced at DOWNLOAD time by the clip
+  //     renderer (see clipWorker below) which re-encodes only the
+  //     user's selected time range, only when they click download.
   //
-  // slugForced / cachedCodec were used by the old copy-vs-transcode
-  // gate. Kept the map warm so codec-probe (which runs at spawn time
-  // for future switching) still runs — but we always transcode now.
+  // Codec probe still runs so we can switch to transcode later per
+  // slug if a source turns out to be non-h264 (kept warm on purpose).
   void slugForced;
   void (channelCodec.get(slug));
-  // preset ultrafast (was veryfast). At 640x360 the visual gap between
-  // ultrafast and veryfast is barely detectable for archive playback,
-  // but per-encoder CPU roughly halves. With 30 concurrent recorders
-  // this is the difference between the server having comfortable
-  // headroom and Windows firing "close programs" low-memory warnings
-  // when all recordings are ON simultaneously.
-  // scaler kept at lanczos (only ~2% cost at 360p) so text stays readable.
-  const videoArgs = [
-    '-vf', 'yadif=0:-1:0,scale=640:360:force_original_aspect_ratio=decrease:flags=lanczos,pad=640:360:(ow-iw)/2:(oh-ih)/2',
-    '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
-    '-profile:v', 'main', '-pix_fmt', 'yuv420p',
-    '-threads', '2',
-    '-b:v', '500k', '-maxrate', '700k', '-bufsize', '1400k',
-    '-force_key_frames', `expr:gte(t,n_forced*${SEG_SECONDS})`,
-  ];
+  const videoArgs = ['-c:v', 'copy'];
 
   const args = [
     '-hide_banner', '-loglevel', 'warning', '-nostdin',
@@ -245,11 +235,9 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
     '-i', input,
     '-map', '0:v:0', '-map', '0:a?', '-dn', '-sn',
     ...videoArgs,
-    // AAC 64k stereo — half the previous 128k rate. Still clean
-    // speech + music at 64k for archive playback and keeps us inside
-    // the 5 MB/min ceiling (500 kbps video + 64 kbps audio + overhead
-    // ≈ 4.35 MB/min).
-    '-c:a', 'aac', '-b:a', '64k', '-ac', '2', '-ar', '48000',
+    // Audio kept as -c copy too. Downloads re-encode to AAC anyway,
+    // and every player we care about handles MP2/AAC natively in mp4.
+    '-c:a', 'copy',
     '-f', 'segment',
     '-segment_time', String(SEG_SECONDS),
     '-segment_format', 'mp4',
@@ -611,7 +599,10 @@ async function clipWorker(job: { clipId: string }) {
       '-map', '[outv]',
       '-map', '0:a:0?', '-map', '1:a:0',
       '-shortest',
+      // Hard cap instantaneous bitrate so a high-motion 60s clip does
+      // not blow past 5 MB — CBR-ish behaviour via VBV constraint.
       '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', V_BITRATE,
+      '-maxrate', '700k', '-bufsize', '1400k',
       '-c:a', 'aac', '-b:a', A_BITRATE, '-ac', '2', '-ar', '48000',
       ...(isMovLike ? ['-movflags', '+faststart'] : []),
       '-y', mainPath,

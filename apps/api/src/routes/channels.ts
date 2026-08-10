@@ -155,7 +155,7 @@ const routes: FastifyPluginAsync = async (app) => {
     if (!primary) return reply.code(503).send({ error: 'no source configured for this channel' });
 
     let src = primary.url.trim();
-    const isUdpLike = primary.kind === 'UDP' || primary.kind === 'RTP';
+    const isUdpLike = (primary.kind as string) === 'UDP' || (primary.kind as string) === 'RTP';
     if (isUdpLike) {
       if (src.includes('://') && !src.split('://', 2)[1]!.startsWith('@')) {
         const [proto, rest] = src.split('://', 2);

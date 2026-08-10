@@ -2,6 +2,16 @@
 const nextConfig = {
   reactStrictMode: true,
   transpilePackages: ['@cmc/shared'],
+  // Never let a browser (or the port-8080 proxy) hold onto the old HTML
+  // shell after a redeploy. Chunks live under /_next/static and stay
+  // long-cached; only the shell / RSC payloads need to revalidate.
+  async headers() {
+    return [
+      { source: '/:path((?!_next/static/).*)', headers: [
+        { key: 'Cache-Control', value: 'no-store, must-revalidate' },
+      ] },
+    ];
+  },
   async rewrites() {
     // Server-side proxy target — Node 18+ resolves `localhost` to
     // IPv6 (::1) first, but Fastify defaults to IPv4 (0.0.0.0) only,

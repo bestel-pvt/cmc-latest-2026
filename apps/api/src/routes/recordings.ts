@@ -2,7 +2,7 @@ import type { FastifyPluginAsync } from 'fastify';
 import { createReadStream, statSync, writeFileSync, mkdirSync, existsSync, readdirSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { tmpdir } from 'node:os';
+import os, { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const routes: FastifyPluginAsync = async (app) => {
@@ -197,6 +197,26 @@ const routes: FastifyPluginAsync = async (app) => {
 
   const buildLocks = new Map<string, Promise<string | null>>();
 
+  // Semaphore: cap concurrent download-transcodes so the API stays
+  // responsive to /hls/ + /sessions polls while a fleet of users
+  // clicks Download. Beyond this, requests wait their turn (client
+  // sees a longer "preparing" spinner but the page keeps loading).
+  // 2 is the sweet spot on a 56-core box: two ultrafast 640x360
+  // encoders occupy ~2 cores, leaving the other 54 for wall
+  // encoders + Node + kernel.
+  const DL_MAX_CONCURRENT = 2;
+  let dlInFlight = 0;
+  const dlQueue: Array<() => void> = [];
+  const dlAcquire = () => new Promise<void>((res) => {
+    if (dlInFlight < DL_MAX_CONCURRENT) { dlInFlight++; return res(); }
+    dlQueue.push(() => { dlInFlight++; res(); });
+  });
+  const dlRelease = () => {
+    dlInFlight--;
+    const next = dlQueue.shift();
+    if (next) next();
+  };
+
   /** Quick "does this MP4 have a readable moov atom" probe. Recorder
    * kills / crashes leave zero-length or moov-less files; the concat
    * demuxer stops dead on those, so we skip them.
@@ -272,25 +292,40 @@ const routes: FastifyPluginAsync = async (app) => {
       // ultrafast preset — downloads are on-demand + serialised by
       // buildLocks, so CPU cost per download is one-shot, not
       // sustained. Users see a few-second render before download.
-      await new Promise<void>((resolve, reject) => {
-        const ff = spawn('ffmpeg', [
-          '-hide_banner', '-loglevel', 'error', '-y',
-          '-err_detect', 'ignore_err',
-          '-fflags', '+genpts+discardcorrupt',
-          '-f', 'concat', '-safe', '0', '-i', listPath,
-          '-vf', 'yadif=0:-1:0,scale=640:360:force_original_aspect_ratio=decrease:flags=lanczos,pad=640:360:(ow-iw)/2:(oh-ih)/2',
-          '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
-          '-profile:v', 'main', '-pix_fmt', 'yuv420p',
-          '-b:v', '500k', '-maxrate', '700k', '-bufsize', '1400k',
-          '-c:a', 'aac', '-b:a', '64k', '-ac', '2', '-ar', '48000',
-          '-movflags', '+faststart',
-          outPath,
-        ], { stdio: ['ignore', 'pipe', 'pipe'] });
-        let tail = '';
-        ff.stderr.on('data', (b) => { tail += b.toString(); });
-        ff.on('exit', (code) => code === 0 ? resolve() : reject(new Error(`ffmpeg exit ${code}: ${tail.slice(-300)}`)));
-        ff.on('error', reject);
-      });
+      // Semaphore acquire — cap concurrent transcodes so the API stays
+      // responsive during downloads. Also drop ffmpeg process priority
+      // BELOW_NORMAL so Windows scheduler always favours Node + kernel
+      // + wall serving over the background encode.
+      await dlAcquire();
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const ff = spawn('ffmpeg', [
+            '-hide_banner', '-loglevel', 'error', '-y',
+            '-err_detect', 'ignore_err',
+            '-fflags', '+genpts+discardcorrupt',
+            '-f', 'concat', '-safe', '0', '-i', listPath,
+            '-vf', 'yadif=0:-1:0,scale=640:360:force_original_aspect_ratio=decrease:flags=lanczos,pad=640:360:(ow-iw)/2:(oh-ih)/2',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
+            '-profile:v', 'main', '-pix_fmt', 'yuv420p',
+            '-threads', '2',
+            '-b:v', '500k', '-maxrate', '700k', '-bufsize', '1400k',
+            '-c:a', 'aac', '-b:a', '64k', '-ac', '2', '-ar', '48000',
+            '-movflags', '+faststart',
+            outPath,
+          ], { stdio: 'ignore' });
+          if (ff.pid) {
+            try { os.setPriority(ff.pid, os.constants.priority.PRIORITY_BELOW_NORMAL); } catch { /* best-effort */ }
+          }
+          ff.on('exit', (code) => code === 0 ? resolve() : reject(new Error(`ffmpeg exit ${code}`)));
+          ff.on('error', reject);
+        });
+      } finally {
+        dlRelease();
+      }
+      // Belt-and-braces: ffmpeg exit-code 0 but empty output = broken input list
+      if (!existsSync(outPath) || statSync(outPath).size < 1024) {
+        throw new Error('ffmpeg produced empty output');
+      }
       return outPath;
     })().finally(() => setTimeout(() => buildLocks.delete(key), 1000));
 

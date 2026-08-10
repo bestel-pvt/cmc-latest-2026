@@ -771,39 +771,12 @@ async function main() {
     }
   }, 30_000);
 
-  // Memory-hog watchdog. Reactive per-encoder recycle if a single
-  // ffmpeg leaks past 250 MB. Only fires when a leak actually happens;
-  // healthy 24/7 encoders are untouched. spawnAndWatch's exit handler
-  // respawns automatically. Same design as live-hls's watchdog.
-  setInterval(() => {
-    const MEMORY_KILL_MB = 250;
-    const wmic = spawn('wmic', ['process', 'where', "name='ffmpeg.exe'", 'get', 'ProcessId,WorkingSetSize', '/format:csv'],
-      { stdio: ['ignore', 'pipe', 'ignore'] });
-    let out = '';
-    wmic.stdout.on('data', (b) => { out += b.toString(); });
-    wmic.on('exit', () => {
-      const wsByPid = new Map<number, number>();
-      for (const line of out.split(/\r?\n/)) {
-        const parts = line.split(',');
-        if (parts.length < 3) continue;
-        const pid = Number(parts[1]);
-        const ws = Number(parts[2]);
-        if (!isNaN(pid) && !isNaN(ws)) wsByPid.set(pid, ws);
-      }
-      for (const sup of supervisors.values()) {
-        const pid = sup.proc?.pid;
-        if (!pid) continue;
-        const ws = wsByPid.get(pid);
-        if (!ws) continue;
-        const mb = Math.round(ws / 1024 / 1024);
-        if (mb > MEMORY_KILL_MB) {
-          log.warn({ slug: sup.slug, pid, mb }, `recording ffmpeg over ${MEMORY_KILL_MB} MB — recycling`);
-          try { sup.proc?.kill('SIGKILL'); } catch { /* noop */ }
-        }
-      }
-    });
-    wmic.on('error', () => { /* wmic missing — skip */ });
-  }, 60_000);
+  // NOTE: wmic-based memory watchdog removed. Two parallel wmic scans
+  // (live-hls + recording) under load overloaded the box past the
+  // point of RDP/SSH responsiveness. Memory-leak mitigation now
+  // relies on smaller input buffers alone (fifo_size 4M, thread_queue
+  // 128, max_muxing_queue 1024). If leak still recurs, revisit with a
+  // proper Node-side approach (querying handle table directly).
 
   // Periodically walk EVERY hour dir under EVERY channel and ingest any
   // .mp4 that isn't marked .recorded.

@@ -577,11 +577,12 @@ async function main(): Promise<void> {
   setInterval(() => {
     try { checkStuckFFmpegs(); } catch (err) { log.warn({ err }, 'stuck-check failed'); }
   }, 15_000);
-  // Memory watchdog: recycle any single ffmpeg that leaks past 250 MB.
-  // Runs every 60 s — cheap; wmic call takes ~50 ms.
-  setInterval(() => {
-    checkFatFFmpegs().catch((err) => log.warn({ err }, 'fat-check failed'));
-  }, 60_000);
+  // NOTE: previous version had a wmic-based fat-check every 60 s to
+  // recycle ffmpegs > 250 MB. Removed because two parallel wmic scans
+  // (live-hls + recording) under load spawned wmiprvse.exe pileups
+  // that overloaded the box to the point of unreachable RDP/SSH.
+  // Memory leak mitigation now relies on smaller input buffers alone.
+  void checkFatFFmpegs;    // keep the function around for later manual invocation if needed
   // Keep the event loop alive.
   process.stdin.resume();
 }

@@ -103,7 +103,7 @@ function channelOutDir(channelId: string, when: Date = new Date()): string {
 // every segment boundary — one keyframe per 60 s guaranteed.
 const RECORDING_TRANSCODE_SLUGS = new Set(
   (process.env.RECORDING_TRANSCODE_SLUGS ??
-    'cnn,365-news,gtv-news,samaa-news')
+    'cnn,365-news,gtv-news,samaa-news,92-news,bol-news,aik-news,ary-news')
     .split(',').map((s) => s.trim()).filter(Boolean),
 );
 
@@ -200,29 +200,42 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
     channelCodec.set(slug, codec);
     log.info({ slug, codec }, 'source codec detected');
   }
-  // RECORDING = -c copy (remux only, ZERO encoder CPU).
+  // RECORDING mode selection:
   //
-  // Prior design transcoded every source to 640x360 @ 500k so each
-  // 60s segment fit under the 5 MB/min user budget. Downside: 30
-  // concurrent libx264 encoders + the wall encoders saturated CPU
-  // + kernel scheduler, dragging LAN ping to 1000-2400 ms and
-  // triggering Windows "low on memory" toasts. Server unusable.
+  //  * Default = -c copy (remux only, ZERO encoder CPU). Storage is
+  //    ~3-5 MB/min per channel at native source bitrate; 5 MB/min
+  //    download budget is enforced at DOWNLOAD time by clipWorker.
   //
-  // New split:
-  //   - Recording writes native-bitrate mp4 segments at the source's
-  //     own resolution + codec (h264/aac remux, no re-encode).
-  //     Storage ~15-25 MB/min per channel. For 32 channels 24/7 that
-  //     is ~1-1.4 TB/day, i.e. 50-75 days retention on the 78 TB
-  //     volume — well above the 30-day target.
-  //   - The 5 MB/min budget is enforced at DOWNLOAD time by the clip
-  //     renderer (see clipWorker below) which re-encodes only the
-  //     user's selected time range, only when they click download.
-  //
-  // Codec probe still runs so we can switch to transcode later per
-  // slug if a source turns out to be non-h264 (kept warm on purpose).
-  void slugForced;
-  void (channelCodec.get(slug));
-  const videoArgs = ['-c:v', 'copy'];
+  //  * Slugs in RECORDING_TRANSCODE_SLUGS = transcode-on-ingest.
+  //    Needed for sources whose GOP (keyframe interval) is longer
+  //    than SEG_SECONDS. With -c copy, ffmpeg's segmenter can only
+  //    cut on keyframes: a 90-180 s GOP means segments start on
+  //    non-keyframes and are un-decodable for the first N seconds,
+  //    or contain no video at all — user sees "stalled" recordings.
+  //    Transcoding with -force_key_frames gives us clean 60-s cuts.
+  //    Cost: ~50-100% of one core per stream; only a handful of
+  //    slugs need this so total added CPU stays well within budget.
+  const codec = channelCodec.get(slug);
+  const needsTranscode = slugForced || (codec !== undefined && codec !== 'h264');
+  // Transcode branch: match the download budget directly (640x360 @
+  // 500k+64k). Two benefits:
+  //   1. Per-encoder CPU is lowest at this resolution
+  //   2. Downloads of these slugs can skip re-encode (concat -c copy
+  //      works because segments are already homogeneous 640x360)
+  const videoArgs = needsTranscode
+    ? [
+        '-vf', 'yadif=0:-1:0,scale=640:360:force_original_aspect_ratio=decrease:flags=lanczos,pad=640:360:(ow-iw)/2:(oh-ih)/2',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
+        '-profile:v', 'main', '-pix_fmt', 'yuv420p',
+        '-threads', '2',
+        '-b:v', '500k', '-maxrate', '700k', '-bufsize', '1400k',
+        '-force_key_frames', `expr:gte(t,n_forced*${SEG_SECONDS})`,
+      ]
+    : ['-c:v', 'copy'];
+  const audioArgs = needsTranscode
+    ? ['-c:a', 'aac', '-b:a', '64k', '-ac', '2', '-ar', '48000']
+    : ['-c:a', 'copy'];
+  if (needsTranscode) log.info({ slug, reason: slugForced ? 'forced' : `codec=${codec}` }, 'recording will transcode');
 
   const args = [
     '-hide_banner', '-loglevel', 'warning', '-nostdin',
@@ -235,9 +248,7 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
     '-i', input,
     '-map', '0:v:0', '-map', '0:a?', '-dn', '-sn',
     ...videoArgs,
-    // Audio kept as -c copy too. Downloads re-encode to AAC anyway,
-    // and every player we care about handles MP2/AAC natively in mp4.
-    '-c:a', 'copy',
+    ...audioArgs,
     '-f', 'segment',
     '-segment_time', String(SEG_SECONDS),
     '-segment_format', 'mp4',

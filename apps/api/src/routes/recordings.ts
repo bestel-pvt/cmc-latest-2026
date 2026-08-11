@@ -477,20 +477,30 @@ const routes: FastifyPluginAsync = async (app) => {
     const p = (async () => {
       mkdirSync(outDir, { recursive: true });
       await new Promise<void>((resolve, reject) => {
+        // Was -c copy + h264_mp4toannexb. Broke on transcoded segments
+        // (fMP4 with empty_moov) — SPS/PPS were missing from later
+        // slices → hls.js bufferAppendError → black screen.
+        //
+        // Now re-encode. Ultrafast 640x360 on a 6-s clip is ~150 ms of
+        // CPU, one-shot per segment, cached afterwards. Every slice
+        // gets clean SPS/PPS + a keyframe at position 0, so hls.js
+        // handles them uniformly regardless of source (transcoded
+        // fMP4 or -c copy source-quality mp4). AAC 64k audio matches
+        // what the download endpoint uses.
         const ff = spawn('ffmpeg', [
           '-hide_banner', '-loglevel', 'error', '-y',
+          '-err_detect', 'ignore_err',
+          '-fflags', '+genpts+discardcorrupt',
           '-i', seg.path,
-          '-c', 'copy',
-          '-bsf:v', 'h264_mp4toannexb',
+          '-vf', 'scale=640:360:force_original_aspect_ratio=decrease:flags=lanczos,pad=640:360:(ow-iw)/2:(oh-ih)/2',
+          '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
+          '-profile:v', 'main', '-pix_fmt', 'yuv420p',
+          '-g', '48', '-force_key_frames', 'expr:gte(t,n_forced*2)',
+          '-b:v', '500k', '-maxrate', '700k', '-bufsize', '1400k',
+          '-c:a', 'aac', '-b:a', '64k', '-ac', '2', '-ar', '48000',
           '-f', 'segment',
           '-segment_time', '6',
           '-segment_format', 'mpegts',
-          // -reset_timestamps 1 RESTARTED each sub-slice's PTS at 0,
-          // which made hls.js recompute its timeline every 6 s and
-          // stall around slice 2-3 (the 9-10 s stall the operator
-          // reported), and made audio drift out of sync with video.
-          // 0 preserves the source PTS across slices — hls.js walks
-          // one continuous timeline for the whole 60-s segment.
           '-reset_timestamps', '0',
           '-avoid_negative_ts', 'make_zero',
           '-copyts',

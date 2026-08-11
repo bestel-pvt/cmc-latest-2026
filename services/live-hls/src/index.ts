@@ -112,15 +112,17 @@ function normaliseUrl(url: string, kind: string): string {
     // SO_RCVBUF (8 MB). With 60 concurrent UDP subscribers on one NIC
     // Windows fails NEW binds at ~800 MB total pinned kernel buffer;
     // 60 * 16 MB tips over, 60 * 8 MB fits.
-    // fifo_size dropped from 10 MB to 4 MB (still absorbs 3-5 s of a
-    // 5 Mbps stream), buffer_size 4 MB (kernel). At 60 concurrent
-    // encoders that's 480 MB of pinned buffers up front — the previous
-    // 10 MB per encoder × 60 = 1.08 GB baseline was contributing to
-    // the OOM state we hit after 3 h.
-    if (!u.includes('fifo_size='))         params.push('fifo_size=4000000');
+    // fifo_size 8 MB, buffer_size 8 MB — restored after 4 MB starved
+    // transcoded encoders during real IGMP hiccups (8 wall channels
+    // went stuck within 20 min: 365/aaj/capital/dawn/express/geo/hum/neo,
+    // all libx264). Middle ground between the original 10 MB (leaky
+    // over 3 h at high fleet count) and 4 MB (too small for real
+    // bursts). 60 encoders * 8 MB = 480 MB pinned baseline; still
+    // comfortable within 64 GB.
+    if (!u.includes('fifo_size='))         params.push('fifo_size=8000000');
     if (!u.includes('overrun_nonfatal='))  params.push('overrun_nonfatal=1');
     if (!u.includes('timeout='))           params.push('timeout=60000000');
-    if (!u.includes('buffer_size='))       params.push('buffer_size=4194304');
+    if (!u.includes('buffer_size='))       params.push('buffer_size=8388608');
     if (!u.includes('reuse='))             params.push('reuse=1');
     if (LOCALADDR && !u.toLowerCase().includes('localaddr=')) {
       params.push(`localaddr=${LOCALADDR}`);
@@ -169,10 +171,11 @@ function ffArgs(url: string, kind: string, outDir: string, transcodeVideo: boole
     // reconnect, driver interrupt storm) can back-pressure onto the
     // demuxer and cause it to bail. 1024 packets buffer roughly 1-2 s
     // of TS which absorbs those hiccups without visible glitch.
-    // -thread_queue_size default is 8; bump only modestly. 1024 was
-    // over-provisioned and let internal queues grow to hundreds of MB
-    // over multi-hour runs.
-    '-thread_queue_size', '128',
+    // thread_queue 512 — 128 starved transcoded encoders under real
+    // IGMP hiccups (20-min stuck-storm on 8 wall x264 channels). 1024
+    // was over-provisioned. 512 = ~1 s of a 5 Mbps stream = enough
+    // to ride typical bursts without holding hundreds of MB per encoder.
+    '-thread_queue_size', '512',
     '-f', 'mpegts',
     '-i', normaliseUrl(url, kind),
     '-map', '0:v:0',

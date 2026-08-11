@@ -120,7 +120,7 @@ function probeVideoCodec(sourceUrl: string, kind: string): string | null {
       input = `${proto!.toLowerCase()}://@${rest}`;
     }
     const localaddr = process.env.RECORDING_LOCALADDR ?? process.env.LOCALADDR ?? '';
-    const parts: string[] = ['fifo_size=4000000', 'overrun_nonfatal=1', 'reuse=1'];
+    const parts: string[] = ['fifo_size=8000000', 'overrun_nonfatal=1', 'reuse=1'];
     if (localaddr) parts.push(`localaddr=${localaddr}`);
     input = `${input}${input.includes('?') ? '&' : '?'}${parts.join('&')}`;
   }
@@ -175,10 +175,10 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
     // when total pinned kernel socket buffers across all sockets
     // exceed ~800 MB. 60 sockets × 16 MB tips the limit; 60 × 8 MB
     // fits comfortably.
-    if (!input.includes('fifo_size='))         parts.push('fifo_size=4000000');
+    if (!input.includes('fifo_size='))         parts.push('fifo_size=8000000');
     if (!input.includes('overrun_nonfatal='))  parts.push('overrun_nonfatal=1');
     if (!input.includes('timeout='))           parts.push('timeout=60000000');
-    if (!input.includes('buffer_size='))       parts.push('buffer_size=4194304');
+    if (!input.includes('buffer_size='))       parts.push('buffer_size=8388608');
     if (!input.includes('reuse='))             parts.push('reuse=1');
     if (localaddr && !input.toLowerCase().includes('localaddr=')) {
       parts.push(`localaddr=${localaddr}`);
@@ -249,7 +249,7 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
     '-err_detect', 'ignore_err',
     // Bigger input queue absorbs source hiccups (IGMP renegotiation,
     // NIC-driver interrupt storm) without dropping segments.
-    '-thread_queue_size', '128',
+    '-thread_queue_size', '512',
     ...(kind === 'UDP' || kind === 'RTP' ? ['-f', 'mpegts'] : []),
     '-i', input,
     '-map', '0:v:0', '-map', '0:a?', '-dn', '-sn',

@@ -68,6 +68,13 @@ const FORCE_TRANSCODE_SLUGS = new Set(
   (process.env.LIVE_HLS_FORCE_TRANSCODE ?? '')
     .split(',').map((s) => s.trim()).filter(Boolean),
 );
+// Global override: transcode EVERY channel. Set when source audit
+// (probe-all-sources) shows the majority of sources have MP2 audio /
+// High-profile h264 / non-h264 codec that browsers cannot play as -c copy.
+// Simpler than maintaining a 29-entry slug whitelist and gives a
+// consistent codec/container across every tile which hls.js / MSE
+// handles best.
+const TRANSCODE_ALL = process.env.LIVE_HLS_TRANSCODE_ALL === '1';
 
 interface Sup {
   channelId:      string;
@@ -237,31 +244,42 @@ function ffArgs(url: string, kind: string, outDir: string, transcodeVideo: boole
         // tile displays and blurry on 4K wall (2-4x upscale). 720p at
         // 3 Mbps gives crisp text + faces even after wall scaling.
         // CPU cost: ~1.8x per encoder vs 540p, still well under budget.
-        // Crop-fill: scale until both dims >= 1280x720, then crop
-        // excess. For 16:9 sources this is a no-op (crisp direct
-        // scale). For 4:3 sources (ARY) removes left/right pillar
-        // bars by scaling up + trimming top+bottom.
+        // Data-driven wall encoder config, derived from a full source
+        // audit (probe-all-sources.ps1) of all 30 channels:
+        //   - 19 sources are h264 High profile → MSE bufferAppendError under -c copy
+        //   - 9 sources have MP2 audio → browsers cannot play in HLS
+        //   - 1 source (ary) is MPEG-2 video → completely un-playable in HLS
+        //   - only 1 (BBC) is truly -c copy safe
+        // Conclusion: transcode every channel, produce ONE consistent
+        // container/codec/profile across the wall.
         //
-        // Prior operator feedback: this was "smooth + good CPU". A
-        // brief stretch-mode experiment (scale without aspect
-        // preservation) horizontally squished 4:3 sources AND left
-        // the browser's tile object-fit: cover to crop vertically on
-        // top of that = worse. If Dawn/Express appear cropped it is
-        // the browser tile's object-fit: cover (grid-layout tiles are
-        // near-square, cropping ~180 px off each tile) — not the
-        // encoder. Fix that at the tile-CSS layer, not here.
-        const vf = 'yadif=0:-1:0,scale=1280:720:force_original_aspect_ratio=increase:flags=lanczos,crop=1280:720';
+        // Pure stretch (scale=WxH without aspect preservation) fills
+        // the tile fully:
+        //   - no black bars (unlike pad-fit)
+        //   - no cropping (unlike crop-fill)
+        //   - minor horizontal stretch on the one 4:3 source (ary)
+        //     which is an acceptable trade-off vs pillar bars / lost
+        //     ticker content
+        // 854x480 at 1.5 Mbps ultrafast keeps 30 concurrent encoders
+        // to ~30 cores of the 56-core box, leaving comfortable
+        // headroom for recording + kernel + Node services.
+        // 640x360: wall tiles are 240-500 px wide in the operator's
+        // multiviewer layouts. 360p vs 480p vs 720p is imperceptible
+        // at that tile size. Halving pixel count vs 480p roughly
+        // halves the per-encoder CPU. Measured: 88% system CPU at
+        // 854x480 → too tight; 640x360 fits with 40%+ headroom.
+        const vf = 'yadif=0:-1:0,scale=640:360:flags=lanczos';
         return [
           '-vf', vf,
           '-c:v', 'libx264',
-          '-preset', 'veryfast',
+          '-preset', 'ultrafast',
           '-tune', 'zerolatency',
           '-profile:v', 'main',
           '-pix_fmt', 'yuv420p',
           '-threads', '2',
-          '-b:v',       '3000k',   // 720p at 3 Mbps = broadcast quality
-          '-maxrate',   '3800k',
-          '-bufsize',   '6000k',
+          '-b:v',       '1000k',
+          '-maxrate',   '1300k',
+          '-bufsize',   '2600k',
           '-force_key_frames', `expr:gte(t,n_forced*${HLS_SEGMENT_TIME})`,
         ];
       })()
@@ -322,7 +340,11 @@ function launch(sup: Sup): void {
   //      Non-h264 sources can't be `-c copy`'d for browser HLS
   //      (Chrome/Edge don't decode MPEG-2 / HEVC inside HLS).
   if (sup.videoCodec === undefined) {
-    if (FORCE_TRANSCODE_SLUGS.has(sup.slug)) {
+    if (TRANSCODE_ALL) {
+      sup.videoCodec = 'forced-all';
+      sup.forceTranscode = true;
+      // codec probe skipped when TRANSCODE_ALL — no-op logs kept quiet
+    } else if (FORCE_TRANSCODE_SLUGS.has(sup.slug)) {
       sup.videoCodec = 'forced';
       sup.forceTranscode = true;
       log.info({ slug: sup.slug }, 'slug in LIVE_HLS_FORCE_TRANSCODE - transcoding');

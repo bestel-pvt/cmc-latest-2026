@@ -408,7 +408,12 @@ function checkStuckFFmpegs(): void {
   //     30 channels roughly every 3-5 h.
   // New logic: FRESH SEGMENTS = ALIVE. If any seg_*.ts was written
   // in the last 30 s, the stream is fine regardless of m3u8 state.
-  const STALE_MS = 180_000;
+  // STALE_MS lowered 180 -> 90 so intermittent source drops
+  // (dawn/express/aaj/ary style) get killed + respawned in ~90s
+  // instead of ~3 min. Combined with the client's 30s freeze
+  // watchdog rebuilding the hls instance, operator perception of
+  // a stuck tile is now ~30 s max, not minutes.
+  const STALE_MS = 90_000;
   const RUNWAY_MS = 120_000;        // was 60 000; slow-KF sources need more
   const RECENT_SEG_MS = 30_000;
 

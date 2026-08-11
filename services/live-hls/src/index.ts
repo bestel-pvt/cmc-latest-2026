@@ -234,12 +234,19 @@ function ffArgs(url: string, kind: string, outDir: string, transcodeVideo: boole
         // tile displays and blurry on 4K wall (2-4x upscale). 720p at
         // 3 Mbps gives crisp text + faces even after wall scaling.
         // CPU cost: ~1.8x per encoder vs 540p, still well under budget.
-        // Fill mode (was pad-fit before). increase+crop scales the
-        // source until BOTH dims are >=target then crops the excess.
-        // For 16:9 sources this is a no-op. For 4:3 sources (Aaj/ARY)
-        // it removes the left/right black pillar bars by scaling up and
-        // trimming top+bottom instead. Ticker content is typically in
-        // the bottom-center so a small crop there is invisible.
+        // Crop-fill: scale until both dims >= 1280x720, then crop
+        // excess. For 16:9 sources this is a no-op (crisp direct
+        // scale). For 4:3 sources (ARY) removes left/right pillar
+        // bars by scaling up + trimming top+bottom.
+        //
+        // Prior operator feedback: this was "smooth + good CPU". A
+        // brief stretch-mode experiment (scale without aspect
+        // preservation) horizontally squished 4:3 sources AND left
+        // the browser's tile object-fit: cover to crop vertically on
+        // top of that = worse. If Dawn/Express appear cropped it is
+        // the browser tile's object-fit: cover (grid-layout tiles are
+        // near-square, cropping ~180 px off each tile) — not the
+        // encoder. Fix that at the tile-CSS layer, not here.
         const vf = 'yadif=0:-1:0,scale=1280:720:force_original_aspect_ratio=increase:flags=lanczos,crop=1280:720';
         return [
           '-vf', vf,

@@ -222,6 +222,12 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
   //   1. Per-encoder CPU is lowest at this resolution
   //   2. Downloads of these slugs can skip re-encode (concat -c copy
   //      works because segments are already homogeneous 640x360)
+  // Keyframe every 2 s (not every SEG_SECONDS=60). The clip editor's
+  // /session.m3u8 endpoint slices each 60-s file into ~10 sub-slices
+  // of 6 s each using `-c copy` — that only works if a keyframe
+  // lands at every slice boundary. With one keyframe per 60 s only
+  // the first slice of each segment was decodable, all subsequent
+  // slices started on a P-frame → hls.js gave up → black screen.
   const videoArgs = needsTranscode
     ? [
         '-vf', 'yadif=0:-1:0,scale=640:360:force_original_aspect_ratio=decrease:flags=lanczos,pad=640:360:(ow-iw)/2:(oh-ih)/2',
@@ -229,7 +235,7 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
         '-profile:v', 'main', '-pix_fmt', 'yuv420p',
         '-threads', '2',
         '-b:v', '500k', '-maxrate', '700k', '-bufsize', '1400k',
-        '-force_key_frames', `expr:gte(t,n_forced*${SEG_SECONDS})`,
+        '-force_key_frames', 'expr:gte(t,n_forced*2)',
       ]
     : ['-c:v', 'copy'];
   const audioArgs = needsTranscode

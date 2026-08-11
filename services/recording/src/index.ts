@@ -468,10 +468,18 @@ async function refreshSupervisors() {
       sup.proc = p;
       p.on('exit', (code) => {
         if (sup._stopped) return;
-        log.warn({ slug: c.slug, code }, 'recorder ffmpeg exited');
+        log.warn({ slug: c.slug, code, restarts: sup.restarts }, 'recorder ffmpeg exited');
         const now = Date.now();
         sup.restarts = now - sup.lastRestartAt > 30_000 ? 0 : sup.restarts + 1;
-        const delay = Math.min(30_000, 500 * 2 ** sup.restarts);
+        // Chronic-offender cooldown: when the upstream source dies
+        // (satellite decoder off, provider outage), every channel's
+        // ffmpeg starts exiting near-immediately. Without a hard cap
+        // this spawns tens of ffmpegs per channel in a short window
+        // (observed: 155 concurrent when source dropped for ~15 min).
+        // >20 restarts = source is down, wait 5 min between attempts.
+        const delay = sup.restarts > 20
+          ? 300_000
+          : Math.min(30_000, 500 * 2 ** Math.min(sup.restarts, 5));
         setTimeout(() => {
           if (sup._stopped) return;
           try { spawnAndWatch(); }

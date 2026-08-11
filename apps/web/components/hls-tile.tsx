@@ -211,7 +211,41 @@ export function HlsTile({
 
     hlsRef.current = build();
 
+    // Freeze watchdog: if video.currentTime hasn't advanced in 30 s,
+    // hls.js is silently stuck. Server keeps producing fresh segments
+    // but hls.js sometimes buffers a bad chunk without firing a fatal
+    // event -> tile just freezes with no error. Rebuild the instance;
+    // one blink and it recovers. Runs every 10 s.
+    let lastAdvanceAt = Date.now();
+    let lastCurrentTime = 0;
+    const freezeCheck = setInterval(() => {
+      const v = videoRef.current;
+      if (!v) return;
+      const t = v.currentTime;
+      if (t > lastCurrentTime + 0.1) {
+        lastCurrentTime = t;
+        lastAdvanceAt = Date.now();
+        return;
+      }
+      // Paused (user or autoplay-blocked) counts as legitimately not
+      // advancing — try play() but do not tear down.
+      if (v.paused) {
+        v.play().catch(() => {});
+        return;
+      }
+      // Playing but stuck. Give it 30 s of grace before rebuild.
+      if (Date.now() - lastAdvanceAt < 30_000) return;
+      const inst = hlsRef.current;
+      if (!inst) return;
+      // Silent, quick rebuild — same code the fatal-error path uses.
+      inst.destroy();
+      hlsRef.current = build();
+      lastAdvanceAt = Date.now();
+      lastCurrentTime = 0;
+    }, 10_000);
+
     return () => {
+      clearInterval(freezeCheck);
       if (rebuildTimer) clearTimeout(rebuildTimer);
       if (playRetryTimer) clearTimeout(playRetryTimer);
       hlsRef.current?.destroy();

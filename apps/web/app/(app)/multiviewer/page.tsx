@@ -153,15 +153,23 @@ export default function MultiviewerPage() {
   const [saveDialogOpen, setSaveDialogOpen] = useState(false);
   const [templateName, setTemplateName] = useState('');
   const [isFullscreen, setIsFullscreen] = useState(false);
-  /** Slot index whose audio is currently ON, or null if all muted.
+  /** Channel SLUG whose audio is currently ON, or null if all muted.
    * Enforces "only one channel makes noise at a time" — clicking a
    * different tile's volume icon switches audio to that tile and
-   * mutes the previous. */
-  const [audioSlotIdx, setAudioSlotIdx] = useState<number | null>(null);
+   * mutes the previous.
+   *
+   * Slug-based (not slot-based). Reason: the tile's 220ms
+   * single-vs-double-click delay + freeze-watchdog rebuilds + layout
+   * changes could all cause re-renders between click and callback,
+   * making a slot INDEX resolve to a different channel by the time
+   * the callback fires. Tracking by slug means whichever tile the
+   * user actually clicked keeps its audio, no matter what re-renders
+   * happen in between. */
+  const [audioSlug, setAudioSlug] = useState<string | null>(null);
   /** Snapshot of layout+assignments taken when the operator double-clicks
    * a tile to solo it. `null` = not in solo mode. Esc restores from this. */
   const [soloRestore, setSoloRestore] = useState<
-    { layoutId: Layout['id']; assignments: Record<string, string>; audioSlotIdx: number | null } | null
+    { layoutId: Layout['id']; assignments: Record<string, string>; audioSlug: string | null } | null
   >(null);
   const wallRef = useRef<HTMLDivElement | null>(null);
 
@@ -197,12 +205,14 @@ export default function MultiviewerPage() {
       else delete next[String(idx)];
       return next;
     });
-    // If we just cleared the slot that had audio on, kill audio too.
-    if (!slug) setAudioSlotIdx((cur) => (cur === idx ? null : cur));
+    // Nothing to do for audio on assignSlot — audio is tracked by
+    // slug, so if the removed channel had audio it will naturally
+    // stop when no visible tile matches audioSlug.
   }, []);
 
-  const toggleAudio = useCallback((idx: number) => {
-    setAudioSlotIdx((cur) => (cur === idx ? null : idx));
+  const toggleAudio = useCallback((slug: string | null) => {
+    if (!slug) return;
+    setAudioSlug((cur) => (cur === slug ? null : slug));
   }, []);
 
   const applyTemplate = useCallback((t: Template) => {
@@ -241,15 +251,15 @@ export default function MultiviewerPage() {
     setSoloRestore((prev) => prev ?? {
       layoutId,
       assignments: { ...assignments },
-      audioSlotIdx,
+      audioSlug,
     });
     setLayoutId('single');
     setAssignments({ '0': slug });
     // Solo audio ON by default — operator dove into this channel to
     // listen to it. If they had another channel's audio on, that's
     // preserved in the restore snapshot.
-    setAudioSlotIdx(0);
-  }, [layoutId, assignments, audioSlotIdx]);
+    setAudioSlug(slug);
+  }, [layoutId, assignments, audioSlug]);
 
   /** Restore the pre-solo layout snapshot. */
   const exitSolo = useCallback(() => {
@@ -257,7 +267,7 @@ export default function MultiviewerPage() {
       if (!snap) return null;
       setLayoutId(snap.layoutId);
       setAssignments(snap.assignments);
-      setAudioSlotIdx(snap.audioSlotIdx);
+      setAudioSlug(snap.audioSlug);
       return null;
     });
   }, []);
@@ -349,19 +359,17 @@ export default function MultiviewerPage() {
         </Button>
 
         <div className="ml-auto flex items-center gap-2">
-          {audioSlotIdx !== null ? (
+          {audioSlug !== null ? (
             <div
               className="flex items-center gap-1.5 rounded-md bg-accent-orange/10 text-accent-orange ring-1 ring-accent-orange/40 px-2 py-1 text-xs font-medium"
               title="Currently playing audio — click the tile's speaker icon (or the X here) to mute"
             >
               <Volume2 className="h-3.5 w-3.5" />
               <span className="max-w-[10rem] truncate">
-                {channelBySlug.get(assignments[String(audioSlotIdx)] ?? '')?.name
-                  ?? assignments[String(audioSlotIdx)]
-                  ?? 'Audio'}
+                {channelBySlug.get(audioSlug)?.name ?? audioSlug}
               </span>
               <button
-                onClick={() => setAudioSlotIdx(null)}
+                onClick={() => setAudioSlug(null)}
                 className="ml-1 rounded p-0.5 hover:bg-accent-orange/20"
                 title="Mute all"
               >
@@ -417,8 +425,8 @@ export default function MultiviewerPage() {
                   slug={slug}
                   channelName={ch?.name}
                   logoUrl={ch?.logoUrl ?? undefined}
-                  audioActive={audioSlotIdx === idx}
-                  onToggleAudio={() => toggleAudio(idx)}
+                  audioActive={!!slug && audioSlug === slug}
+                  onToggleAudio={() => toggleAudio(slug)}
                   onClear={() => assignSlot(idx, null)}
                   onPick={() => setPickerSlotIdx(idx)}
                   onDoubleClick={slug ? () => enterSolo(slug) : undefined}

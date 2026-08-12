@@ -75,6 +75,13 @@ export function HlsTile({
    *
    * Cleared on unmount to avoid firing on a torn-down tile. */
   const clickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Keep the latest onToggleAudio in a ref so the 220ms delayed
+  // single-click callback always resolves to the CURRENT prop closure,
+  // not whatever was captured when the click first fired. Without this
+  // a re-render inside the click delay could make the callback act on
+  // a stale slug — the operator sees "clicked tile X, audio went to Y".
+  const onToggleAudioRef = useRef(onToggleAudio);
+  useEffect(() => { onToggleAudioRef.current = onToggleAudio; }, [onToggleAudio]);
   useEffect(() => () => {
     if (clickTimerRef.current) clearTimeout(clickTimerRef.current);
   }, []);
@@ -84,7 +91,7 @@ export function HlsTile({
     if (clickTimerRef.current) return;   // already waiting for a possible double
     clickTimerRef.current = setTimeout(() => {
       clickTimerRef.current = null;
-      onToggleAudio();
+      onToggleAudioRef.current();
     }, 220);
   }
   function handleTileDoubleClick(): void {

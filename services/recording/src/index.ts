@@ -250,9 +250,14 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
     // Bigger input queue absorbs source hiccups (IGMP renegotiation,
     // NIC-driver interrupt storm) without dropping segments.
     '-thread_queue_size', '512',
+    // VLC-tolerant probing — match live-hls. Slow-PMT sources
+    // (abb-tak, k21) need 10s before video PID appears.
+    '-analyzeduration', '10000000',
+    '-probesize', '10000000',
     ...(kind === 'UDP' || kind === 'RTP' ? ['-f', 'mpegts'] : []),
     '-i', input,
-    '-map', '0:v:0', '-map', '0:a?', '-dn', '-sn',
+    // Optional video map — audio-only bursts don't crash the recorder.
+    '-map', '0:v:0?', '-map', '0:a?', '-dn', '-sn',
     ...videoArgs,
     ...audioArgs,
     '-f', 'segment',

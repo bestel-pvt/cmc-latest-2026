@@ -193,9 +193,21 @@ function ffArgs(url: string, kind: string, outDir: string, transcodeVideo: boole
     // stall storms during normal IGMP hiccups. Memory ceiling
     // enforced by age-based recycle instead.
     '-thread_queue_size', '512',
+    // VLC-tolerant probing. Default analyzeduration=5000000 (5s) +
+    // probesize=5000000 (5MB). Some Pakistani sources (abb-tak, k21)
+    // send video PAT/PMT slowly after IGMP join — ffmpeg gives up
+    // before it sees the video stream and starts producing HLS with
+    // audio only, or dies with 'no video stream'. VLC waits ~10s and
+    // finds them. Matching that behaviour.
+    '-analyzeduration', '10000000',
+    '-probesize', '10000000',
     '-f', 'mpegts',
     '-i', normaliseUrl(url, kind),
-    '-map', '0:v:0',
+    // '?' makes video map optional so an audio-only source still
+    // produces an HLS playlist (silent video slot; browser will show
+    // black + audio). Was mandatory before → any source whose video
+    // dropped for a moment killed the whole encoder.
+    '-map', '0:v:0?',
     '-map', '0:a:0?',
     // Explicitly strip subtitle + data streams (SCTE-35 splice cues,
     // teletext, PSI-P tables). CNN specifically carries these and the

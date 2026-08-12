@@ -122,17 +122,16 @@ function normaliseUrl(url: string, kind: string): string {
     // fifo_size 8 MB, buffer_size 8 MB — restored after 4 MB starved
     // transcoded encoders during real IGMP hiccups (8 wall channels
     // went stuck within 20 min: 365/aaj/capital/dawn/express/geo/hum/neo,
-    // fifo_size 2 MB (was 8 MB). Snapshot showed each ffmpeg process
-    // committing ~1.6 GB Private memory after 36 min — most of that
-    // is the internal packet queue that ffmpeg keeps EXPANDING when
-    // source timing jitters. Smaller fifo caps the growth ceiling.
-    // buffer_size 4 MB (was 8 MB) — kernel SO_RCVBUF. Same reason:
-    // absorb realistic bursts (5 Mbps stream ~ 1 s of buffer) without
-    // giving Windows kernel unbounded room to allocate on our behalf.
-    if (!u.includes('fifo_size='))         params.push('fifo_size=2000000');
+    // Buffers restored to the previously-stable 8 MB values. The
+    // shorter 2 MB / 4 MB experiment reduced Private memory but
+    // caused streams to stutter under normal IGMP jitter (operator
+    // observation). Memory ceiling now enforced by the age-based
+    // ffmpeg recycle (see recycleAgedFFmpegs) instead of by
+    // starving the input buffer.
+    if (!u.includes('fifo_size='))         params.push('fifo_size=8000000');
     if (!u.includes('overrun_nonfatal='))  params.push('overrun_nonfatal=1');
     if (!u.includes('timeout='))           params.push('timeout=60000000');
-    if (!u.includes('buffer_size='))       params.push('buffer_size=4194304');
+    if (!u.includes('buffer_size='))       params.push('buffer_size=8388608');
     if (!u.includes('reuse='))             params.push('reuse=1');
     if (LOCALADDR && !u.toLowerCase().includes('localaddr=')) {
       params.push(`localaddr=${LOCALADDR}`);
@@ -174,12 +173,12 @@ function ffArgs(url: string, kind: string, outDir: string, transcodeVideo: boole
     '-hide_banner',
     '-nostdin',
     '-loglevel', 'warning',
-    // Dropped +igndts. That flag makes ffmpeg reconstruct EVERY
-    // packet's timing from scratch, which requires keeping input
-    // packets in memory until they can be re-timed — contributed
-    // heavily to the 1.6 GB/process memory growth. discardcorrupt
-    // + genpts is enough for the sources we handle.
-    '-fflags', '+discardcorrupt+genpts',
+    // Kept +igndts back. Removing it caused streams to stall on the
+    // handful of sources whose DTS drifts occasionally (Pakistani
+    // interlaced 1080i50 with ad breaks). Memory ceiling now enforced
+    // by age-based recycle (recycleAgedFFmpegs) instead of by
+    // starving demux options.
+    '-fflags', '+discardcorrupt+igndts+genpts',
     '-err_detect', 'ignore_err',
     // Bigger input queue between demuxer and encoder/muxer. Default is
     // 8 packets; brief source stalls (IGMP renegotiation, wall PC
@@ -190,12 +189,10 @@ function ffArgs(url: string, kind: string, outDir: string, transcodeVideo: boole
     // IGMP hiccups (20-min stuck-storm on 8 wall x264 channels). 1024
     // was over-provisioned. 512 = ~1 s of a 5 Mbps stream = enough
     // to ride typical bursts without holding hundreds of MB per encoder.
-    // thread_queue 256 (was 512). Actual IGMP-hiccup bursts on this
-    // wire are 1-2 s at most; 256 packets ≈ 1 s of a 5 Mbps stream.
-    // Higher was contributing to committed memory without a real
-    // stability benefit — the stall-storm was the SOURCE dropping,
-    // no queue would have saved that.
-    '-thread_queue_size', '256',
+    // thread_queue 512 — proven stable value. Lower values caused
+    // stall storms during normal IGMP hiccups. Memory ceiling
+    // enforced by age-based recycle instead.
+    '-thread_queue_size', '512',
     '-f', 'mpegts',
     '-i', normaliseUrl(url, kind),
     '-map', '0:v:0',

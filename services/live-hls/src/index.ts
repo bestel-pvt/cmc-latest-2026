@@ -122,14 +122,17 @@ function normaliseUrl(url: string, kind: string): string {
     // fifo_size 8 MB, buffer_size 8 MB — restored after 4 MB starved
     // transcoded encoders during real IGMP hiccups (8 wall channels
     // went stuck within 20 min: 365/aaj/capital/dawn/express/geo/hum/neo,
-    // all libx264). Middle ground between the original 10 MB (leaky
-    // over 3 h at high fleet count) and 4 MB (too small for real
-    // bursts). 60 encoders * 8 MB = 480 MB pinned baseline; still
-    // comfortable within 64 GB.
-    if (!u.includes('fifo_size='))         params.push('fifo_size=8000000');
+    // fifo_size 2 MB (was 8 MB). Snapshot showed each ffmpeg process
+    // committing ~1.6 GB Private memory after 36 min — most of that
+    // is the internal packet queue that ffmpeg keeps EXPANDING when
+    // source timing jitters. Smaller fifo caps the growth ceiling.
+    // buffer_size 4 MB (was 8 MB) — kernel SO_RCVBUF. Same reason:
+    // absorb realistic bursts (5 Mbps stream ~ 1 s of buffer) without
+    // giving Windows kernel unbounded room to allocate on our behalf.
+    if (!u.includes('fifo_size='))         params.push('fifo_size=2000000');
     if (!u.includes('overrun_nonfatal='))  params.push('overrun_nonfatal=1');
     if (!u.includes('timeout='))           params.push('timeout=60000000');
-    if (!u.includes('buffer_size='))       params.push('buffer_size=8388608');
+    if (!u.includes('buffer_size='))       params.push('buffer_size=4194304');
     if (!u.includes('reuse='))             params.push('reuse=1');
     if (LOCALADDR && !u.toLowerCase().includes('localaddr=')) {
       params.push(`localaddr=${LOCALADDR}`);
@@ -171,7 +174,12 @@ function ffArgs(url: string, kind: string, outDir: string, transcodeVideo: boole
     '-hide_banner',
     '-nostdin',
     '-loglevel', 'warning',
-    '-fflags', '+discardcorrupt+igndts+genpts',
+    // Dropped +igndts. That flag makes ffmpeg reconstruct EVERY
+    // packet's timing from scratch, which requires keeping input
+    // packets in memory until they can be re-timed — contributed
+    // heavily to the 1.6 GB/process memory growth. discardcorrupt
+    // + genpts is enough for the sources we handle.
+    '-fflags', '+discardcorrupt+genpts',
     '-err_detect', 'ignore_err',
     // Bigger input queue between demuxer and encoder/muxer. Default is
     // 8 packets; brief source stalls (IGMP renegotiation, wall PC
@@ -182,7 +190,12 @@ function ffArgs(url: string, kind: string, outDir: string, transcodeVideo: boole
     // IGMP hiccups (20-min stuck-storm on 8 wall x264 channels). 1024
     // was over-provisioned. 512 = ~1 s of a 5 Mbps stream = enough
     // to ride typical bursts without holding hundreds of MB per encoder.
-    '-thread_queue_size', '512',
+    // thread_queue 256 (was 512). Actual IGMP-hiccup bursts on this
+    // wire are 1-2 s at most; 256 packets ≈ 1 s of a 5 Mbps stream.
+    // Higher was contributing to committed memory without a real
+    // stability benefit — the stall-storm was the SOURCE dropping,
+    // no queue would have saved that.
+    '-thread_queue_size', '256',
     '-f', 'mpegts',
     '-i', normaliseUrl(url, kind),
     '-map', '0:v:0',
@@ -417,6 +430,33 @@ function launch(sup: Sup): void {
  * channel to transcode — a stream that hangs `-c copy` for minutes
  * often has malformed NALs that libx264 re-encoding cleans up.
  */
+/**
+ * Age-based encoder recycle. Every ffmpeg (both libx264 AND -c copy)
+ * grows Private memory ~1 GB/hour in production. Root cause is
+ * ffmpeg's internal packet/PTS bookkeeping on live UDP streams with
+ * mild timing jitter — unfixable in config alone. Bounded lifetime
+ * is the only guaranteed backstop.
+ *
+ * Every MAX_ENCODER_AGE_MS the oldest one supervisor sees > age gets
+ * SIGKILL'd — exit handler respawns in <2s. Sequential (one per
+ * check tick) so at most 1 tile blinks at a time; wall stays smooth.
+ *
+ * Watch interval 60 s + spread across supervisors: ~30 kills per 90
+ * minutes = ~1 kill / 3 minutes. Each blink ~2-3 s.
+ */
+const MAX_ENCODER_AGE_MS = 90 * 60 * 1000;
+function recycleAgedFFmpegs(): void {
+  const now = Date.now();
+  const aged = Array.from(supervisors.values())
+    .filter((s) => s.proc && !s.stop && (now - s.lastRestartAt) > MAX_ENCODER_AGE_MS)
+    .sort((a, b) => a.lastRestartAt - b.lastRestartAt);   // oldest first
+  const victim = aged[0];
+  if (!victim || !victim.proc) return;
+  const ageMin = Math.round((now - victim.lastRestartAt) / 60000);
+  log.info({ slug: victim.slug, ageMin }, 'encoder past MAX_ENCODER_AGE — recycling');
+  try { victim.proc.kill('SIGKILL'); } catch { /* noop */ }
+}
+
 function checkStuckFFmpegs(): void {
   // A channel is REALLY stuck only if NEITHER the m3u8 nor any segment
   // file has been written in the last 3 min. Just checking m3u8 was
@@ -614,12 +654,15 @@ async function main(): Promise<void> {
   setInterval(() => {
     try { checkStuckFFmpegs(); } catch (err) { log.warn({ err }, 'stuck-check failed'); }
   }, 15_000);
-  // NOTE: previous version had a wmic-based fat-check every 60 s to
-  // recycle ffmpegs > 250 MB. Removed because two parallel wmic scans
-  // (live-hls + recording) under load spawned wmiprvse.exe pileups
-  // that overloaded the box to the point of unreachable RDP/SSH.
-  // Memory leak mitigation now relies on smaller input buffers alone.
-  void checkFatFFmpegs;    // keep the function around for later manual invocation if needed
+  // Age-based recycle: kill the oldest ffmpeg past MAX_ENCODER_AGE_MS
+  // every minute. One-at-a-time so at most a single tile is blinking.
+  // Guarantees no ffmpeg lives >90 min = memory can never accumulate
+  // to the 1-2 GB level we saw overnight. No wmic, no polling storm,
+  // just a check-then-signal from the supervisor's own state.
+  setInterval(() => {
+    try { recycleAgedFFmpegs(); } catch (err) { log.warn({ err }, 'age-recycle failed'); }
+  }, 60_000);
+  void checkFatFFmpegs;    // legacy wmic path kept for reference; not called
   // Keep the event loop alive.
   process.stdin.resume();
 }

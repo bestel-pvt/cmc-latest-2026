@@ -394,7 +394,12 @@ function launch(sup: Sup): void {
     // eventually make Node's spawn() itself throw UNKNOWN — which
     // takes the ENTIRE service down. Cap backoff at 5 minutes for
     // channels with runaway crash counts so the parent stays healthy.
-    const wait = sup.restarts > 20
+    // Chronic-offender cooldown kicks in EARLIER (was >20). A source
+    // that stalls 8 times in a row is almost certainly broadcaster-side
+    // (video stream missing, malformed timing, off-air). Keep hammering
+    // it at 15 s intervals wastes CPU + log noise and can domino to
+    // healthy channels via file-IO / kernel-pool contention.
+    const wait = sup.restarts > 8
       ? 300_000                                      // 5 min for chronic offenders
       : Math.min(30_000, 1000 * Math.pow(2, Math.min(sup.restarts, 5)));
     log.warn(

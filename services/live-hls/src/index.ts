@@ -326,24 +326,6 @@ function ffArgs(url: string, kind: string, outDir: string, transcodeVideo: boole
           '-b:v',       '1000k',
           '-maxrate',   '1300k',
           '-bufsize',   '2600k',
-          // GOP forcing — deliberately overkill for reliability. Some
-          // sources (365-news specifically observed) send video where
-          // ffmpeg's -force_key_frames alone cannot land keyframes
-          // reliably at 6s marks; segments end up ~40s apart wall-clock
-          // even though HLS advertises 6s. Result: browser sees "stuck"
-          // playback while ffmpeg buffers frames waiting for the next
-          // segmentable boundary.
-          //
-          // Combining `-g 60` (keyframe every 60 frames = 2s at 30fps
-          // or 2.4s at 25fps) + `-keyint_min 60` (no keyframes closer
-          // than 60) + `-sc_threshold 0` (disable scene-change
-          // detection triggering extra keyframes) + explicit
-          // -force_key_frames as belt-and-braces guarantees the output
-          // has a keyframe at every HLS segment boundary regardless of
-          // what the source does.
-          '-g', '60',
-          '-keyint_min', '60',
-          '-sc_threshold', '0',
           '-force_key_frames', `expr:gte(t,n_forced*${HLS_SEGMENT_TIME})`,
         ];
       })()

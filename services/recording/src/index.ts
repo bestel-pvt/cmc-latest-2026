@@ -14,6 +14,27 @@
  */
 
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+
+/**
+ * Hard kill an ffmpeg process TREE on Windows.
+ *
+ * Node's proc.kill('SIGKILL') on Windows only terminates the parent
+ * handle — ffmpeg's internal encoder/mux child processes survive.
+ * That was the root cause of the 143-zombie / 246 GB committed leak
+ * where the 90-min recycle killed the parent but children lingered
+ * for 20+ hours, accumulating memory. taskkill /F /T walks the tree.
+ */
+function hardKill(proc: ChildProcess | null | undefined): void {
+  if (!proc) return;
+  const pid = proc.pid;
+  if (pid && process.platform === 'win32') {
+    try {
+      spawnSync('taskkill', ['/F', '/T', '/PID', String(pid)], { stdio: 'ignore' });
+      return;
+    } catch { /* fall back */ }
+  }
+  try { proc.kill('SIGKILL'); } catch { /* noop */ }
+}
 type FF = ChildProcess & { stderr: NonNullable<ChildProcess['stderr']> };
 import { createHash } from 'node:crypto';
 import { createReadStream, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
@@ -308,7 +329,7 @@ function stopFFmpegGracefully(sup: Supervisor): void {
   setTimeout(() => {
     if (sup.proc && sup.proc === p && p.exitCode === null && p.signalCode === null) {
       log.warn({ slug: sup.slug }, 'ffmpeg did not exit on q, force killing');
-      try { p.kill('SIGKILL'); } catch { /* */ }
+      hardKill(p);
     }
   }, 3000);
 }
@@ -807,7 +828,7 @@ async function main() {
       if (!victim || !victim.proc) return;
       const ageMin = Math.round((now - victim.lastRestartAt) / 60000);
       log.info({ slug: victim.slug, ageMin }, 'recording ffmpeg past MAX_AGE — recycling');
-      try { victim.proc.kill('SIGKILL'); } catch { /* noop */ }
+      hardKill(victim.proc);
     } catch (err) { log.warn({ err }, 'rec age-recycle failed'); }
   }, 60_000);
 

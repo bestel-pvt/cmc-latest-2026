@@ -23,6 +23,30 @@
 
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { mkdirSync, readdirSync, statSync, unlinkSync } from 'node:fs';
+
+/**
+ * Hard kill an ffmpeg (or any child) process tree.
+ *
+ * IMPORTANT: on Windows, `proc.kill('SIGKILL')` only calls
+ * TerminateProcess on the parent handle — child threads/processes
+ * spawned by ffmpeg internally (encoder workers, mux threads) can
+ * survive. This is what caused a 20-hour, 143-zombie ffmpeg
+ * accumulation that ate 246 GB of committed memory.
+ *
+ * taskkill /F /T /PID walks the process tree and terminates every
+ * descendant. Runs sync (no callback plumbing needed for a kill).
+ */
+function hardKill(proc: ChildProcess | null | undefined): void {
+  if (!proc) return;
+  const pid = proc.pid;
+  if (pid && process.platform === 'win32') {
+    try {
+      spawnSync('taskkill', ['/F', '/T', '/PID', String(pid)], { stdio: 'ignore' });
+      return;
+    } catch { /* fall through to Node kill as backup */ }
+  }
+  try { proc.kill('SIGKILL'); } catch { /* noop */ }
+}
 import { join, resolve } from 'node:path';
 import pino from 'pino';
 import { prisma } from '@cmc/db';
@@ -468,7 +492,7 @@ function recycleAgedFFmpegs(): void {
   if (!victim || !victim.proc) return;
   const ageMin = Math.round((now - victim.lastRestartAt) / 60000);
   log.info({ slug: victim.slug, ageMin }, 'encoder past MAX_ENCODER_AGE — recycling');
-  try { victim.proc.kill('SIGKILL'); } catch { /* noop */ }
+  hardKill(victim.proc);
 }
 
 function checkStuckFFmpegs(): void {
@@ -523,7 +547,7 @@ function checkStuckFFmpegs(): void {
     if (m3u8Age > STALE_MS) {
       const seg = newestSegMtime === 0 ? 'no-segs' : `${Math.round((Date.now() - newestSegMtime)/1000)}s`;
       log.warn({ slug: sup.slug, m3u8_age_s: m3u8Age === Infinity ? 'missing' : Math.round(m3u8Age/1000), newest_seg: seg }, 'ffmpeg genuinely stuck — killing to restart');
-      try { sup.proc.kill('SIGKILL'); } catch { /* noop */ }
+      hardKill(sup.proc);
     }
   }
 }
@@ -566,7 +590,7 @@ async function checkFatFFmpegs(): Promise<void> {
     const mb = Math.round(ws / 1024 / 1024);
     if (mb > MEMORY_KILL_MB) {
       log.warn({ slug: sup.slug, pid, mb }, `ffmpeg over ${MEMORY_KILL_MB} MB — recycling`);
-      try { sup.proc.kill('SIGKILL'); } catch { /* noop */ }
+      hardKill(sup.proc);
     }
   }
 }
@@ -609,7 +633,7 @@ async function rescan(): Promise<void> {
       cur.url = want.url;
       cur.kind = want.kind;
       cur.restarts = 0;
-      if (cur.proc) { try { cur.proc.kill('SIGKILL'); } catch { /* noop */ } }
+      if (cur.proc) { hardKill(cur.proc); }
       // launch() will fire from the exit handler
     }
   }
@@ -619,7 +643,7 @@ async function rescan(): Promise<void> {
     if (!desired.has(id)) {
       log.info({ slug: sup.slug }, 'channel inactive, stopping ffmpeg');
       sup.stop = true;
-      if (sup.proc) { try { sup.proc.kill('SIGKILL'); } catch { /* noop */ } }
+      if (sup.proc) { hardKill(sup.proc); }
       supervisors.delete(id);
     }
   }
@@ -684,7 +708,7 @@ async function main(): Promise<void> {
 function shutdown(): void {
   for (const sup of supervisors.values()) {
     sup.stop = true;
-    if (sup.proc) { try { sup.proc.kill('SIGKILL'); } catch { /* noop */ } }
+    if (sup.proc) { hardKill(sup.proc); }
   }
   process.exit(0);
 }

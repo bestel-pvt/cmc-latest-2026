@@ -653,6 +653,38 @@ async function main(): Promise<void> {
   log.info({ HLS_DIR, HLS_SEGMENT_TIME, HLS_LIST_SIZE, FFMPEG }, 'live-hls starting');
   mkdirSync(HLS_DIR, { recursive: true });
 
+  // STARTUP ZOMBIE SWEEP. When the previous live-hls process died
+  // (force-exit, crash, OS kill), any ffmpeg children it spawned are
+  // orphaned — they keep running but nothing supervises or reaps
+  // them. Over multiple crash cycles this piles up (144 zombies /
+  // 250 GB committed observed after a mass-source-drop → force-exit
+  // → task didn't respawn). Windows Task Manager's process tree
+  // linkage is loose enough that the orphans survive parent death.
+  //
+  // Fix: at startup, before spawning fresh ffmpegs, kill any ffmpeg
+  // whose command line references our HLS dir. Uses wmic (server
+  // has it) with a per-PID taskkill /T for hard tree-kill.
+  if (process.platform === 'win32') {
+    try {
+      const wmic = spawnSync('wmic', ['process', 'where', "name='ffmpeg.exe'",
+        'get', 'ProcessId,CommandLine', '/format:csv'], { encoding: 'utf8' });
+      const marker = HLS_DIR.replace(/\\/g, '\\\\').toLowerCase();
+      const pids: number[] = [];
+      for (const line of (wmic.stdout ?? '').split(/\r?\n/)) {
+        if (!line.toLowerCase().includes(marker.toLowerCase().split('\\').slice(-2).join('\\'))) continue;
+        // last CSV field is PID
+        const parts = line.trim().split(',');
+        const pid = Number(parts[parts.length - 1]);
+        if (Number.isInteger(pid) && pid > 0) pids.push(pid);
+      }
+      for (const pid of pids) {
+        try { spawnSync('taskkill', ['/F', '/T', '/PID', String(pid)], { stdio: 'ignore' }); }
+        catch { /* noop */ }
+      }
+      if (pids.length > 0) log.info({ count: pids.length }, 'startup: killed orphan ffmpeg zombies from previous run');
+    } catch (err) { log.warn({ err }, 'startup zombie sweep failed'); }
+  }
+
   // ONE-TIME housekeeping at service startup: remove every .ts file
   // from every channel dir so we start with a clean slate. Old files
   // from a previous run's counter would otherwise pile up. Runs ONCE

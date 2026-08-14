@@ -690,6 +690,32 @@ function hasFfmpeg(): boolean {
 
 async function main() {
   mkdirSync(RECORDINGS, { recursive: true });
+
+  // STARTUP ZOMBIE SWEEP. Any ffmpeg orphaned by a previous
+  // recording-service crash keeps recording indefinitely with no
+  // parent to reap it. Multiple crash cycles pile up hundreds of
+  // zombies (144 observed post-mortem, 250 GB committed). Kill any
+  // ffmpeg whose cmdline references D:\cmc\recordings before we
+  // spawn our own.
+  if (process.platform === 'win32') {
+    try {
+      const marker = RECORDINGS.toLowerCase();
+      const wmic = spawnSync('wmic', ['process', 'where', "name='ffmpeg.exe'",
+        'get', 'ProcessId,CommandLine', '/format:csv'], { encoding: 'utf8' });
+      const pids: number[] = [];
+      for (const line of (wmic.stdout ?? '').split(/\r?\n/)) {
+        if (!line.toLowerCase().includes(marker)) continue;
+        const parts = line.trim().split(',');
+        const pid = Number(parts[parts.length - 1]);
+        if (Number.isInteger(pid) && pid > 0) pids.push(pid);
+      }
+      for (const pid of pids) {
+        try { spawnSync('taskkill', ['/F', '/T', '/PID', String(pid)], { stdio: 'ignore' }); }
+        catch { /* noop */ }
+      }
+      if (pids.length > 0) log.info({ count: pids.length }, 'startup: killed orphan recording ffmpeg zombies');
+    } catch (err) { log.warn({ err }, 'startup zombie sweep failed'); }
+  }
   mkdirSync(CLIPS, { recursive: true });
 
   if (!hasFfmpeg()) {

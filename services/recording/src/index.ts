@@ -16,24 +16,45 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 
 /**
- * Hard kill an ffmpeg process TREE on Windows.
+ * Hard kill with verify-after-kill loop.
  *
- * Node's proc.kill('SIGKILL') on Windows only terminates the parent
- * handle — ffmpeg's internal encoder/mux child processes survive.
- * That was the root cause of the 143-zombie / 246 GB committed leak
- * where the 90-min recycle killed the parent but children lingered
- * for 20+ hours, accumulating memory. taskkill /F /T walks the tree.
+ * TWO layers of Windows unreliability:
+ *  1. proc.kill('SIGKILL') only signals parent → tree survives
+ *     Solved with taskkill /F /T (walks tree)
+ *  2. Even taskkill can fail silently when ffmpeg is blocked on a
+ *     kernel-level UDP socket wait. TerminateProcess sets exit code
+ *     but the process stays alive. Node's exit event fires, spawner
+ *     creates a replacement, old one becomes a zombie. Observed:
+ *     184 zombies from ONE recording supervisor after ~50h.
+ *
+ * Verify-loop retries up to 3 times. On persistent failure, returns
+ * false so caller knows this ffmpeg needs OS-level intervention
+ * (NIC restart or reboot) — only those force the kernel to abort
+ * the blocked syscall.
  */
-function hardKill(proc: ChildProcess | null | undefined): void {
-  if (!proc) return;
+function pidAlive(pid: number): boolean {
+  if (process.platform !== 'win32') {
+    try { process.kill(pid, 0); return true; } catch { return false; }
+  }
+  const r = spawnSync('tasklist', ['/FI', `PID eq ${pid}`, '/NH', '/FO', 'CSV'], { encoding: 'utf8' });
+  return (r.stdout ?? '').toLowerCase().includes('ffmpeg.exe');
+}
+
+function hardKill(proc: ChildProcess | null | undefined): boolean {
+  if (!proc) return true;
   const pid = proc.pid;
-  if (pid && process.platform === 'win32') {
-    try {
-      spawnSync('taskkill', ['/F', '/T', '/PID', String(pid)], { stdio: 'ignore' });
-      return;
-    } catch { /* fall back */ }
+  if (!pid) return true;
+  if (process.platform === 'win32') {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try { spawnSync('taskkill', ['/F', '/T', '/PID', String(pid)], { stdio: 'ignore' }); }
+      catch { /* fall through to recheck */ }
+      spawnSync('cmd', ['/c', 'timeout', '/t', '1', '/nobreak', '>', 'NUL'], { stdio: 'ignore' });
+      if (!pidAlive(pid)) return true;
+    }
+    return false;   // caller sees false — process is kernel-blocked
   }
   try { proc.kill('SIGKILL'); } catch { /* noop */ }
+  return true;
 }
 type FF = ChildProcess & { stderr: NonNullable<ChildProcess['stderr']> };
 import { createHash } from 'node:crypto';

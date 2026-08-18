@@ -542,6 +542,45 @@ async function refreshSupervisors() {
     catch (err) { log.error({ err, slug: c.slug }, 'initial spawn threw'); }
     supervisors.set(c.id, sup);
   }
+
+  // ORPHAN SWEEP (belt-and-suspenders). Even with the verified
+  // hardKill above, exotic edge cases can still leave a recording
+  // ffmpeg alive that no supervisor is tracking: a Node exception
+  // between spawnFFmpeg() and sup.proc assignment, a supervisor
+  // deleted from the Map while its child is still respawning,
+  // or a taskkill that fooled the verify loop. This sweep catches
+  // any recording ffmpeg whose PID isn't the current sup.proc.pid
+  // for any live supervisor, and kills it. Cheap (~1 wmic call per
+  // 5 s tick) and self-healing.
+  if (process.platform === 'win32') {
+    try {
+      const tracked = new Set<number>();
+      for (const sup of supervisors.values()) {
+        const pid = sup.proc?.pid;
+        if (typeof pid === 'number') tracked.add(pid);
+      }
+      const wmic = spawnSync('wmic', ['process', 'where', "name='ffmpeg.exe'",
+        'get', 'ProcessId,CommandLine', '/format:csv'], { encoding: 'utf8' });
+      const orphans: number[] = [];
+      for (const line of (wmic.stdout ?? '').split(/\r?\n/)) {
+        // Only recording ffmpegs (cmdline references D:\cmc\recordings).
+        if (!line.toLowerCase().includes(RECORDINGS.toLowerCase())) continue;
+        const parts = line.trim().split(',');
+        const pid = Number(parts[parts.length - 1]);
+        if (!Number.isInteger(pid) || pid <= 0) continue;
+        if (tracked.has(pid)) continue;
+        orphans.push(pid);
+      }
+      if (orphans.length > 0) {
+        log.warn({ count: orphans.length, pids: orphans.slice(0, 8) },
+                 'orphan recording ffmpegs found (untracked) — killing');
+        for (const pid of orphans) {
+          try { spawnSync('taskkill', ['/F', '/T', '/PID', String(pid)], { stdio: 'ignore' }); }
+          catch { /* noop */ }
+        }
+      }
+    } catch (err) { log.warn({ err }, 'orphan sweep failed (non-fatal)'); }
+  }
 }
 
 /** Escape a user-supplied string for use inside a drawtext text= value.
@@ -842,12 +881,24 @@ async function main() {
   // stalled for 13 h). Scheduled task respawns cleanly on exit.
   let lastTick = Date.now();
   await refreshSupervisors(); lastTick = Date.now();
+  // Reentrancy guard: refreshSupervisors awaits `prisma.channel.findMany`
+  // and Redis lookups; those can take >5 s under load. Without this
+  // guard, the setInterval fires again while the previous tick is
+  // still mid-loop. Both invocations pass the `supervisors.has(c.id)`
+  // check before either calls `supervisors.set(c.id, sup)` → the same
+  // channel gets spawnFFmpeg'd twice (or 8× — 2026-08-18 forensics
+  // captured 8 concurrent spawns for one channel in one second).
+  let refreshInFlight = false;
   setInterval(async () => {
+    if (refreshInFlight) return;
+    refreshInFlight = true;
     try {
       await refreshSupervisors();
       lastTick = Date.now();
     } catch (err) {
       log.error({ err }, 'refreshSupervisors threw — will retry next tick');
+    } finally {
+      refreshInFlight = false;
     }
   }, 5_000);
   setInterval(() => {

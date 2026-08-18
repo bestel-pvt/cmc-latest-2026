@@ -243,14 +243,16 @@ function ffArgs(url: string, kind: string, outDir: string, transcodeVideo: boole
     // stall storms during normal IGMP hiccups. Memory ceiling
     // enforced by age-based recycle instead.
     '-thread_queue_size', '512',
-    // VLC-tolerant probing. Default analyzeduration=5000000 (5s) +
-    // probesize=5000000 (5MB). Some Pakistani sources (abb-tak, k21)
-    // send video PAT/PMT slowly after IGMP join — ffmpeg gives up
-    // before it sees the video stream and starts producing HLS with
-    // audio only, or dies with 'no video stream'. VLC waits ~10s and
-    // finds them. Matching that behaviour.
-    '-analyzeduration', '10000000',
-    '-probesize', '10000000',
+    // VLC-tolerant probing. Bumped from 10s/10MB to 40s/50MB after
+    // observing CNN take ~30s to lock in VLC on the server (2026-08-18).
+    // Multiple channels (CNN, 365-news, aaj-news, bol-news) have the
+    // same pattern: PAT/PMT slow after IGMP join → ffmpeg gives up at
+    // 10s and enters a spawn→watchdog-kill→respawn loop that never
+    // produces any HLS. 40s + 50MB matches the slowest observed lock
+    // with headroom; RUNWAY_MS below (120s) still gives plenty of
+    // margin before the stuck-watchdog first considers killing.
+    '-analyzeduration', '40000000',
+    '-probesize', '50000000',
     '-f', 'mpegts',
     '-i', normaliseUrl(url, kind),
     // '?' makes video map optional so an audio-only source still

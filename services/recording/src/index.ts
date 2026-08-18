@@ -292,10 +292,10 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
     // Bigger input queue absorbs source hiccups (IGMP renegotiation,
     // NIC-driver interrupt storm) without dropping segments.
     '-thread_queue_size', '512',
-    // VLC-tolerant probing — match live-hls. Slow-PMT sources
-    // (abb-tak, k21) need 10s before video PID appears.
-    '-analyzeduration', '10000000',
-    '-probesize', '10000000',
+    // VLC-tolerant probing — match live-hls. Bumped to 40s/50MB
+    // after observing CNN take ~30s to lock in VLC (2026-08-18).
+    '-analyzeduration', '40000000',
+    '-probesize', '50000000',
     ...(kind === 'UDP' || kind === 'RTP' ? ['-f', 'mpegts'] : []),
     '-i', input,
     // Optional video map — audio-only bursts don't crash the recorder.

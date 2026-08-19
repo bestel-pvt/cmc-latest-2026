@@ -204,17 +204,8 @@ export default function ChannelsPage() {
                       <div className="flex items-center gap-3">
                         <div className="h-9 w-9 rounded bg-white border border-border overflow-hidden flex items-center justify-center font-display font-bold text-[12px] text-muted">
                           {c.logoUrl
-                            ? (
-                              // Logo endpoint is public + immutable-cached — plain <img>
-                              // lets the browser reuse its HTTP cache across pages and
-                              // avoids the AuthImg blob-fetch that was refetching all
-                              // 30 logos on every reload (2-7 s queue behind HTTP/1.1's
-                              // 6-connections-per-origin limit).
-                              // eslint-disable-next-line @next/next/no-img-element
-                              <img src={c.logoUrl} alt=""
-                                   className="max-w-full max-h-full object-contain"
-                                   onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }} />
-                            )
+                            ? <AuthImg src={c.logoUrl} alt="" className="max-w-full max-h-full object-contain"
+                                       fallback={<span>{c.name.slice(0,2).toUpperCase()}</span>} />
                             : <span className="text-muted">{c.name.slice(0,2).toUpperCase()}</span>}
                         </div>
                         <div>

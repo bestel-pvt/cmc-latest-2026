@@ -28,7 +28,7 @@ export function SystemResourcesCard() {
   const { data } = useQuery<SystemStats>({
     queryKey: ['dashboard.system'],
     queryFn: () => api<SystemStats>('/api/dashboard/system'),
-    refetchInterval: 30_000,
+    refetchInterval: 5_000,
   });
   if (!data) return null;
   const cpu = data.cpu.loadPct1m;

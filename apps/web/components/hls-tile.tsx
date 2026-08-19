@@ -75,13 +75,6 @@ export function HlsTile({
    *
    * Cleared on unmount to avoid firing on a torn-down tile. */
   const clickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Keep the latest onToggleAudio in a ref so the 220ms delayed
-  // single-click callback always resolves to the CURRENT prop closure,
-  // not whatever was captured when the click first fired. Without this
-  // a re-render inside the click delay could make the callback act on
-  // a stale slug — the operator sees "clicked tile X, audio went to Y".
-  const onToggleAudioRef = useRef(onToggleAudio);
-  useEffect(() => { onToggleAudioRef.current = onToggleAudio; }, [onToggleAudio]);
   useEffect(() => () => {
     if (clickTimerRef.current) clearTimeout(clickTimerRef.current);
   }, []);
@@ -91,7 +84,7 @@ export function HlsTile({
     if (clickTimerRef.current) return;   // already waiting for a possible double
     clickTimerRef.current = setTimeout(() => {
       clickTimerRef.current = null;
-      onToggleAudioRef.current();
+      onToggleAudio();
     }, 220);
   }
   function handleTileDoubleClick(): void {
@@ -130,132 +123,47 @@ export function HlsTile({
     }
 
     if (hlsRef.current) { hlsRef.current.destroy(); }
-
-    // Recovery state: hls.js's recoverMediaError() sometimes patches
-    // over the same broken segment forever without ever recovering
-    // (specifically CNN's SCTE-35 + teletext streams hit fragParsingError
-    // repeatedly). If we take more than N consecutive fatal errors
-    // without the video actually resuming, we drop and rebuild the
-    // whole hls.js instance — that clears every internal buffer and
-    // parser state cleanly.
-    let fatalCount = 0;
-    let rebuildTimer: ReturnType<typeof setTimeout> | null = null;
-
-    // Retry play() until it actually sticks — Chrome autoplay policy
-    // sometimes rejects the first call even on muted video (paused
-    // background tab). Without retry, hls.js fetches 1 segment then
-    // idles because the video element never demands more.
-    let playRetryTimer: ReturnType<typeof setTimeout> | null = null;
-    const tryPlay = (attempt = 0): void => {
-      video.play().catch(() => {
-        if (attempt < 10) {
-          playRetryTimer = setTimeout(() => tryPlay(attempt + 1), 500);
-        }
-      });
-    };
-
-    const build = (): Hls => {
-      const inst = new Hls({
-        // User accepts high latency in exchange for zero stalls.
-        // 6 s segments × liveSyncDurationCount 3 = start ~18 s behind live.
-        liveDurationInfinity: true,
-        lowLatencyMode: false,
-        liveSyncDurationCount: 3,
-        liveMaxLatencyDurationCount: 40,
-        maxBufferLength: 120,
-        maxMaxBufferLength: 240,
-        backBufferLength: 60,
-        maxLiveSyncPlaybackRate: 1.05,
-        fragLoadingMaxRetry: 8,
-        fragLoadingRetryDelay: 500,
-        levelLoadingMaxRetry: 6,
-        manifestLoadingMaxRetry: 6,
-        // NOTE: initialLiveManifestSize + startPosition -1 removed —
-        // they were too aggressive with the shorter 10-segment playlist
-        // and caused tiles to reload continuously as hls.js kept
-        // fetching + failing to buffer enough before playback. Default
-        // (3 segments buffered before playing) is the right balance.
-      });
-      inst.attachMedia(video);
-      inst.on(Hls.Events.MEDIA_ATTACHED, () => inst.loadSource(url));
-      inst.on(Hls.Events.MANIFEST_PARSED, () => {
-        tryPlay();
-        setStatus('playing');
-      });
-      inst.on(Hls.Events.FRAG_LOADED, () => {
-        // Successful load = reset fatal counter; whatever transient
-        // error we saw is behind us.
-        fatalCount = 0;
-        if (rebuildTimer) { clearTimeout(rebuildTimer); rebuildTimer = null; }
-      });
-      inst.on(Hls.Events.ERROR, (_evt, data) => {
-        if (!data.fatal) return;
-        fatalCount++;
+    const hls = new Hls({
+      // User accepts high latency in exchange for zero stalls.
+      // 6 s segments × liveSyncDurationCount 3 = start ~18 s behind live.
+      // Then a big forward buffer (120 s) fills in background so any
+      // network hiccup up to a couple of minutes is invisible.
+      liveDurationInfinity: true,
+      lowLatencyMode: false,
+      liveSyncDurationCount: 3,
+      liveMaxLatencyDurationCount: 40,     // let latency drift up to ~4 minutes before catching up
+      maxBufferLength: 120,                // 2 min forward buffer
+      maxMaxBufferLength: 240,             // 4 min ceiling
+      backBufferLength: 60,                // 1 min back-buffer
+      maxLiveSyncPlaybackRate: 1.05,       // gentle 5% catch-up if drifting
+      fragLoadingMaxRetry: 8,              // 8 retries per segment
+      fragLoadingRetryDelay: 500,
+      levelLoadingMaxRetry: 6,
+      manifestLoadingMaxRetry: 6,
+    });
+    hlsRef.current = hls;
+    hls.attachMedia(video);
+    hls.on(Hls.Events.MEDIA_ATTACHED, () => hls.loadSource(url));
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      video.play().catch(() => {});
+      setStatus('playing');
+    });
+    hls.on(Hls.Events.ERROR, (_evt, data) => {
+      if (data.fatal) {
         setStatus('error');
+        // Try to recover network + media errors; give up on other-fatal.
         if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-          inst.startLoad();
+          hls.startLoad();
           setStatus('loading');
-        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR && fatalCount <= 2) {
-          inst.recoverMediaError();
+        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+          hls.recoverMediaError();
           setStatus('loading');
-        } else {
-          // 3+ fatal errors without recovery, or a non-media/network
-          // fatal — rebuild the whole thing. Delay briefly so we do
-          // not thrash if the source is genuinely down.
-          if (rebuildTimer) clearTimeout(rebuildTimer);
-          rebuildTimer = setTimeout(() => {
-            rebuildTimer = null;
-            if (hlsRef.current === inst) {
-              inst.destroy();
-              fatalCount = 0;
-              hlsRef.current = build();
-            }
-          }, 3000);
         }
-      });
-      return inst;
-    };
-
-    hlsRef.current = build();
-
-    // Freeze watchdog: if video.currentTime hasn't advanced in 30 s,
-    // hls.js is silently stuck. Server keeps producing fresh segments
-    // but hls.js sometimes buffers a bad chunk without firing a fatal
-    // event -> tile just freezes with no error. Rebuild the instance;
-    // one blink and it recovers. Runs every 10 s.
-    let lastAdvanceAt = Date.now();
-    let lastCurrentTime = 0;
-    const freezeCheck = setInterval(() => {
-      const v = videoRef.current;
-      if (!v) return;
-      const t = v.currentTime;
-      if (t > lastCurrentTime + 0.1) {
-        lastCurrentTime = t;
-        lastAdvanceAt = Date.now();
-        return;
       }
-      // Paused (user or autoplay-blocked) counts as legitimately not
-      // advancing — try play() but do not tear down.
-      if (v.paused) {
-        v.play().catch(() => {});
-        return;
-      }
-      // Playing but stuck. Give it 30 s of grace before rebuild.
-      if (Date.now() - lastAdvanceAt < 30_000) return;
-      const inst = hlsRef.current;
-      if (!inst) return;
-      // Silent, quick rebuild — same code the fatal-error path uses.
-      inst.destroy();
-      hlsRef.current = build();
-      lastAdvanceAt = Date.now();
-      lastCurrentTime = 0;
-    }, 10_000);
+    });
 
     return () => {
-      clearInterval(freezeCheck);
-      if (rebuildTimer) clearTimeout(rebuildTimer);
-      if (playRetryTimer) clearTimeout(playRetryTimer);
-      hlsRef.current?.destroy();
+      hls.destroy();
       hlsRef.current = null;
     };
   }, [slug]);
@@ -292,11 +200,10 @@ export function HlsTile({
             playsInline
             muted
             autoPlay
-            // object-fill: back to the operator's original choice —
-            // stretch to fill tile. Layout aspect does not visibly
-            // affect ticker sharpness on the wall; the ticker
-            // sharpness is dominated by the ENCODER preset + scaler,
-            // which is fixed on the server side.
+            // object-fill: simple stretch to fill the tile. Whatever
+            // aspect the source arrives in, the video paints edge to
+            // edge. Reverted from cover/contain experiments — the
+            // stretch trade-off is the user's accepted final choice.
             style={{ objectFit: 'fill' }}
             className="w-full h-full"
           />

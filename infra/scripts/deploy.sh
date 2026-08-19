@@ -20,7 +20,7 @@ log "pnpm install"
 pnpm install --frozen-lockfile
 
 log "docker compose up -d (infra)"
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d postgres redis ollama nginx
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d postgres redis mediamtx ollama nginx
 
 log "waiting for postgres to be healthy"
 for i in $(seq 1 30); do

@@ -99,14 +99,11 @@ function RecordingsInner() {
     return m;
   }, [channels]);
 
-  // Live per-channel recording status — poll every 15 s. 5 s hammered
-  // the API on top of 30-tile wall polls + /sessions poll and made the
-  // page feel sluggish. 15 s is still fast enough that the operator sees
-  // a channel drop within one blink of the "In progress" card.
+  // Live per-channel recording status — poll every 5 s.
   const { data: liveStatus } = useQuery<LiveStatus[]>({
     queryKey: ['recordings.status'],
     queryFn: () => api<LiveStatus[]>('/api/recordings/status'),
-    refetchInterval: 15_000,
+    refetchInterval: 5_000,
   });
 
   const { data: sessions, isLoading } = useQuery<Session[]>({
@@ -133,20 +130,11 @@ function RecordingsInner() {
       s.channel.slug.toLowerCase().includes(needle));
   }, [sessions, q]);
 
-  // Manager use case: user filters to 15:00-15:15 and clicks a session
-  // that spans 12:00-16:00. We open the editor on the INTERSECTION so
-  // they land inside their picked window, not on 4 hours of tape.
   function openEditor(s: Session) {
-    const sessStart = new Date(s.startedAt).getTime();
-    const sessEnd   = new Date(s.endedAt).getTime();
-    const filtStart = new Date(from).getTime();
-    const filtEnd   = new Date(to).getTime();
-    const sliceStart = new Date(Math.max(sessStart, filtStart)).toISOString();
-    const sliceEnd   = new Date(Math.min(sessEnd,   filtEnd)).toISOString();
     router.push(
       `/clips/new?channelId=${s.channelId}` +
-      `&sessionStart=${encodeURIComponent(sliceStart)}` +
-      `&sessionEnd=${encodeURIComponent(sliceEnd)}`,
+      `&sessionStart=${encodeURIComponent(s.startedAt)}` +
+      `&sessionEnd=${encodeURIComponent(s.endedAt)}`,
     );
   }
 
@@ -275,7 +263,6 @@ function RecordingsInner() {
                   <tr>
                     <th className="text-left px-4 py-2">Channel</th>
                     <th className="text-left px-4 py-2">Started</th>
-                    <th className="text-left px-4 py-2">Ended</th>
                     <th className="text-left px-4 py-2">Duration</th>
                     <th className="text-left px-4 py-2">Size</th>
                     <th className="text-left px-4 py-2">Segments</th>
@@ -285,15 +272,6 @@ function RecordingsInner() {
                 <tbody className="divide-y divide-line">
                   {filtered.map((s) => {
                     const started = new Date(s.startedAt);
-                    const ended   = new Date(s.endedAt);
-                    const stillLive =
-                      (liveStatus ?? []).some(
-                        (ls) => ls.id === s.channelId && ls.status === 'recording',
-                      ) && Date.now() - ended.getTime() < 5 * 60 * 1000;
-                    const dtFmt: Intl.DateTimeFormatOptions = {
-                      year: 'numeric', month: '2-digit', day: '2-digit',
-                      hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
-                    };
                     return (
                       <tr
                         key={s.id}
@@ -303,14 +281,10 @@ function RecordingsInner() {
                       >
                         <td className="px-4 py-2.5 font-medium">{s.channel.name}</td>
                         <td className="px-4 py-2.5 font-mono text-xs">
-                          {started.toLocaleString(undefined, dtFmt)}
-                        </td>
-                        <td className="px-4 py-2.5 font-mono text-xs">
-                          {stillLive
-                            ? <span className="inline-flex items-center gap-1 text-accent-green">
-                                <CircleDot className="h-3 w-3 animate-pulse" /> live
-                              </span>
-                            : ended.toLocaleString(undefined, dtFmt)}
+                          {started.toLocaleString(undefined, {
+                            year: 'numeric', month: '2-digit', day: '2-digit',
+                            hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+                          })}
                         </td>
                         <td className="px-4 py-2.5 font-mono text-xs">{fmtDurationMs(s.durationMs)}</td>
                         <td className="px-4 py-2.5 font-mono text-xs">{fmtBytes(Number(s.sizeBytes))}</td>

@@ -48,3 +48,14 @@ venv
 # generated
 apps/*/prisma-client
 packages/db/generated
+
+# temp / lock files
+~$*
+~WRL*.tmp
+*.tmp
+apps/web/tmp/
+
+# backups
+*.zip
+!package-lock.json
+cmcbackend*.zip

@@ -25,53 +25,27 @@ import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { mkdirSync, readdirSync, statSync, unlinkSync } from 'node:fs';
 
 /**
- * Hard kill an ffmpeg process tree WITH verify-loop.
+ * Hard kill an ffmpeg (or any child) process tree.
  *
- * Windows layers of unreliability:
- *  1. proc.kill('SIGKILL') only signals the parent handle → children
- *     (encoder threads, mux worker) survive. Solved by taskkill /F /T
- *     which walks the tree.
- *  2. Even taskkill returns "success" while an ffmpeg blocked in a
- *     kernel-level UDP socket wait keeps running — the socket wait
- *     can't be cancelled from userspace. TerminateProcess sets exit
- *     code but the process stays alive. Node's on('exit') then fires,
- *     supervisor spawns a replacement, and the old one becomes a
- *     zombie. Observed: 184 zombies from one supervisor after ~50 h.
+ * IMPORTANT: on Windows, `proc.kill('SIGKILL')` only calls
+ * TerminateProcess on the parent handle — child threads/processes
+ * spawned by ffmpeg internally (encoder workers, mux threads) can
+ * survive. This is what caused a 20-hour, 143-zombie ffmpeg
+ * accumulation that ate 246 GB of committed memory.
  *
- * Fix: after taskkill, verify the PID is actually gone. If it's still
- * there after 3 attempts * 1s, log an error and return anyway so the
- * caller can move on — the process is truly unkillable via userspace
- * and only a NIC restart (forces socket closure) or reboot will
- * reap it. Marking it "gone" for the supervisor is a lie, but at
- * least we don't respawn on top of it (see stillAlive check in the
- * supervisor's exit handler).
+ * taskkill /F /T /PID walks the process tree and terminates every
+ * descendant. Runs sync (no callback plumbing needed for a kill).
  */
-function pidAlive(pid: number): boolean {
-  if (process.platform !== 'win32') {
-    try { process.kill(pid, 0); return true; } catch { return false; }
-  }
-  const r = spawnSync('tasklist', ['/FI', `PID eq ${pid}`, '/NH', '/FO', 'CSV'], { encoding: 'utf8' });
-  return (r.stdout ?? '').toLowerCase().includes('ffmpeg.exe');
-}
-
-function hardKill(proc: ChildProcess | null | undefined): boolean {
-  if (!proc) return true;
+function hardKill(proc: ChildProcess | null | undefined): void {
+  if (!proc) return;
   const pid = proc.pid;
-  if (!pid) return true;
-
-  if (process.platform === 'win32') {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try { spawnSync('taskkill', ['/F', '/T', '/PID', String(pid)], { stdio: 'ignore' }); }
-      catch { /* fall through to sleep+recheck */ }
-      // Give kernel 800 ms to actually reap
-      spawnSync('cmd', ['/c', 'timeout', '/t', '1', '/nobreak', '>', 'NUL'], { stdio: 'ignore' });
-      if (!pidAlive(pid)) return true;
-    }
-    log.error({ pid }, 'hardKill: process still alive after 3 taskkill attempts — kernel-blocked ffmpeg (needs NIC restart)');
-    return false;
+  if (pid && process.platform === 'win32') {
+    try {
+      spawnSync('taskkill', ['/F', '/T', '/PID', String(pid)], { stdio: 'ignore' });
+      return;
+    } catch { /* fall through to Node kill as backup */ }
   }
   try { proc.kill('SIGKILL'); } catch { /* noop */ }
-  return true;
 }
 import { join, resolve } from 'node:path';
 import pino from 'pino';

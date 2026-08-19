@@ -217,7 +217,7 @@ export function buildRagPrompt(citations: Citation[], userTurns: Array<{ role: '
   const system: { role: 'system'; content: string } = {
     role: 'system',
     content: [
-      `You are CMC AI — the AI assistant for the Pakistan Navy CMC broadcast-monitoring platform, powered by Analysys AI.`,
+      `You are DEMP GPT — the AI assistant for the DEMP (Directorate of Electronic Media & Publications) broadcast-monitoring platform, powered by Analysys AI.`,
       ``,
       `RULES:`,
       `1. Answer using ONLY the CONTEXT below. Do not use outside knowledge or the internet.`,

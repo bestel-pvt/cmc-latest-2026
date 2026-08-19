@@ -55,12 +55,8 @@ export function LogoUploader({ channelId, currentUrl }: { channelId: string; cur
     <div className="flex items-center gap-3">
       <div className="h-16 w-16 rounded-md border border-line bg-white overflow-hidden flex items-center justify-center">
         {currentUrl
-          // Logo endpoint is public + long-cached; plain <img> uses the
-          // browser HTTP cache instead of AuthImg's per-mount blob-fetch.
-          // eslint-disable-next-line @next/next/no-img-element
-          ? <img src={currentUrl} alt="channel logo"
-                 className="max-w-full max-h-full object-contain"
-                 onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }} />
+          ? <AuthImg src={currentUrl} alt="channel logo" className="max-w-full max-h-full object-contain"
+                     fallback={<ImagePlus className="h-6 w-6 text-muted-2" />} />
           : <ImagePlus className="h-6 w-6 text-muted-2" />}
       </div>
       <div>

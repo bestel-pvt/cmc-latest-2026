@@ -413,29 +413,18 @@ function RecordingsPanel({ channelId, channelSlug }: { channelId: string; channe
               No segments in this window for <span className="font-mono">{channelSlug}</span>.
             </div>
           )}
-          {rows.map((r) => {
-            const start = new Date(r.startedAt).toISOString();
-            const end   = new Date(new Date(r.startedAt).getTime() + r.durationMs).toISOString();
-            return (
-              <Link
-                key={r.id}
-                href={`/clips/new?channelId=${channelId}&sessionStart=${encodeURIComponent(start)}&sessionEnd=${encodeURIComponent(end)}`}
-                className="block px-3 py-2 hover:bg-panel2 transition-colors text-xs"
-                title="Open in Clip Editor"
-              >
-                <div className="flex items-center justify-between">
-                  <div className="flex-1 min-w-0">
-                    <div className="font-medium">{new Date(r.startedAt).toLocaleString()}</div>
-                    <div className="text-[10px] text-muted-2 font-mono truncate">{r.path.split(/[\\/]/).slice(-1)[0]}</div>
-                  </div>
-                  <div className="text-right shrink-0 ml-3">
-                    <div className="text-muted">{fmtBytes(r.sizeBytes)}</div>
-                    <div className="text-[10px] text-muted-2">{Math.round(r.durationMs / 1000)}s</div>
-                  </div>
-                </div>
-              </Link>
-            );
-          })}
+          {rows.map((r) => (
+            <div key={r.id} className="px-3 py-2 flex items-center justify-between text-xs">
+              <div className="flex-1 min-w-0">
+                <div className="font-medium">{new Date(r.startedAt).toLocaleString()}</div>
+                <div className="text-[10px] text-muted-2 font-mono truncate">{r.path.split(/[\\/]/).slice(-1)[0]}</div>
+              </div>
+              <div className="text-right shrink-0 ml-3">
+                <div className="text-muted">{fmtBytes(r.sizeBytes)}</div>
+                <div className="text-[10px] text-muted-2">{Math.round(r.durationMs / 1000)}s</div>
+              </div>
+            </div>
+          ))}
         </div>
       </CardContent>
     </Card>

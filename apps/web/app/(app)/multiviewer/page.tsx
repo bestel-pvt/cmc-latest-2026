@@ -4,7 +4,7 @@
  * Video-wall multiviewer.
  *
  * Matches the standalone CMC video-wall app conceptually:
- *   - 5 layouts (single, dual, grid-8, mosaic-20, grid-32)
+ *   - 4 layouts (single, dual, mosaic-20, grid-32)
  *   - assign a channel per slot from a searchable channel list
  *   - save / load / delete named templates (localStorage; per-browser)
  *   - fullscreen mode
@@ -38,7 +38,7 @@ interface Slot {
 }
 
 interface Layout {
-  id: 'single' | 'dual' | 'grid8' | 'mosaic' | 'grid32';
+  id: 'single' | 'dual' | 'mosaic' | 'grid32';
   label: string;
   slots: Slot[];
 }
@@ -53,15 +53,6 @@ function buildLayouts(): Layout[] {
     { x: 0.0, y: 0, w: 0.5, h: 1 },
     { x: 0.5, y: 0, w: 0.5, h: 1 },
   ];
-
-  // Grid8: 2 rows × 4 cols = 8 tiles. Same 16:9 tile aspect the wall
-  // encoder produces, so no letterboxing/pillarboxing at any wall size.
-  const grid8: Slot[] = [];
-  for (let r = 0; r < 2; r++) {
-    for (let c = 0; c < 4; c++) {
-      grid8.push({ x: c / 4, y: r / 2, w: 1 / 4, h: 1 / 2 });
-    }
-  }
 
   // Mosaic-20: 4 big tiles across the top row + 16 quadrants below.
   const mosaic: Slot[] = [];
@@ -81,11 +72,8 @@ function buildLayouts(): Layout[] {
     }
   }
 
-  // Grid32: 8 cols × 4 rows = 32 slots. Operator verified that layout
-  // aspect does not visibly change wall text sharpness — that is
-  // dominated by the ENCODER preset + scaler on the server. Tiles use
-  // object-fit: fill for maximum screen use; text sharpness comes
-  // from live-hls (`-preset veryfast -vf …flags=lanczos`).
+  // Grid32: 8 cols × 4 rows = 32 slots — user's original request,
+  // matches the standalone Rust wall.
   const grid32: Slot[] = [];
   for (let r = 0; r < 4; r++) {
     for (let c = 0; c < 8; c++) {
@@ -96,9 +84,8 @@ function buildLayouts(): Layout[] {
   return [
     { id: 'single', label: '1 · Single',       slots: single },
     { id: 'dual',   label: '2 · Dual',         slots: dual },
-    { id: 'grid8',  label: '3 · Grid (8)',     slots: grid8 },
-    { id: 'mosaic', label: '4 · Mosaic (20)',  slots: mosaic },
-    { id: 'grid32', label: '5 · Grid (32)',    slots: grid32 },
+    { id: 'mosaic', label: '3 · Mosaic (20)',  slots: mosaic },
+    { id: 'grid32', label: '4 · Grid (32)',    slots: grid32 },
   ];
 }
 
@@ -153,28 +140,20 @@ export default function MultiviewerPage() {
   const [saveDialogOpen, setSaveDialogOpen] = useState(false);
   const [templateName, setTemplateName] = useState('');
   const [isFullscreen, setIsFullscreen] = useState(false);
-  /** Channel SLUG whose audio is currently ON, or null if all muted.
+  /** Slot index whose audio is currently ON, or null if all muted.
    * Enforces "only one channel makes noise at a time" — clicking a
    * different tile's volume icon switches audio to that tile and
-   * mutes the previous.
-   *
-   * Slug-based (not slot-based). Reason: the tile's 220ms
-   * single-vs-double-click delay + freeze-watchdog rebuilds + layout
-   * changes could all cause re-renders between click and callback,
-   * making a slot INDEX resolve to a different channel by the time
-   * the callback fires. Tracking by slug means whichever tile the
-   * user actually clicked keeps its audio, no matter what re-renders
-   * happen in between. */
-  const [audioSlug, setAudioSlug] = useState<string | null>(null);
+   * mutes the previous. */
+  const [audioSlotIdx, setAudioSlotIdx] = useState<number | null>(null);
   /** Snapshot of layout+assignments taken when the operator double-clicks
    * a tile to solo it. `null` = not in solo mode. Esc restores from this. */
   const [soloRestore, setSoloRestore] = useState<
-    { layoutId: Layout['id']; assignments: Record<string, string>; audioSlug: string | null } | null
+    { layoutId: Layout['id']; assignments: Record<string, string>; audioSlotIdx: number | null } | null
   >(null);
   const wallRef = useRef<HTMLDivElement | null>(null);
 
   const layout = useMemo(
-    () => LAYOUTS.find((l) => l.id === layoutId) ?? LAYOUTS.find((l) => l.id === 'mosaic')!,
+    () => LAYOUTS.find((l) => l.id === layoutId) ?? LAYOUTS[2]!,
     [layoutId],
   );
 
@@ -205,14 +184,12 @@ export default function MultiviewerPage() {
       else delete next[String(idx)];
       return next;
     });
-    // Nothing to do for audio on assignSlot — audio is tracked by
-    // slug, so if the removed channel had audio it will naturally
-    // stop when no visible tile matches audioSlug.
+    // If we just cleared the slot that had audio on, kill audio too.
+    if (!slug) setAudioSlotIdx((cur) => (cur === idx ? null : cur));
   }, []);
 
-  const toggleAudio = useCallback((slug: string | null) => {
-    if (!slug) return;
-    setAudioSlug((cur) => (cur === slug ? null : slug));
+  const toggleAudio = useCallback((idx: number) => {
+    setAudioSlotIdx((cur) => (cur === idx ? null : idx));
   }, []);
 
   const applyTemplate = useCallback((t: Template) => {
@@ -251,15 +228,15 @@ export default function MultiviewerPage() {
     setSoloRestore((prev) => prev ?? {
       layoutId,
       assignments: { ...assignments },
-      audioSlug,
+      audioSlotIdx,
     });
     setLayoutId('single');
     setAssignments({ '0': slug });
     // Solo audio ON by default — operator dove into this channel to
     // listen to it. If they had another channel's audio on, that's
     // preserved in the restore snapshot.
-    setAudioSlug(slug);
-  }, [layoutId, assignments, audioSlug]);
+    setAudioSlotIdx(0);
+  }, [layoutId, assignments, audioSlotIdx]);
 
   /** Restore the pre-solo layout snapshot. */
   const exitSolo = useCallback(() => {
@@ -267,7 +244,7 @@ export default function MultiviewerPage() {
       if (!snap) return null;
       setLayoutId(snap.layoutId);
       setAssignments(snap.assignments);
-      setAudioSlug(snap.audioSlug);
+      setAudioSlotIdx(snap.audioSlotIdx);
       return null;
     });
   }, []);
@@ -359,17 +336,19 @@ export default function MultiviewerPage() {
         </Button>
 
         <div className="ml-auto flex items-center gap-2">
-          {audioSlug !== null ? (
+          {audioSlotIdx !== null ? (
             <div
               className="flex items-center gap-1.5 rounded-md bg-accent-orange/10 text-accent-orange ring-1 ring-accent-orange/40 px-2 py-1 text-xs font-medium"
               title="Currently playing audio — click the tile's speaker icon (or the X here) to mute"
             >
               <Volume2 className="h-3.5 w-3.5" />
               <span className="max-w-[10rem] truncate">
-                {channelBySlug.get(audioSlug)?.name ?? audioSlug}
+                {channelBySlug.get(assignments[String(audioSlotIdx)] ?? '')?.name
+                  ?? assignments[String(audioSlotIdx)]
+                  ?? 'Audio'}
               </span>
               <button
-                onClick={() => setAudioSlug(null)}
+                onClick={() => setAudioSlotIdx(null)}
                 className="ml-1 rounded p-0.5 hover:bg-accent-orange/20"
                 title="Mute all"
               >
@@ -398,13 +377,7 @@ export default function MultiviewerPage() {
         </div>
       </div>
 
-      {/* Wall — grid32 renders as an 8×8 slot matrix on the 1920×1080
-          signal that the wall controller receives from the PC HDMI.
-          Signal aspect = 16:9, tile aspect = 240×135 = 16:9 → perfect
-          match. Container just fills the browser viewport; the wall
-          controller then splits the signal across 8 physical screens
-          (each showing a 2×4 slice = 8 tiles). Non-grid32 layouts
-          behave identically — 16:9 tiles inside a 16:9 container. */}
+      {/* Wall */}
       <div className="flex-1 bg-black overflow-hidden" ref={wallRef}>
         <div className="relative w-full h-full">
           {layout.slots.map((slot, idx) => {
@@ -425,8 +398,8 @@ export default function MultiviewerPage() {
                   slug={slug}
                   channelName={ch?.name}
                   logoUrl={ch?.logoUrl ?? undefined}
-                  audioActive={!!slug && audioSlug === slug}
-                  onToggleAudio={() => toggleAudio(slug)}
+                  audioActive={audioSlotIdx === idx}
+                  onToggleAudio={() => toggleAudio(idx)}
                   onClear={() => assignSlot(idx, null)}
                   onPick={() => setPickerSlotIdx(idx)}
                   onDoubleClick={slug ? () => enterSolo(slug) : undefined}

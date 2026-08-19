@@ -450,7 +450,18 @@ function launch(sup: Sup): void {
   proc.on('exit', (code, sig) => {
     sup.proc = null;
     if (sup.stop) return;
-    sup.restarts += 1;
+    // Reset the restart counter if ffmpeg stayed alive long enough
+    // to be considered "healthy" before this exit. Was: unconditional
+    // sup.restarts += 1 counted every routine age-recycle (fires
+    // every 90 min = MAX_ENCODER_AGE_MS) as a crash. Over 24 h that
+    // pushed the counter from 1 → 16 despite every ffmpeg running a
+    // healthy 90 min before its recycle. Once >8, chronic-offender
+    // cooldown kicked in → 5-MINUTE HLS blackout every 90 min. User
+    // symptom: channel stuck/looping/showing stale content during
+    // the 5 min gap, hard-refresh sometimes fixes it (browser drops
+    // buffered playlist). Matches the recording service's fix.
+    const wasAliveLong = Date.now() - sup.lastRestartAt > 30_000;
+    sup.restarts = wasAliveLong ? 0 : sup.restarts + 1;
     // Extended cool-down after excessive respawns. A source that has
     // exited 20+ times without ever staying alive long is bad. The
     // sub-second-per-crash storm we saw overnight (92-news restarted

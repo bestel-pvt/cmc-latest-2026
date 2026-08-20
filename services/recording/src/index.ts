@@ -62,7 +62,7 @@ function hardKill(proc: ChildProcess | null | undefined): boolean {
 }
 type FF = ChildProcess & { stderr: NonNullable<ChildProcess['stderr']> };
 import { createHash } from 'node:crypto';
-import { createReadStream, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { createReadStream, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -626,30 +626,98 @@ async function clipWorker(job: { clipId: string }) {
   mkdirSync(CLIPS, { recursive: true });
   const outFile = join(CLIPS, `${clip.id}.${clip.format.toLowerCase()}`);
 
-  // Find segments overlapping [startAt, endAt]
-  const segs = await prisma.recordingSegment.findMany({
-    where: {
-      channelId: clip.channelId,
-      startedAt: { lte: clip.endAt },
-      AND: [{ startedAt: { gte: new Date(clip.startAt.getTime() - 24 * 3600 * 1000) } }],
-    },
-    orderBy: { startedAt: 'asc' },
-  });
-  const covering = segs.filter((s) => {
-    const end = new Date(s.startedAt.getTime() + s.durationMs);
-    return end > clip.startAt && s.startedAt < clip.endAt;
-  });
+  // Locate the underlying .mp4 files DIRECTLY FROM DISK, not from the
+  // RecordingSegment table. The recording ffmpegs write to a
+  // deterministic path — RECORDINGS_DIR/<channelId>/YYYY/MM/DD/HH/
+  // YYYYMMDDTHHMMSSZ.mp4 (local time, per ffmpeg's -strftime on
+  // Windows). We compute every hour-dir the clip window touches,
+  // readdir each, parse filenames back to timestamps, and keep files
+  // whose [fileStart, fileStart+SEG_SECONDS] window overlaps
+  // [clip.startAt, clip.endAt]. This makes clip creation independent
+  // of the DB ingest pipeline — user can clip a moment that just
+  // happened, or one from days ago, and it works as long as the .mp4
+  // is on disk. Prior implementation queried RecordingSegment which
+  // FAILED whenever ingest lag left a gap (2026-08-20: 4 clips failed
+  // because Aug 18/19 segments never landed in DB).
+  interface CoveringFile { path: string; startedAt: Date }
+  const covering: CoveringFile[] = [];
+  // channelOutDir() writes hour-dirs using UTC (getUTCHours), so we
+  // must match with UTC here. ffmpeg's -strftime 1 on Windows writes
+  // FILENAMES using LOCAL time, though — see filename parsing below.
+  // Missing this dual-timezone quirk was why the first cut of the
+  // DB-free renderer failed on all 4 retried clips: looked in
+  // /2026/08/18/20/ (Node local PKT hour) when the file was written
+  // to /2026/08/18/15/ (UTC hour).
+  const firstHour = new Date(clip.startAt); firstHour.setUTCMinutes(0, 0, 0);
+  const lastHour  = new Date(clip.endAt);   lastHour.setUTCMinutes(0, 0, 0);
+  log.info({
+    clipId: clip.id,
+    tzOffsetMin: -new Date().getTimezoneOffset(),
+    startAt_iso: clip.startAt.toISOString(),
+    endAt_iso: clip.endAt.toISOString(),
+    firstHour_iso: firstHour.toISOString(),
+    lastHour_iso: lastHour.toISOString(),
+  }, 'clip: covering scan starting');
+  for (let cur = new Date(firstHour); cur.getTime() <= lastHour.getTime(); cur = new Date(cur.getTime() + 3600_000)) {
+    const dir = join(
+      RECORDINGS, clip.channelId,
+      String(cur.getUTCFullYear()),
+      String(cur.getUTCMonth() + 1).padStart(2, '0'),
+      String(cur.getUTCDate()).padStart(2, '0'),
+      String(cur.getUTCHours()).padStart(2, '0'),
+    );
+    const dirExists = existsSync(dir);
+    log.info({ clipId: clip.id, dir, dirExists }, 'clip: probing hour dir');
+    if (!dirExists) continue;
+    let names: string[] = [];
+    try { names = readdirSync(dir); } catch (err) { log.warn({ clipId: clip.id, dir, err }, 'clip: readdir failed'); continue; }
+    let matched = 0;
+    for (const n of names) {
+      const m = n.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z\.mp4$/);
+      if (!m) continue;
+      const fileStart = new Date(+m[1]!, +m[2]! - 1, +m[3]!, +m[4]!, +m[5]!, +m[6]!);
+      const fileEnd   = new Date(fileStart.getTime() + SEG_SECONDS * 1000);
+      if (fileEnd > clip.startAt && fileStart < clip.endAt) {
+        covering.push({ path: join(dir, n), startedAt: fileStart });
+        matched++;
+      }
+    }
+    log.info({ clipId: clip.id, dir, totalEntries: names.length, matched }, 'clip: dir scan complete');
+  }
+  covering.sort((a, b) => a.startedAt.getTime() - b.startedAt.getTime());
+
   if (covering.length === 0) {
     await prisma.clip.update({ where: { id: clip.id }, data: { status: 'FAILED' } });
-    log.warn({ clipId: clip.id }, 'no covering segments');
+    log.warn({ clipId: clip.id, channelId: clip.channelId, startAt: clip.startAt, endAt: clip.endAt },
+             'no covering .mp4 files on disk for requested window');
     return;
   }
 
+  // Build ffmpeg input args. Single file → -ss/-to trim. Multiple files
+  // → concat demuxer + trim relative to first file's start.
   const first = covering[0]!;
-  const ss = (clip.startAt.getTime() - first.startedAt.getTime()) / 1000;
-  const to = (clip.endAt.getTime()   - first.startedAt.getTime()) / 1000;
+  const ss = Math.max(0, (clip.startAt.getTime() - first.startedAt.getTime()) / 1000);
+  const totalSpan = (covering[covering.length - 1]!.startedAt.getTime() + SEG_SECONDS * 1000 - first.startedAt.getTime()) / 1000;
+  const to = Math.min(totalSpan, (clip.endAt.getTime() - first.startedAt.getTime()) / 1000);
   const duration = Math.max(1, to - ss);
   const [w, h] = clip.resolution.split('x').map(Number);
+
+  // If multiple files, write a concat list file for ffmpeg's concat
+  // demuxer (safer than concat filter for pre-encoded MP4 pieces).
+  let ffInputArgs: string[];
+  const concatListPath = join(tmpdir(), `clip-concat-${clip.id}.txt`);
+  if (covering.length === 1) {
+    ffInputArgs = ['-ss', String(ss), '-to', String(Math.max(ss + 1, to)), '-i', first.path];
+  } else {
+    const lines = covering.map((c) => `file '${c.path.replace(/\\/g, '/').replace(/'/g, "'\\''")}'`).join('\n');
+    writeFileSync(concatListPath, lines);
+    ffInputArgs = [
+      '-f', 'concat', '-safe', '0',
+      '-ss', String(ss), '-to', String(Math.max(ss + 1, to)),
+      '-i', concatListPath,
+    ];
+  }
+  log.info({ clipId: clip.id, files: covering.length, span_s: totalSpan, ss, to }, 'clip: covering files located');
 
   // Watermark text — email + timestamp — flattened + ASCII-safe.
   const wmRaw = (clip.watermarkText ?? '').replace(/'/g, '');
@@ -702,9 +770,7 @@ async function clipWorker(job: { clipId: string }) {
 
     const mainArgs: string[] = [
       '-hide_banner', '-loglevel', 'warning',
-      '-ss', String(Math.max(0, ss)),
-      '-to', String(Math.max(ss + 1, to)),
-      '-i', first.path,
+      ...ffInputArgs,
       // Silent audio fallback — mapped only if source has no audio.
       '-f', 'lavfi', '-t', String(duration + 1), '-i', 'anullsrc=r=48000:cl=stereo',
     ];
@@ -744,6 +810,7 @@ async function clipWorker(job: { clipId: string }) {
     try { unlinkSync(outFile); } catch { /* */ }
   } finally {
     try { rmSync(workDir, { recursive: true, force: true }); } catch { /* */ }
+    try { unlinkSync(concatListPath); } catch { /* file may not exist for single-file clips */ }
   }
 }
 

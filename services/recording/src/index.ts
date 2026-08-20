@@ -99,11 +99,11 @@ const SEG_SECONDS   = Number(process.env.RECORDING_SEGMENT_SECONDS ?? 60);
 // blockiness (news ticker text tearing, faces pixelated) on downloaded
 // clips. Combined with the 854x480 resolution below, size envelope is
 // ~9.7 MB/min — well under any reasonable clip length.
-const V_BITRATE     = process.env.RECORDING_VIDEO_BITRATE ?? '1200k';
+const V_BITRATE     = process.env.RECORDING_VIDEO_BITRATE ?? '500k';
 // Kept for the clip renderer (which still re-encodes audio at export).
 // The live recorder no longer uses this because it pass-through
 // remuxes from live-hls's already-AAC output.
-const A_BITRATE     = process.env.RECORDING_AUDIO_BITRATE ?? '96k';
+const A_BITRATE     = process.env.RECORDING_AUDIO_BITRATE ?? '64k';
 const SIGN_KEY      = process.env.MANIFEST_SIGNING_KEY   ?? 'dev-only';
 const TITLE_CARD_SEC = 3;
 
@@ -121,6 +121,24 @@ interface Supervisor {
 }
 
 const supervisors = new Map<string, Supervisor>();
+
+/** Every recording ffmpeg pid we've spawned this process lifetime,
+ *  mapped to the ms epoch when it was spawned. The orphan sweep uses
+ *  this as a "young process" grace list — any ffmpeg pid that appears
+ *  in wmic AND is <90s old came from us and must not be killed, even
+ *  if the sweep can't otherwise link it to a live supervisor (race
+ *  windows: pid recycling on Windows, tracked-set inspection during
+ *  a mid-respawn tick, or the ffmpeg being reaped but its record
+ *  lingering in wmic for a beat).
+ *
+ *  2026-08-20 evening: abb-tak restart-looped every ~20 s because
+ *  the sweep was killing its just-spawned live ffmpeg — the exit
+ *  handler fired 86 ms after the orphan kill each cycle.  */
+const recentlySpawnedPids = new Map<number, number>();
+/** Sweep is expensive (wmic ~50-100 ms) and dangerous (can race with
+ *  a spawn). Only run at this cadence, not once per refresh tick.  */
+const ORPHAN_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+let lastOrphanSweepAt = 0;
 
 /**
  * Auto-restart intelligence.
@@ -335,6 +353,19 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
   // muxer trailer, closes the file cleanly, and exits with code 255
   // (which we treat as a clean stop in the exit handler).
   const proc = spawn('ffmpeg', args, { stdio: ['pipe', 'pipe', 'pipe'] });
+  // Register spawn time BEFORE anything else that could throw or await
+  // so the orphan sweep never races with a barely-alive pid.
+  if (typeof proc.pid === 'number') {
+    recentlySpawnedPids.set(proc.pid, Date.now());
+    // Cheap GC: drop entries older than 30 min so the map can't grow
+    // unbounded over a long service lifetime.
+    if (recentlySpawnedPids.size > 500) {
+      const cutoff = Date.now() - 30 * 60 * 1000;
+      for (const [k, v] of recentlySpawnedPids) {
+        if (v < cutoff) recentlySpawnedPids.delete(k);
+      }
+    }
+  }
   proc.stderr.on('data', (b) => {
     const line = b.toString().trim();
     if (line && !line.startsWith('frame=')) log.debug({ slug }, line.slice(0, 200));
@@ -551,44 +582,88 @@ async function refreshSupervisors() {
     supervisors.set(c.id, sup);
   }
 
-  // ORPHAN SWEEP (belt-and-suspenders). Even with the verified
-  // hardKill above, exotic edge cases can still leave a recording
-  // ffmpeg alive that no supervisor is tracking: a Node exception
-  // between spawnFFmpeg() and sup.proc assignment, a supervisor
-  // deleted from the Map while its child is still respawning,
-  // or a taskkill that fooled the verify loop. This sweep catches
-  // any recording ffmpeg whose PID isn't the current sup.proc.pid
-  // for any live supervisor, and kills it. Cheap (~1 wmic call per
-  // 5 s tick) and self-healing.
-  if (process.platform === 'win32') {
-    try {
-      const tracked = new Set<number>();
-      for (const sup of supervisors.values()) {
-        const pid = sup.proc?.pid;
-        if (typeof pid === 'number') tracked.add(pid);
+  // ORPHAN SWEEP — throttled + young-process safe.
+  //
+  // The sweep exists as a belt-and-suspenders against exotic leaks
+  // (Node exception between spawnFFmpeg() and sup.proc assignment,
+  // a taskkill that fooled the verify loop). BUT it is dangerous
+  // because tracked-set inspection can miss legitimate ffmpegs
+  // during a mid-respawn tick — and taskkilling a live recorder
+  // triggers immediate segment loss.
+  //
+  // Two guards make this safe:
+  //   1. Cadence: only run every ORPHAN_SWEEP_INTERVAL_MS (5 min),
+  //      not once per refresh tick. Real orphans persist forever
+  //      until killed; there's no cost to waiting 5 min to reap them.
+  //   2. Age filter: any pid recentlySpawnedPids.has() OR that wmic
+  //      reports as <90s old is exempt. That covers the entire
+  //      race window (spawn → assign → next tick sees it) without
+  //      opening a leak window (a real orphan will still be here
+  //      when the 5-min timer fires).
+  //
+  // 2026-08-20 evening: abb-tak had 17 restart-loops in an hour
+  // because the old sweep was killing its just-spawned live ffmpeg
+  // every ~20 s — the exit fired 86 ms after the orphan kill each
+  // cycle.
+  if (process.platform !== 'win32') return;
+  const nowMs = Date.now();
+  if (nowMs - lastOrphanSweepAt < ORPHAN_SWEEP_INTERVAL_MS) return;
+  lastOrphanSweepAt = nowMs;
+  try {
+    const tracked = new Set<number>();
+    for (const sup of supervisors.values()) {
+      const pid = sup.proc?.pid;
+      if (typeof pid === 'number') tracked.add(pid);
+    }
+    // Ask wmic for CreationDate too so we can compute per-pid age.
+    const wmic = spawnSync('wmic', ['process', 'where', "name='ffmpeg.exe'",
+      'get', 'ProcessId,CommandLine,CreationDate', '/format:csv'], { encoding: 'utf8' });
+    const orphans: number[] = [];
+    const skippedYoung: number[] = [];
+    for (const line of (wmic.stdout ?? '').split(/\r?\n/)) {
+      // Only recording ffmpegs (cmdline references D:\cmc\recordings).
+      if (!line.toLowerCase().includes(RECORDINGS.toLowerCase())) continue;
+      const parts = line.trim().split(',');
+      // csv layout (with /format:csv): Node,CommandLine,CreationDate,ProcessId
+      const pid = Number(parts[parts.length - 1]);
+      const created = parts[parts.length - 2] ?? '';
+      if (!Number.isInteger(pid) || pid <= 0) continue;
+      if (tracked.has(pid)) continue;
+      // Grace: pids we spawned recently, even if not currently tracked
+      // (respawn window), are ours.
+      const ourSpawnAt = recentlySpawnedPids.get(pid);
+      if (typeof ourSpawnAt === 'number' && nowMs - ourSpawnAt < 90_000) {
+        skippedYoung.push(pid);
+        continue;
       }
-      const wmic = spawnSync('wmic', ['process', 'where', "name='ffmpeg.exe'",
-        'get', 'ProcessId,CommandLine', '/format:csv'], { encoding: 'utf8' });
-      const orphans: number[] = [];
-      for (const line of (wmic.stdout ?? '').split(/\r?\n/)) {
-        // Only recording ffmpegs (cmdline references D:\cmc\recordings).
-        if (!line.toLowerCase().includes(RECORDINGS.toLowerCase())) continue;
-        const parts = line.trim().split(',');
-        const pid = Number(parts[parts.length - 1]);
-        if (!Number.isInteger(pid) || pid <= 0) continue;
-        if (tracked.has(pid)) continue;
-        orphans.push(pid);
-      }
-      if (orphans.length > 0) {
-        log.warn({ count: orphans.length, pids: orphans.slice(0, 8) },
-                 'orphan recording ffmpegs found (untracked) — killing');
-        for (const pid of orphans) {
-          try { spawnSync('taskkill', ['/F', '/T', '/PID', String(pid)], { stdio: 'ignore' }); }
-          catch { /* noop */ }
+      // WMI CreationDate is `YYYYMMDDHHmmss.ffffff+ZZZ` local time.
+      // Parse the first 14 digits as local wall-clock, compare in ms.
+      const m = created.match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/);
+      if (m) {
+        const spawned = new Date(
+          Number(m[1]), Number(m[2]) - 1, Number(m[3]),
+          Number(m[4]), Number(m[5]), Number(m[6]),
+        ).getTime();
+        if (nowMs - spawned < 90_000) {
+          skippedYoung.push(pid);
+          continue;
         }
       }
-    } catch (err) { log.warn({ err }, 'orphan sweep failed (non-fatal)'); }
-  }
+      orphans.push(pid);
+    }
+    if (skippedYoung.length > 0) {
+      log.info({ count: skippedYoung.length, pids: skippedYoung.slice(0, 8) },
+               'orphan sweep: skipping young ffmpegs (<90s) — probably ours mid-spawn');
+    }
+    if (orphans.length > 0) {
+      log.warn({ count: orphans.length, pids: orphans.slice(0, 8) },
+               'orphan recording ffmpegs found (untracked, >90s old) — killing');
+      for (const pid of orphans) {
+        try { spawnSync('taskkill', ['/F', '/T', '/PID', String(pid)], { stdio: 'ignore' }); }
+        catch { /* noop */ }
+      }
+    }
+  } catch (err) { log.warn({ err }, 'orphan sweep failed (non-fatal)'); }
 }
 
 /** Escape a user-supplied string for use inside a drawtext text= value.
@@ -717,14 +792,31 @@ async function clipWorker(job: { clipId: string }) {
 
   // If multiple files, write a concat list file for ffmpeg's concat
   // demuxer (safer than concat filter for pre-encoded MP4 pieces).
+  // Tolerance flags applied to EVERY clip input. UDP-copy recordings
+  // (most channels) can have truncated H.264 SEI, PID discontinuities,
+  // and missing PES headers when packet loss hits mid-frame. Without
+  // these flags, the render dies with `SEI type X size Y truncated at
+  // Z / ffmpeg main exit 1` and the whole clip fails. With them,
+  // ffmpeg skips the bad frame and continues.
+  //
+  // 2026-08-20: neo-news + aik-news clips failed exactly this way after
+  // the covering-file scan was already finding the segment.
+  const TOLERANCE_IN = [
+    '-fflags', '+discardcorrupt+igndts+genpts',
+    '-err_detect', 'ignore_err',
+    '-ec', 'guess_mvs+deblock',
+    '-analyzeduration', '20000000',
+    '-probesize', '20000000',
+  ];
   let ffInputArgs: string[];
   const concatListPath = join(tmpdir(), `clip-concat-${clip.id}.txt`);
   if (covering.length === 1) {
-    ffInputArgs = ['-ss', String(ss), '-to', String(Math.max(ss + 1, to)), '-i', first.path];
+    ffInputArgs = [...TOLERANCE_IN, '-ss', String(ss), '-to', String(Math.max(ss + 1, to)), '-i', first.path];
   } else {
     const lines = covering.map((c) => `file '${c.path.replace(/\\/g, '/').replace(/'/g, "'\\''")}'`).join('\n');
     writeFileSync(concatListPath, lines);
     ffInputArgs = [
+      ...TOLERANCE_IN,
       '-f', 'concat', '-safe', '0',
       '-ss', String(ss), '-to', String(Math.max(ss + 1, to)),
       '-i', concatListPath,
@@ -795,12 +887,12 @@ async function clipWorker(job: { clipId: string }) {
       '-map', '[outv]',
       '-map', '0:a:0?', '-map', '1:a:0',
       '-shortest',
-      // Hard cap instantaneous bitrate. Bumped 2026-08-20 with the
-      // V_BITRATE default change from 500k → 1200k for better clip
-      // legibility; maxrate/bufsize scaled proportionally to keep the
-      // VBV constraint effective.
+      // Bitrate cap tuned 2026-08-20 (evening) — operator wants ~4-5 MB
+      // per minute of downloaded clip. 500k video + 64k audio + faststart
+      // overhead ≈ 4.2 MB/min at 854x480. maxrate/bufsize scaled so VBV
+      // still bounds bursts without stealing detail.
       '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', V_BITRATE,
-      '-maxrate', '1600k', '-bufsize', '3200k',
+      '-maxrate', '700k', '-bufsize', '1400k',
       '-c:a', 'aac', '-b:a', A_BITRATE, '-ac', '2', '-ar', '48000',
       ...(isMovLike ? ['-movflags', '+faststart'] : []),
       '-y', mainPath,

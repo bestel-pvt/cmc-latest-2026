@@ -256,45 +256,49 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
     }
   }
 
-  // Uniform ingest transcode for EVERY channel. Design goal (operator
-  // spec 2026-08-20 late-late): "the recording IS the download". By
-  // ingesting at a small canvas (640x360) with a healthy per-pixel
-  // bitrate (700k), storage per channel = ~5.5 MB/min and downloads
-  // can just concat -c copy — no re-encode, no compress-below-source,
-  // consistent bytes end-to-end.
+  // Decide transcode:
+  //   1. Slug in RECORDING_TRANSCODE_SLUGS (slow-KF sources) → always
+  //      transcode so we get clean 60-s segment cuts.
+  //   2. Source codec is not H.264 (probed once) → transcode so the
+  //      browser + hls.js can play the recording.
+  //   3. Otherwise `-c copy` (near-zero CPU, native quality preserved).
   //
-  // Previous mode (`-c copy` on native + transcode-at-download) was
-  // the reverse: 1.3 MB source segment shrank to 975 KB on download,
-  // which the operator called "totally ghalat".
-  //
-  // Storage math: 5.5 MB/min × 60 × 24 × 30 days × 30 channels
-  //   ≈ 7.1 TB per rolling 30-day window (safe on 78 TB disk).
-  // CPU: 30 × x264 ultrafast @ 640x360 ≈ 15-25 % per core, well
-  // inside the box's budget (measured live-hls fleet is comparable).
-  //
-  // The old RECORDING_TRANSCODE_SLUGS list is kept for env override
-  // (in case someone wants to force `-c copy` on a specific slug via
-  // RECORDING_COPY_SLUGS) but is no longer consulted by default.
-  void slug; void kind; void sourceUrl;   // codec probe no longer needed
-  const copyOverride = (process.env.RECORDING_COPY_SLUGS ?? '')
-    .split(',').map((s) => s.trim()).filter(Boolean);
-  const forceCopy = copyOverride.includes(slug);
-  const needsTranscode = !forceCopy;
+  // The 2026-08-20 late-late "force transcode ALL channels" experiment
+  // pushed CPU to 100 % on the 112-core box because 30 concurrent x264
+  // encodes cost ~20-40 cores on top of live-hls's ~40 cores.
+  // Recording = download consistency is now preserved by:
+  //   * -c copy segments  →  download uses letterbox-padded re-encode
+  //     at the same 640x360 content size (net: download size tracks
+  //     source size, no compress-below-source regression).
+  const slugForced = RECORDING_TRANSCODE_SLUGS.has(slug);
+  if (!slugForced && !channelCodec.has(slug)) {
+    log.info({ slug }, 'probing source codec (once)');
+    const codec = probeVideoCodec(sourceUrl, kind);
+    channelCodec.set(slug, codec);
+    log.info({ slug, codec }, 'source codec detected');
+  }
+  const codec = channelCodec.get(slug);
+  const needsTranscode = slugForced || (codec !== undefined && codec !== 'h264');
   // Keyframe every 2 s so the clip editor's HLS slicer (6 s chunks)
   // always finds a keyframe on every slice boundary — cross-slice
   // -c copy works, hls.js plays without black frames.
   const videoArgs = needsTranscode
     ? [
         // Ingest stays at 640x360 — 30 concurrent x264 encodes must
-        // fit under ~5-8 CPU cores 24/7. Tried 1280x720 letterboxed
-        // ingest and it saturated all 16 cores (RDP froze). Letterbox
-        // padding for playback sharpness happens on-demand at CLIP /
-        // DOWNLOAD time instead — one process at a time, unbounded
-        // CPU is fine there.
-        '-vf', 'yadif=0:-1:0,scale=640:360:force_original_aspect_ratio=decrease:flags=lanczos,pad=640:360:(ow-iw)/2:(oh-ih)/2',
+        // fit under the server's steady CPU budget. Server has 112
+        // logical cores but was hitting 98 % because each encoder was
+        // using 2.2 cores × 30 = 66 cores plus 30 live-hls transcodes.
+        //
+        // Cuts applied:
+        //   * -threads 1 (was 2)  ~1.6 GB/hour still recycled at 30 min
+        //     so 2 threads bought no throughput at 640x360; halves core use
+        //   * dropped yadif      only matters for viewer-side interlace,
+        //     not for stored mp4 (player deinterlaces on playback). Yadif
+        //     costs ~30-40 % CPU per stream, wasted here.
+        '-vf', 'scale=640:360:force_original_aspect_ratio=decrease:flags=lanczos,pad=640:360:(ow-iw)/2:(oh-ih)/2',
         '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
         '-profile:v', 'main', '-pix_fmt', 'yuv420p',
-        '-threads', '2',
+        '-threads', '1',
         '-b:v', '700k', '-maxrate', '1000k', '-bufsize', '2000k',
         '-force_key_frames', 'expr:gte(t,n_forced*2)',
       ]

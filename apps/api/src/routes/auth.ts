@@ -18,7 +18,15 @@ const authRoutes: FastifyPluginAsync = async (app) => {
       return reply.unauthorized('Invalid credentials');
     }
 
-    const accessToken  = await reply.jwtSign({ sub: user.id, email: user.email, role: user.role });
+    // 12 h access token: without explicit expiresIn the token uses the
+    // @fastify/jwt default (short — session/15 min), which forced the
+    // browser to re-authenticate every ~15 min. bcryptjs.compare is
+    // synchronous pure-JS and takes ~450 ms per call on this hardware;
+    // three concurrent logins (browser retry + multiple tabs) serialize
+    // to 1.2–1.3 s each because the main event loop is blocked. 12 h
+    // access + 7 d refresh means the browser hits /login once per shift,
+    // not every 15 min — bcrypt pressure disappears in normal use.
+    const accessToken  = await reply.jwtSign({ sub: user.id, email: user.email, role: user.role }, { expiresIn: '12h' });
     const refreshToken = await reply.jwtSign({ sub: user.id, email: user.email, role: user.role }, { expiresIn: '7d' });
 
     await app.prisma.user.update({ where: { id: user.id }, data: { lastLoginAt: new Date() } });
@@ -34,7 +42,7 @@ const authRoutes: FastifyPluginAsync = async (app) => {
       const payload = app.jwt.verify(refreshToken) as { sub: string; email: string; role: 'ADMIN' | 'OPERATOR' | 'ANALYST' | 'VIEWER' };
       const user = await app.prisma.user.findUnique({ where: { id: payload.sub } });
       if (!user || user.disabledAt) return reply.unauthorized();
-      const accessToken = await reply.jwtSign({ sub: user.id, email: user.email, role: user.role });
+      const accessToken = await reply.jwtSign({ sub: user.id, email: user.email, role: user.role }, { expiresIn: '12h' });
       return { accessToken };
     } catch {
       return reply.unauthorized('Invalid refresh token');

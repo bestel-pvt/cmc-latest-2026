@@ -291,7 +291,7 @@ function RecordingsInner() {
                     // Anything older is a genuinely-ended session and
                     // gets the formatted end timestamp instead.
                     const chLive = (liveStatus ?? []).some(
-                      (l) => l.channelId === s.channel.id && l.status === 'recording',
+                      (l) => l.id === s.channel.id && l.status === 'recording',
                     );
                     const isLive = chLive && (Date.now() - ended.getTime()) < 120_000;
                     return (

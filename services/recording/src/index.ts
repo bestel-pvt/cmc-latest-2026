@@ -645,15 +645,24 @@ async function clipWorker(job: { clipId: string }) {
   // because Aug 18/19 segments never landed in DB).
   interface CoveringFile { path: string; startedAt: Date }
   const covering: CoveringFile[] = [];
-  // channelOutDir() writes hour-dirs using UTC (getUTCHours), so we
-  // must match with UTC here. ffmpeg's -strftime 1 on Windows writes
-  // FILENAMES using LOCAL time, though — see filename parsing below.
-  // Missing this dual-timezone quirk was why the first cut of the
-  // DB-free renderer failed on all 4 retried clips: looked in
-  // /2026/08/18/20/ (Node local PKT hour) when the file was written
-  // to /2026/08/18/15/ (UTC hour).
+  // channelOutDir() writes hour-dirs using UTC (getUTCHours) at SPAWN
+  // time, and the ffmpeg process keeps writing to that same dir until
+  // it exits — it does NOT rotate dirs on the hour. So a segment for
+  // UTC hour H can physically live in dir H, H-1, H-2, ... depending
+  // on when the process started. Filename filter below still restricts
+  // to the clip window, so widening the scan is safe.
+  //
+  // 2026-08-20 GTV incident: clip at 14:01 UTC failed with "no covering
+  // files" because ffmpeg (spawned during UTC 13) was still writing to
+  // /2026/08/20/13/ — dir /2026/08/20/14/ didn't exist yet.
+  //
+  // Also handles the earlier PKT-vs-UTC bug: filename is LOCAL time,
+  // dir is UTC hour — filename regex parses local, we compare in real
+  // ms so it stays correct across the boundary.
   const firstHour = new Date(clip.startAt); firstHour.setUTCMinutes(0, 0, 0);
+  firstHour.setUTCHours(firstHour.getUTCHours() - 6);
   const lastHour  = new Date(clip.endAt);   lastHour.setUTCMinutes(0, 0, 0);
+  lastHour.setUTCHours(lastHour.getUTCHours() + 1);
   log.info({
     clipId: clip.id,
     tzOffsetMin: -new Date().getTimezoneOffset(),
@@ -778,7 +787,9 @@ async function clipWorker(job: { clipId: string }) {
       // Silent audio fallback — mapped only if source has no audio.
       '-f', 'lavfi', '-t', String(duration + 1), '-i', 'anullsrc=r=48000:cl=stereo',
     ];
-    if (hasBranding) mainArgs.push('-i', PAK_LOGO, '-i', ANL_LOGO);
+    // Branding disabled — PAK_LOGO/ANL_LOGO removed; keep gate false-only path.
+    // if (hasBranding) mainArgs.push('-i', PAK_LOGO, '-i', ANL_LOGO);
+    void hasBranding;
     mainArgs.push(
       '-filter_complex', mainFilter.join(';'),
       '-map', '[outv]',

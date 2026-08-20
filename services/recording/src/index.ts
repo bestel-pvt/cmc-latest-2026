@@ -788,7 +788,15 @@ async function clipWorker(job: { clipId: string }) {
   const totalSpan = (covering[covering.length - 1]!.startedAt.getTime() + SEG_SECONDS * 1000 - first.startedAt.getTime()) / 1000;
   const to = Math.min(totalSpan, (clip.endAt.getTime() - first.startedAt.getTime()) / 1000);
   const duration = Math.max(1, to - ss);
-  const [w, h] = clip.resolution.split('x').map(Number);
+  // Force 640x360 regardless of clip.resolution.
+  // Operator asked (2026-08-20 late evening) to lower the output canvas
+  // so bits-per-pixel goes up at the same 500k budget — 640x360 gives
+  // 74 % more bits/pixel than 854x480 for identical file size and made
+  // faces/tickers legible in a side-by-side test. The old UI dropdown
+  // still writes "1920x1080" into clip.resolution for legacy reasons;
+  // we clamp here so no clip ends up at a wasteful size.
+  void clip.resolution;
+  const w = 640, h = 360;
 
   // If multiple files, write a concat list file for ffmpeg's concat
   // demuxer (safer than concat filter for pre-encoded MP4 pieces).

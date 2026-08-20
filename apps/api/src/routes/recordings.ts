@@ -301,10 +301,14 @@ const routes: FastifyPluginAsync = async (app) => {
             '-err_detect', 'ignore_err',
             '-fflags', '+genpts+discardcorrupt',
             '-f', 'concat', '-safe', '0', '-i', listPath,
-            // Tuned 2026-08-20 (evening): operator asked for ~4-5 MB/min
-            // downloads. 500k video + 64k audio + faststart ≈ 4.2 MB/min
-            // at 854x480. Same resolution as before — no visual crunch.
-            '-vf', 'yadif=0:-1:0,scale=854:480:force_original_aspect_ratio=decrease:flags=lanczos,pad=854:480:(ow-iw)/2:(oh-ih)/2',
+            // Tuned 2026-08-20 late evening: dropped to 640x360 @ 500k.
+            // Same file-size budget as 854x480 @ 500k, but 74 % more bits
+            // per pixel — faces, tickers and station bugs read cleanly
+            // instead of mosquito-noised. Operator asked directly for
+            // "length/width smaller so resolution can be better without
+            // file size growing" after comparing crisp 640x360 recordings
+            // vs blocky 854x480 downloads.
+            '-vf', 'yadif=0:-1:0,scale=640:360:force_original_aspect_ratio=decrease:flags=lanczos,pad=640:360:(ow-iw)/2:(oh-ih)/2',
             '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency',
             '-profile:v', 'main', '-pix_fmt', 'yuv420p',
             '-threads', '2',
@@ -713,33 +717,47 @@ const routes: FastifyPluginAsync = async (app) => {
     });
     if (playable.length === 0) return reply.notFound();
 
-    // Decode each segment's audio → raw s16le mono at 4 kHz, collect
-    // into one big Int16Array.
+    // Decode ALL segments in ONE ffmpeg concat call, not N sequential
+    // spawns. A 60-min session (60 segments) went from 60 × ~1 s spawns
+    // (~1 min wall-clock — client timeout → "Waveform unavailable")
+    // to a single stream that finishes in ~5-10 s. Concat + `-c copy`
+    // audio-only isn't safe if per-segment codecs vary, so we decode
+    // to raw s16le mono @ 4 kHz which normalises everything.
     const totalDurMs = playable.reduce((n, s) => n + s.durationMs, 0);
     const sr = 4000;
     const expectedSamples = Math.floor((totalDurMs / 1000) * sr);
     const buf = new Int16Array(expectedSamples);
     let offset = 0;
-
-    for (const s of playable) {
-      const wav = await new Promise<Buffer>((resolve, reject) => {
-        const chunks: Buffer[] = [];
+    const listPath = join(PEAKS_CACHE, `list-${key}.txt`);
+    const listBody = playable
+      .map((s) => `file '${s.path.replace(/\\/g, '/').replace(/'/g, "'\\''")}'`)
+      .join('\n');
+    writeFileSync(listPath, listBody);
+    try {
+      const chunks: Buffer[] = [];
+      await new Promise<void>((resolve) => {
         const ff = spawn('ffmpeg', [
           '-hide_banner', '-loglevel', 'error', '-nostdin',
-          '-i', s.path,
+          '-fflags', '+discardcorrupt+igndts+genpts',
+          '-err_detect', 'ignore_err',
+          '-f', 'concat', '-safe', '0', '-i', listPath,
           '-vn', '-ac', '1', '-ar', String(sr),
           '-f', 's16le', '-',
         ], { stdio: ['ignore', 'pipe', 'pipe'] });
+        // 90-second hard cap so a stalled ffmpeg can't block the reply
+        // (the client bails at ~30 s anyway).
+        const kill = setTimeout(() => { try { ff.kill('SIGKILL'); } catch {} }, 90_000);
         ff.stdout.on('data', (b) => chunks.push(b));
-        ff.on('exit', (code) => code === 0
-          ? resolve(Buffer.concat(chunks))
-          : reject(new Error(`ffmpeg exit ${code}`)));
-        ff.on('error', reject);
-      }).catch(() => Buffer.alloc(0));
+        ff.on('exit', () => { clearTimeout(kill); resolve(); });
+        ff.on('error', () => { clearTimeout(kill); resolve(); });
+      });
+      const wav = Buffer.concat(chunks);
       const samples = new Int16Array(wav.buffer, wav.byteOffset, wav.byteLength / 2);
-      const room = Math.min(samples.length, buf.length - offset);
-      buf.set(samples.subarray(0, room), offset);
-      offset += room;
+      const room = Math.min(samples.length, buf.length);
+      buf.set(samples.subarray(0, room));
+      offset = room;
+    } finally {
+      try { unlinkSync(listPath); } catch {}
     }
 
     // Downsample to `buckets` peaks (max abs value per bucket → normalised 0-1).

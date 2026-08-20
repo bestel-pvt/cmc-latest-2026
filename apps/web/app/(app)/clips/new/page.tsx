@@ -70,6 +70,11 @@ export default function NewClipPage() {
     { kind: 'error'; message: string }
   >({ kind: 'idle' });
   const [waveState, setWaveState] = useState<'idle' | 'loading' | 'ready' | 'failed'>('idle');
+  // Separate flag for "buffering after a seek". videoState transitions
+  // to 'ready' after the initial manifest parse and never flips back to
+  // 'loading' on seeks — so without this the player looks completely
+  // frozen when you click a timeline point that isn't buffered yet.
+  const [seekBuffering, setSeekBuffering] = useState(false);
 
   const [title, setTitle] = useState('');
   const [notes, setNotes] = useState('');
@@ -336,7 +341,24 @@ export default function NewClipPage() {
               playsInline
               muted={muted}
               onClick={() => { const v = videoRef.current; if (!v) return; v.paused ? v.play() : v.pause(); }}
+              onWaiting={() => setSeekBuffering(true)}
+              onSeeking={() => setSeekBuffering(true)}
+              onPlaying={() => setSeekBuffering(false)}
+              onCanPlay={() => setSeekBuffering(false)}
+              onPause={() => setSeekBuffering(false)}
+              onSeeked={() => {
+                // Some browsers fire 'seeked' before the frame is actually
+                // decoded; leave the spinner up until 'playing' or
+                // 'canplay' fires so the operator never sees a stall
+                // that looks like a hang.
+              }}
             />
+            {videoState.kind === 'ready' && seekBuffering && (
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-ink/40 text-[11px] text-white/80 pointer-events-none">
+                <Loader2 className="h-6 w-6 animate-spin text-brand" />
+                <div>Loading…</div>
+              </div>
+            )}
             {videoState.kind === 'loading' && (
               <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-ink/80 text-sm text-white/80 pointer-events-none">
                 <Loader2 className="h-6 w-6 animate-spin text-brand" />

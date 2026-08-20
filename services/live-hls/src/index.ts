@@ -495,7 +495,14 @@ function launch(sup: Sup): void {
  * Watch interval 60 s + spread across supervisors: ~30 kills per 90
  * minutes = ~1 kill / 3 minutes. Each blink ~2-3 s.
  */
-const MAX_ENCODER_AGE_MS = 90 * 60 * 1000;
+// Tightened 2026-08-20 late: 90 → 30 min. At 90 min each ffmpeg had
+// grown to ~1-1.5 GB (measured: 644 MB @ 12 min for aik-news → linear
+// extrapolation ~1.6 GB @ 30 min, ~5 GB @ 90 min). 30 procs × 1.5 GB
+// was pushing 45 GB of memory JUST for live-hls. At 30 min recycle
+// each proc caps at ~500 MB → 15 GB total (fits well inside 128 GB
+// server with plenty of headroom for recording + node + OS cache).
+// Recycle is one-at-a-time so at worst one tile blinks every ~60 s.
+const MAX_ENCODER_AGE_MS = 30 * 60 * 1000;
 function recycleAgedFFmpegs(): void {
   const now = Date.now();
   const aged = Array.from(supervisors.values())

@@ -937,23 +937,35 @@ async function main() {
   // Periodically walk EVERY hour dir under EVERY channel and ingest any
   // .mp4 that isn't marked .recorded.
   const { existsSync: _exists, readdirSync } = await import('node:fs');
+  // Only the CURRENT and PREVIOUS hour dirs need scanning — anything
+  // older either already has a .recorded sidecar (ingested on the last
+  // sweep) or was created before the service ever ran and won't ever
+  // gain one. The old implementation walked the ENTIRE year/month/day/
+  // hour tree every 5 s: on this box that's ~30 d × 24 h × 30 channels
+  // ≈ 21 K dirs × (readdir + statSync per .mp4) — the scan never
+  // finished, so the `scanning` guard blocked every subsequent tick.
+  // Symptom (2026-08-20): 30 recording ffmpegs writing 60 fresh files
+  // per channel per hour, but only ONE channel's segments ever landed
+  // in the RecordingSegment table. Recordings page showed "0 recordings"
+  // + all channels "not-started" because the DB genuinely was empty
+  // for the past 12+ hours of otherwise-perfect ffmpeg output.
   function walkChannel(channelId: string): string[] {
     const base = join(RECORDINGS, channelId);
     if (!_exists(base)) return [];
-    const dirs: string[] = [];
-    for (const y of readdirSync(base)) {
-      const yp = join(base, y);
-      for (const m of readdirSync(yp)) {
-        const mp = join(yp, m);
-        for (const d of readdirSync(mp)) {
-          const dp = join(mp, d);
-          for (const h of readdirSync(dp)) {
-            dirs.push(join(dp, h));
-          }
-        }
-      }
+    const now = new Date();
+    const prev = new Date(now.getTime() - 3600_000);
+    const out: string[] = [];
+    for (const when of [prev, now]) {
+      const dir = join(
+        base,
+        String(when.getUTCFullYear()),
+        String(when.getUTCMonth() + 1).padStart(2, '0'),
+        String(when.getUTCDate()).padStart(2, '0'),
+        String(when.getUTCHours()).padStart(2, '0'),
+      );
+      if (_exists(dir)) out.push(dir);
     }
-    return dirs;
+    return out;
   }
   // In-flight guard: a slow scan cycle (e.g. hundreds of unmarked files
   // + slow Prisma) can take >5 s. Without this guard the NEXT

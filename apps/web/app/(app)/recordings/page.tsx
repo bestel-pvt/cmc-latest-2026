@@ -63,8 +63,13 @@ function RecordingsInner() {
   // both endpoints and Date parsing accept it consistently).
   const now = new Date();
   const todayLocal = fmtLocalDT(now);
+  // Default window: today from 00:00 — was 30 days, which pulled
+  // ~150 K RecordingSegment rows and made the page hang for 8 s
+  // before showing anything. Operators overwhelmingly look at
+  // today's recordings; older data is still one click on the date
+  // picker away.
   const thirtyDaysAgo = (() => {
-    const d = new Date(now.getTime()); d.setDate(d.getDate() - 29); d.setHours(0, 0, 0, 0);
+    const d = new Date(now.getTime()); d.setHours(0, 0, 0, 0);
     return fmtLocalDT(d);
   })();
 

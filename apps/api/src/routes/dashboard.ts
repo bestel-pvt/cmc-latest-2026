@@ -195,34 +195,48 @@ const routes: FastifyPluginAsync = async (app) => {
    * reload all share the same cached response.
    */
   app.get('/resources', async () => {
-    const CACHE_MS = 10_000;
+    // Stale-while-revalidate. The dirSize walk over D:\cmc\recordings
+    // was measured at 25–30 s on this box (hundreds of thousands of
+    // .mp4 files, each stat'd sync). Blocking the browser dashboard
+    // for that long is what made the whole UI feel "stuck loading".
+    // New policy: cheap fields (CPU, memory, disk free/total via
+    // logical-drive query) ALWAYS return in <150 ms. The expensive
+    // per-directory breakdown is served from cache only; a background
+    // refresh runs at most once per REFRESH_MS. On first call after
+    // boot the breakdown is zeroed (dashboard just shows the
+    // top-level bar); once the first refresh finishes (~30 s later)
+    // the numbers populate.
+    const REFRESH_MS = 5 * 60_000;  // 5 min — matches how fast disk usage actually changes
     const nowMs = Date.now();
-    if (resourcesCache && nowMs - resourcesCache.at < CACHE_MS) {
-      return resourcesCache.value;
-    }
-    // Directory sizes CAN be expensive on TB-scale data — 480 files
-    // was ~140 ms; 100 K files can push several seconds. Cache above
-    // keeps that from happening every 10 s poll.
-    const recordingsBytes = dirSize(RECORDINGS_DIR);
-    const clipsBytes      = dirSize(CLIPS_DIR);
-    const framesBytes     = dirSize(FRAMES_ROOT);
 
+    // Cheap fields — always fresh.
     const cpus = os.cpus();
     const totalMem = os.totalmem();
     const freeMem  = os.freemem();
     const usedMem  = totalMem - freeMem;
     const cpuPct   = await cpuUsagePercent(150);
-
-    // Show ALL fixed drives, biggest first — the actual storage
-    // hardware. The single "primary" (biggest, i.e. the recording
-    // volume) still drives the top-line percentage/bar, but the
-    // operator sees the full picture instead of thinking their tiny
-    // system C: drive is all the storage they have.
     const disks = allDisks();
     const primary = disks[0] ?? diskUsage(DATA_DIR);
     const primaryMount = disks[0]?.mount ?? DATA_DIR;
 
-    const payload = {
+    // Kick off background refresh if cache is stale / empty. Never
+    // await — always returns from cache (or zeros on cold boot).
+    if (!breakdownRefreshInFlight && (!breakdownCache || nowMs - breakdownCache.at > REFRESH_MS)) {
+      breakdownRefreshInFlight = true;
+      setImmediate(() => {
+        try {
+          const recordingsBytes = dirSize(RECORDINGS_DIR);
+          const clipsBytes      = dirSize(CLIPS_DIR);
+          const framesBytes     = dirSize(FRAMES_ROOT);
+          breakdownCache = { at: Date.now(), recordingsBytes, clipsBytes, framesBytes };
+        } finally {
+          breakdownRefreshInFlight = false;
+        }
+      });
+    }
+    const bd = breakdownCache ?? { recordingsBytes: 0, clipsBytes: 0, framesBytes: 0 };
+
+    return {
       at: new Date().toISOString(),
       cpu: {
         cores: cpus.length,
@@ -242,21 +256,22 @@ const routes: FastifyPluginAsync = async (app) => {
         freeBytes: primary.free,
         usedPct: primary.total > 0 ? Math.round((primary.used / primary.total) * 100) : 0,
         breakdown: {
-          recordingsBytes,
-          clipsBytes,
-          framesBytes,
-          otherBytes: Math.max(0, primary.used - recordingsBytes - clipsBytes - framesBytes),
+          recordingsBytes: bd.recordingsBytes,
+          clipsBytes: bd.clipsBytes,
+          framesBytes: bd.framesBytes,
+          otherBytes: Math.max(0, primary.used - bd.recordingsBytes - bd.clipsBytes - bd.framesBytes),
         },
         volumes: disks,
       },
       uptimeSec: Math.round(os.uptime()),
     };
-    resourcesCache = { at: nowMs, value: payload };
-    return payload;
   });
 };
 
-// Module-scope cache — one API process shares it across all clients.
-let resourcesCache: { at: number; value: unknown } | null = null;
+// Module-scope caches. breakdownCache holds ONLY the per-directory
+// dirSize numbers (the expensive part). Everything else is computed
+// fresh on each request in <150 ms.
+let breakdownCache: { at: number; recordingsBytes: number; clipsBytes: number; framesBytes: number } | null = null;
+let breakdownRefreshInFlight = false;
 
 export default routes;

@@ -36,59 +36,51 @@ const routes: FastifyPluginAsync = async (app) => {
    * This is O(active-channels), typically 30 stats. ~10 ms total.
    */
   app.get('/status', async () => {
-    const { existsSync, statSync, readdirSync } = await import('node:fs');
-    const path = await import('node:path');
-    const RECORDINGS_DIR = path.resolve(process.env.RECORDINGS_DIR ?? './data/recordings');
-
+    // OLD implementation walked D:\cmc\recordings\<channelId>\**\*.mp4
+    // synchronously for every channel to find the newest segment. On
+    // this box that means ~30 channels × hundreds of thousands of .mp4
+    // files with statSync each — measured 25 s in production 2026-08-20,
+    // causing the dashboard "Recording status" tile to hang until the
+    // 30 s browser timeout fired. Everything the FS walk was after is
+    // already in the RecordingSegment table indexed by (channelId,
+    // startedAt); one Prisma query returns the same result in <50 ms.
     const channels = await app.prisma.channel.findMany({
       where: { recordingEnabled: true, active: true },
       select: { id: true, name: true, slug: true },
     });
-
+    // Pull the newest RecordingSegment row per channel with a single
+    // GROUP-BY-style query. Prisma has no native distinct-on so we
+    // fetch the last-24h window (small) and reduce in JS — this is
+    // still O(N segments in 24h) not O(N total files on disk).
+    const dayAgo = new Date(Date.now() - 24 * 3600 * 1000);
+    const recent = await app.prisma.recordingSegment.findMany({
+      where: { channelId: { in: channels.map((c) => c.id) }, startedAt: { gte: dayAgo } },
+      select: { channelId: true, startedAt: true, durationMs: true, sizeBytes: true },
+      orderBy: { startedAt: 'desc' },
+    });
+    const newestByCh = new Map<string, { at: number; size: number }>();
+    for (const s of recent) {
+      if (newestByCh.has(s.channelId)) continue;
+      const endedAt = s.startedAt.getTime() + s.durationMs;
+      newestByCh.set(s.channelId, { at: endedAt, size: Number(s.sizeBytes ?? 0) });
+    }
     const now = Date.now();
-    const results = channels.map((c) => {
-      const chDir = path.join(RECORDINGS_DIR, c.id);
-      if (!existsSync(chDir)) {
-        return { ...c, status: 'not-started' as const, sizeBytes: 0, lastWriteAt: null, ageSec: null };
-      }
-      // Find the newest .mp4 anywhere in the channel dir (year/month/day/hour).
-      let newest: { path: string; mtime: number; size: number } | null = null;
-      function walk(dir: string) {
-        let entries: import('node:fs').Dirent[] = [];
-        try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
-        for (const e of entries) {
-          const full = path.join(dir, e.name);
-          if (e.isDirectory()) walk(full);
-          else if (e.isFile() && e.name.endsWith('.mp4')) {
-            const st = statSync(full);
-            if (!newest || st.mtimeMs > newest.mtime) newest = { path: full, mtime: st.mtimeMs, size: st.size };
-          }
-        }
-      }
-      walk(chDir);
-      if (!newest) {
-        return { ...c, status: 'not-started' as const, sizeBytes: 0, lastWriteAt: null, ageSec: null };
-      }
-      const n = newest as { mtime: number; size: number };
-      const ageSec = Math.round((now - n.mtime) / 1000);
-      // A file that ffmpeg has JUST opened is < 4 KB and mtime looks
-      // fresh — but no video has landed yet. Treat those as "starting"
-      // so the operator sees the difference between "healthy" and
-      // "spinning up / never got a keyframe".
+    return channels.map((c) => {
+      const n = newestByCh.get(c.id);
+      if (!n) return { ...c, status: 'not-started' as const, sizeBytes: 0, lastWriteAt: null, ageSec: null };
+      const ageSec = Math.round((now - n.at) / 1000);
       const status: 'recording' | 'idle' | 'failed' | 'not-started' =
         ageSec < 90 && n.size > 4096 ? 'recording' :
-        ageSec < 90                  ? 'idle'      :   // fresh mtime, empty file = starting/stalled
+        ageSec < 90                  ? 'idle'      :
         ageSec < 300                 ? 'idle'      :
                                        'failed';
       return {
         ...c, status,
-        sizeBytes: (newest as { size: number }).size,
-        lastWriteAt: new Date((newest as { mtime: number }).mtime).toISOString(),
+        sizeBytes: n.size,
+        lastWriteAt: new Date(n.at).toISOString(),
         ageSec,
       };
     });
-
-    return results;
   });
 
   /**
@@ -99,7 +91,12 @@ const routes: FastifyPluginAsync = async (app) => {
    */
   app.get('/sessions', async (req) => {
     const q = (req.query as { channelId?: string; from?: string; to?: string; limit?: string }) ?? {};
-    const from = q.from ? new Date(q.from) : new Date(Date.now() - 30 * 24 * 3600 * 1000);
+    // Default window narrowed from 30 d → 24 h (2026-08-20). With
+    // ~30 channels × 60 s segments × 30 d = ~1.3 M rows the default
+    // query was pulling several hundred MB into Node memory and
+    // timing out at 30 s. If the operator needs older data they
+    // pick from the date range control (which sets q.from/q.to).
+    const from = q.from ? new Date(q.from) : new Date(Date.now() - 24 * 3600 * 1000);
     const to   = q.to   ? new Date(q.to)   : new Date();
     // OVERLAP filter, not strict-started-in-window.
     // Otherwise a "last 10 minutes" filter on an ongoing 30-min session

@@ -285,6 +285,12 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
   // -c copy works, hls.js plays without black frames.
   const videoArgs = needsTranscode
     ? [
+        // Ingest stays at 640x360 — 30 concurrent x264 encodes must
+        // fit under ~5-8 CPU cores 24/7. Tried 1280x720 letterboxed
+        // ingest and it saturated all 16 cores (RDP froze). Letterbox
+        // padding for playback sharpness happens on-demand at CLIP /
+        // DOWNLOAD time instead — one process at a time, unbounded
+        // CPU is fine there.
         '-vf', 'yadif=0:-1:0,scale=640:360:force_original_aspect_ratio=decrease:flags=lanczos,pad=640:360:(ow-iw)/2:(oh-ih)/2',
         '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
         '-profile:v', 'main', '-pix_fmt', 'yuv420p',
@@ -775,14 +781,16 @@ async function clipWorker(job: { clipId: string }) {
   const totalSpan = (covering[covering.length - 1]!.startedAt.getTime() + SEG_SECONDS * 1000 - first.startedAt.getTime()) / 1000;
   const to = Math.min(totalSpan, (clip.endAt.getTime() - first.startedAt.getTime()) / 1000);
   const duration = Math.max(1, to - ss);
-  // Clip canvas matches the ingest canvas (640x360). Every source
-  // segment is now recorded at 640x360@700k+96k so we render clips at
-  // the same dimensions — no upscale, no downscale, just add the
-  // watermark strip and re-encode at the same target bitrate.
-  // Result: clip bytes/second closely track the source's bytes/second,
-  // no compress-below-source regression, ~5-6 MB/min ceiling.
+  // Clip renders at 1280x720 canvas with content in a centered 640x360
+  // area, black padding around. Ingest source is 640x360 (kept small
+  // so 30 concurrent encoders fit in CPU budget) — the letterbox
+  // padding happens HERE at clip time, one render at a time, no CPU
+  // pressure. Result: fullscreen playback upscales 1280→1920 (1.5x)
+  // instead of 640→1920 (3x), so faces/tickers stay sharp. Black
+  // padding compresses to almost nothing so file size stays around
+  // the same as a raw 640x360@700k encode.
   void clip.resolution;   // legacy UI field, no longer used
-  const w = 640, h = 360;
+  const w = 1280, h = 720;
 
   // If multiple files, write a concat list file for ffmpeg's concat
   // demuxer (safer than concat filter for pre-encoded MP4 pieces).

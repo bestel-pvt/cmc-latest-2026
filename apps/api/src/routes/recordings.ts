@@ -305,36 +305,32 @@ const routes: FastifyPluginAsync = async (app) => {
           ff.on('error', reject);
         });
       };
+      // Recording download: re-encode with letterbox padding — content
+      // stays 640x360 (matches on-disk ingest), padded to 1280x720
+      // canvas with black borders. Black regions compress to almost
+      // nothing so the output size stays close to the source total,
+      // but fullscreen playback upscales 1.5x (1280→1920) instead of
+      // 3x (640→1920), giving much sharper text/faces on the operator's
+      // reference monitor. Same 700k target as ingest.
+      //
+      // Serialised by buildLocks + capped by dlAcquire semaphore so
+      // this can't dogpile with 24/7 recording ffmpegs.
       await dlAcquire();
       try {
-        try {
-          await runFf([
-            '-hide_banner', '-loglevel', 'error', '-y',
-            '-err_detect', 'ignore_err',
-            '-fflags', '+genpts+discardcorrupt+igndts',
-            '-f', 'concat', '-safe', '0', '-i', listPath,
-            '-c', 'copy',
-            '-movflags', '+faststart',
-            outPath,
-          ]);
-        } catch (copyErr) {
-          // Codec mismatch across the requested span. Fall back to a
-          // CRF re-encode at the SOURCE resolution so we still don't
-          // downscale — just normalise the stream. Rare.
-          try { unlinkSync(outPath); } catch {}
-          await runFf([
-            '-hide_banner', '-loglevel', 'error', '-y',
-            '-err_detect', 'ignore_err',
-            '-fflags', '+genpts+discardcorrupt+igndts',
-            '-f', 'concat', '-safe', '0', '-i', listPath,
-            '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22',
-            '-pix_fmt', 'yuv420p', '-threads', '2',
-            '-c:a', 'aac', '-b:a', '96k', '-ac', '2', '-ar', '48000',
-            '-movflags', '+faststart',
-            outPath,
-          ]);
-          void copyErr;   // logged in the thrown Error above already
-        }
+        await runFf([
+          '-hide_banner', '-loglevel', 'error', '-y',
+          '-err_detect', 'ignore_err',
+          '-fflags', '+genpts+discardcorrupt+igndts',
+          '-f', 'concat', '-safe', '0', '-i', listPath,
+          '-vf', 'scale=640:360:force_original_aspect_ratio=decrease:flags=lanczos,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black',
+          '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency',
+          '-profile:v', 'main', '-pix_fmt', 'yuv420p',
+          '-threads', '2',
+          '-b:v', '700k', '-maxrate', '1000k', '-bufsize', '2000k',
+          '-c:a', 'aac', '-b:a', '96k', '-ac', '2', '-ar', '48000',
+          '-movflags', '+faststart',
+          outPath,
+        ]);
       } finally {
         dlRelease();
       }
@@ -745,9 +741,11 @@ const routes: FastifyPluginAsync = async (app) => {
           '-vn', '-ac', '1', '-ar', String(sr),
           '-f', 's16le', '-',
         ], { stdio: ['ignore', 'pipe', 'pipe'] });
-        // 90-second hard cap so a stalled ffmpeg can't block the reply
-        // (the client bails at ~30 s anyway).
-        const kill = setTimeout(() => { try { ff.kill('SIGKILL'); } catch {} }, 90_000);
+        // 5-minute hard cap. A 6-hour session (360 segments) takes
+        // 60-120 s wall to decode through one concat call at 4 kHz mono
+        // s16le. Old 90 s cap was killing 6-hour+ requests mid-decode
+        // and returning HTTP 500 to the operator.
+        const kill = setTimeout(() => { try { ff.kill('SIGKILL'); } catch {} }, 300_000);
         ff.stdout.on('data', (b) => chunks.push(b));
         ff.on('exit', () => { clearTimeout(kill); resolve(); });
         ff.on('error', () => { clearTimeout(kill); resolve(); });

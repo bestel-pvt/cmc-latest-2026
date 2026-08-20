@@ -489,7 +489,13 @@ const routes: FastifyPluginAsync = async (app) => {
           '-err_detect', 'ignore_err',
           '-fflags', '+genpts+discardcorrupt',
           '-i', seg.path,
-          '-vf', 'scale=640:360:force_original_aspect_ratio=decrease:flags=lanczos,pad=640:360:(ow-iw)/2:(oh-ih)/2',
+          // fps=25 coerces high-framerate sources to a browser-safe rate.
+          // Al Jazeera Arabic ships 1080p @ 50 fps with mp3 audio; hls.js
+          // throws fragParsingError after ~2 s of black on the resulting
+          // MPEG-TS. Forcing constant 25 fps at the filter stage produces
+          // slices every browser handles uniformly regardless of source
+          // frame rate (25 / 25.4 / 30 / 50).
+          '-vf', 'scale=640:360:force_original_aspect_ratio=decrease:flags=lanczos,pad=640:360:(ow-iw)/2:(oh-ih)/2,fps=25',
           '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
           '-profile:v', 'main', '-pix_fmt', 'yuv420p',
           '-g', '48', '-force_key_frames', 'expr:gte(t,n_forced*2)',
@@ -498,9 +504,13 @@ const routes: FastifyPluginAsync = async (app) => {
           '-f', 'segment',
           '-segment_time', '6',
           '-segment_format', 'mpegts',
-          '-reset_timestamps', '0',
+          // reset_timestamps=1 + no -copyts: each slice starts at PTS 0
+          // instead of inheriting the source's absolute timeline. hls.js
+          // is more tolerant of slice-relative timestamps; copyts was
+          // producing timestamp gaps that hls.js flagged as parse errors
+          // on the al-jazeera / 50-fps class of clip.
+          '-reset_timestamps', '1',
           '-avoid_negative_ts', 'make_zero',
-          '-copyts',
           '-muxdelay', '0', '-muxpreload', '0',
           join(outDir, '%d.ts'),
         ], { stdio: ['ignore', 'pipe', 'pipe'] });

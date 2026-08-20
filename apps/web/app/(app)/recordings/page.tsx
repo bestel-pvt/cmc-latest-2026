@@ -77,7 +77,13 @@ function RecordingsInner() {
   // means back-nav from an inline modal / detail page restores the
   // exact rows and controls the operator was looking at.
   const channelId = sp.get('channelId') ?? 'all';
-  const from = sp.get('from') ?? thirtyDaysAgo;
+  // Ignore a saved URL `from` that predates today's 00:00 — the
+  // default changed 2026-08-20 from 30 days ago to today, and users
+  // reloading their old bookmarks otherwise get the 30-day-ago value
+  // silently reapplied (and pay the 8-second load penalty). Use the
+  // saved value only when it's inside today's window.
+  const rawFrom = sp.get('from');
+  const from = (rawFrom && rawFrom >= thirtyDaysAgo) ? rawFrom : thirtyDaysAgo;
   const to   = sp.get('to')   ?? todayLocal;
   const q    = sp.get('q')    ?? '';
 

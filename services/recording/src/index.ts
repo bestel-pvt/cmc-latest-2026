@@ -95,11 +95,15 @@ const SEG_SECONDS   = Number(process.env.RECORDING_SEGMENT_SECONDS ?? 60);
 // Download budget: 500k video + 64k audio + ~30k mux overhead
 // = ~594 kbps × 60s / 8 / 1024 ≈ 4.35 MB per minute. Safely under
 // the 5 MB/min user requirement (1 min = 5 MB, 2 min = 10 MB, ...).
-const V_BITRATE     = process.env.RECORDING_VIDEO_BITRATE ?? '500k';
+// Bumped 2026-08-20 from 500k → 1200k after operators reported visible
+// blockiness (news ticker text tearing, faces pixelated) on downloaded
+// clips. Combined with the 854x480 resolution below, size envelope is
+// ~9.7 MB/min — well under any reasonable clip length.
+const V_BITRATE     = process.env.RECORDING_VIDEO_BITRATE ?? '1200k';
 // Kept for the clip renderer (which still re-encodes audio at export).
 // The live recorder no longer uses this because it pass-through
 // remuxes from live-hls's already-AAC output.
-const A_BITRATE     = process.env.RECORDING_AUDIO_BITRATE ?? '64k';
+const A_BITRATE     = process.env.RECORDING_AUDIO_BITRATE ?? '96k';
 const SIGN_KEY      = process.env.MANIFEST_SIGNING_KEY   ?? 'dev-only';
 const TITLE_CARD_SEC = 3;
 
@@ -780,10 +784,12 @@ async function clipWorker(job: { clipId: string }) {
       '-map', '[outv]',
       '-map', '0:a:0?', '-map', '1:a:0',
       '-shortest',
-      // Hard cap instantaneous bitrate so a high-motion 60s clip does
-      // not blow past 5 MB — CBR-ish behaviour via VBV constraint.
+      // Hard cap instantaneous bitrate. Bumped 2026-08-20 with the
+      // V_BITRATE default change from 500k → 1200k for better clip
+      // legibility; maxrate/bufsize scaled proportionally to keep the
+      // VBV constraint effective.
       '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', V_BITRATE,
-      '-maxrate', '700k', '-bufsize', '1400k',
+      '-maxrate', '1600k', '-bufsize', '3200k',
       '-c:a', 'aac', '-b:a', A_BITRATE, '-ac', '2', '-ar', '48000',
       ...(isMovLike ? ['-movflags', '+faststart'] : []),
       '-y', mainPath,

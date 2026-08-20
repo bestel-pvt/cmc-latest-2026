@@ -38,7 +38,7 @@ interface Slot {
 }
 
 interface Layout {
-  id: 'single' | 'dual' | 'mosaic' | 'grid32';
+  id: 'single' | 'dual' | 'grid8' | 'mosaic' | 'grid32';
   label: string;
   slots: Slot[];
 }
@@ -72,6 +72,16 @@ function buildLayouts(): Layout[] {
     }
   }
 
+  // Grid8: 4 cols × 2 rows = 8 slots. Fills the wall with fewer,
+  // larger tiles than grid32 — better for shifts that follow a
+  // priority set of ~8 channels without needing full-wall detail.
+  const grid8: Slot[] = [];
+  for (let r = 0; r < 2; r++) {
+    for (let c = 0; c < 4; c++) {
+      grid8.push({ x: c / 4, y: r / 2, w: 1 / 4, h: 1 / 2 });
+    }
+  }
+
   // Grid32: 8 cols × 4 rows = 32 slots — user's original request,
   // matches the standalone Rust wall.
   const grid32: Slot[] = [];
@@ -84,8 +94,9 @@ function buildLayouts(): Layout[] {
   return [
     { id: 'single', label: '1 · Single',       slots: single },
     { id: 'dual',   label: '2 · Dual',         slots: dual },
-    { id: 'mosaic', label: '3 · Mosaic (20)',  slots: mosaic },
-    { id: 'grid32', label: '4 · Grid (32)',    slots: grid32 },
+    { id: 'grid8',  label: '3 · Grid (8)',     slots: grid8 },
+    { id: 'mosaic', label: '4 · Mosaic (20)',  slots: mosaic },
+    { id: 'grid32', label: '5 · Grid (32)',    slots: grid32 },
   ];
 }
 

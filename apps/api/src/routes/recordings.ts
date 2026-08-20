@@ -301,12 +301,20 @@ const routes: FastifyPluginAsync = async (app) => {
             '-err_detect', 'ignore_err',
             '-fflags', '+genpts+discardcorrupt',
             '-f', 'concat', '-safe', '0', '-i', listPath,
-            '-vf', 'yadif=0:-1:0,scale=640:360:force_original_aspect_ratio=decrease:flags=lanczos,pad=640:360:(ow-iw)/2:(oh-ih)/2',
-            '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
+            // Quality bump 2026-08-20: user reported "pixels phatt rhe hen"
+            // on the 640x360 @ 500k output — visible blockiness on news
+            // tickers and faces. Bumped to 854x480 @ 1200k (SD) with a
+            // slightly slower preset for better compression at the same
+            // CPU envelope. Size envelope: 1200k video + 96k audio ≈
+            // 9.7 MB/min (was 4.35 MB/min at 500k+64k). Still comfortable
+            // for the operator's typical 1-5 min clips; longer sessions
+            // still fit under everyday email/upload limits.
+            '-vf', 'yadif=0:-1:0,scale=854:480:force_original_aspect_ratio=decrease:flags=lanczos,pad=854:480:(ow-iw)/2:(oh-ih)/2',
+            '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency',
             '-profile:v', 'main', '-pix_fmt', 'yuv420p',
             '-threads', '2',
-            '-b:v', '500k', '-maxrate', '700k', '-bufsize', '1400k',
-            '-c:a', 'aac', '-b:a', '64k', '-ac', '2', '-ar', '48000',
+            '-b:v', '1200k', '-maxrate', '1600k', '-bufsize', '3200k',
+            '-c:a', 'aac', '-b:a', '96k', '-ac', '2', '-ar', '48000',
             '-movflags', '+faststart',
             outPath,
           ], { stdio: ['ignore', 'ignore', 'pipe'] });

@@ -274,6 +274,7 @@ function RecordingsInner() {
                   <tr>
                     <th className="text-left px-4 py-2">Channel</th>
                     <th className="text-left px-4 py-2">Started</th>
+                    <th className="text-left px-4 py-2">Ended</th>
                     <th className="text-left px-4 py-2">Duration</th>
                     <th className="text-left px-4 py-2">Size</th>
                     <th className="text-left px-4 py-2">Segments</th>
@@ -283,6 +284,16 @@ function RecordingsInner() {
                 <tbody className="divide-y divide-line">
                   {filtered.map((s) => {
                     const started = new Date(s.startedAt);
+                    const ended   = new Date(s.endedAt);
+                    // Show "LIVE" if the session's last segment closed
+                    // within the last ~2 min AND that channel is still
+                    // in the recording state per /api/recordings/status.
+                    // Anything older is a genuinely-ended session and
+                    // gets the formatted end timestamp instead.
+                    const chLive = (liveStatus ?? []).some(
+                      (l) => l.channelId === s.channel.id && l.status === 'recording',
+                    );
+                    const isLive = chLive && (Date.now() - ended.getTime()) < 120_000;
                     return (
                       <tr
                         key={s.id}
@@ -296,6 +307,19 @@ function RecordingsInner() {
                             year: 'numeric', month: '2-digit', day: '2-digit',
                             hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
                           })}
+                        </td>
+                        <td className="px-4 py-2.5 font-mono text-xs">
+                          {isLive ? (
+                            <span className="inline-flex items-center gap-1 rounded-sm bg-accent-red/15 text-accent-red px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider">
+                              <span className="h-1.5 w-1.5 rounded-full bg-accent-red animate-pulse" />
+                              Live
+                            </span>
+                          ) : (
+                            ended.toLocaleString(undefined, {
+                              year: 'numeric', month: '2-digit', day: '2-digit',
+                              hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+                            })
+                          )}
                         </td>
                         <td className="px-4 py-2.5 font-mono text-xs">{fmtDurationMs(s.durationMs)}</td>
                         <td className="px-4 py-2.5 font-mono text-xs">{fmtBytes(Number(s.sizeBytes))}</td>

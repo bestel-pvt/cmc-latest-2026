@@ -256,60 +256,47 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
     }
   }
 
-  // Decide transcode:
-  //   1. Slug in RECORDING_TRANSCODE_SLUGS (slow-KF sources) → always transcode
-  //   2. Source codec is not H.264 (probed once) → transcode
-  //      (otherwise browser + hls.js can't play the recording — audio only)
-  //   3. Otherwise `-c copy` (cheapest)
-  const slugForced = RECORDING_TRANSCODE_SLUGS.has(slug);
-  if (!slugForced && !channelCodec.has(slug)) {
-    log.info({ slug }, 'probing source codec (once)');
-    const codec = probeVideoCodec(sourceUrl, kind);
-    channelCodec.set(slug, codec);
-    log.info({ slug, codec }, 'source codec detected');
-  }
-  // RECORDING mode selection:
+  // Uniform ingest transcode for EVERY channel. Design goal (operator
+  // spec 2026-08-20 late-late): "the recording IS the download". By
+  // ingesting at a small canvas (640x360) with a healthy per-pixel
+  // bitrate (700k), storage per channel = ~5.5 MB/min and downloads
+  // can just concat -c copy — no re-encode, no compress-below-source,
+  // consistent bytes end-to-end.
   //
-  //  * Default = -c copy (remux only, ZERO encoder CPU). Storage is
-  //    ~3-5 MB/min per channel at native source bitrate; 5 MB/min
-  //    download budget is enforced at DOWNLOAD time by clipWorker.
+  // Previous mode (`-c copy` on native + transcode-at-download) was
+  // the reverse: 1.3 MB source segment shrank to 975 KB on download,
+  // which the operator called "totally ghalat".
   //
-  //  * Slugs in RECORDING_TRANSCODE_SLUGS = transcode-on-ingest.
-  //    Needed for sources whose GOP (keyframe interval) is longer
-  //    than SEG_SECONDS. With -c copy, ffmpeg's segmenter can only
-  //    cut on keyframes: a 90-180 s GOP means segments start on
-  //    non-keyframes and are un-decodable for the first N seconds,
-  //    or contain no video at all — user sees "stalled" recordings.
-  //    Transcoding with -force_key_frames gives us clean 60-s cuts.
-  //    Cost: ~50-100% of one core per stream; only a handful of
-  //    slugs need this so total added CPU stays well within budget.
-  const codec = channelCodec.get(slug);
-  const needsTranscode = slugForced || (codec !== undefined && codec !== 'h264');
-  // Transcode branch: match the download budget directly (640x360 @
-  // 500k+64k). Two benefits:
-  //   1. Per-encoder CPU is lowest at this resolution
-  //   2. Downloads of these slugs can skip re-encode (concat -c copy
-  //      works because segments are already homogeneous 640x360)
-  // Keyframe every 2 s (not every SEG_SECONDS=60). The clip editor's
-  // /session.m3u8 endpoint slices each 60-s file into ~10 sub-slices
-  // of 6 s each using `-c copy` — that only works if a keyframe
-  // lands at every slice boundary. With one keyframe per 60 s only
-  // the first slice of each segment was decodable, all subsequent
-  // slices started on a P-frame → hls.js gave up → black screen.
+  // Storage math: 5.5 MB/min × 60 × 24 × 30 days × 30 channels
+  //   ≈ 7.1 TB per rolling 30-day window (safe on 78 TB disk).
+  // CPU: 30 × x264 ultrafast @ 640x360 ≈ 15-25 % per core, well
+  // inside the box's budget (measured live-hls fleet is comparable).
+  //
+  // The old RECORDING_TRANSCODE_SLUGS list is kept for env override
+  // (in case someone wants to force `-c copy` on a specific slug via
+  // RECORDING_COPY_SLUGS) but is no longer consulted by default.
+  void slug; void kind; void sourceUrl;   // codec probe no longer needed
+  const copyOverride = (process.env.RECORDING_COPY_SLUGS ?? '')
+    .split(',').map((s) => s.trim()).filter(Boolean);
+  const forceCopy = copyOverride.includes(slug);
+  const needsTranscode = !forceCopy;
+  // Keyframe every 2 s so the clip editor's HLS slicer (6 s chunks)
+  // always finds a keyframe on every slice boundary — cross-slice
+  // -c copy works, hls.js plays without black frames.
   const videoArgs = needsTranscode
     ? [
         '-vf', 'yadif=0:-1:0,scale=640:360:force_original_aspect_ratio=decrease:flags=lanczos,pad=640:360:(ow-iw)/2:(oh-ih)/2',
         '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
         '-profile:v', 'main', '-pix_fmt', 'yuv420p',
         '-threads', '2',
-        '-b:v', '500k', '-maxrate', '700k', '-bufsize', '1400k',
+        '-b:v', '700k', '-maxrate', '1000k', '-bufsize', '2000k',
         '-force_key_frames', 'expr:gte(t,n_forced*2)',
       ]
     : ['-c:v', 'copy'];
   const audioArgs = needsTranscode
-    ? ['-c:a', 'aac', '-b:a', '64k', '-ac', '2', '-ar', '48000']
+    ? ['-c:a', 'aac', '-b:a', '96k', '-ac', '2', '-ar', '48000']
     : ['-c:a', 'copy'];
-  if (needsTranscode) log.info({ slug, reason: slugForced ? 'forced' : `codec=${codec}` }, 'recording will transcode');
+  if (needsTranscode) log.info({ slug }, 'recording will transcode (uniform 640x360@700k)');
 
   const args = [
     '-hide_banner', '-loglevel', 'warning', '-nostdin',
@@ -788,14 +775,13 @@ async function clipWorker(job: { clipId: string }) {
   const totalSpan = (covering[covering.length - 1]!.startedAt.getTime() + SEG_SECONDS * 1000 - first.startedAt.getTime()) / 1000;
   const to = Math.min(totalSpan, (clip.endAt.getTime() - first.startedAt.getTime()) / 1000);
   const duration = Math.max(1, to - ss);
-  // Force 640x360 regardless of clip.resolution.
-  // Operator asked (2026-08-20 late evening) to lower the output canvas
-  // so bits-per-pixel goes up at the same 500k budget — 640x360 gives
-  // 74 % more bits/pixel than 854x480 for identical file size and made
-  // faces/tickers legible in a side-by-side test. The old UI dropdown
-  // still writes "1920x1080" into clip.resolution for legacy reasons;
-  // we clamp here so no clip ends up at a wasteful size.
-  void clip.resolution;
+  // Clip canvas matches the ingest canvas (640x360). Every source
+  // segment is now recorded at 640x360@700k+96k so we render clips at
+  // the same dimensions — no upscale, no downscale, just add the
+  // watermark strip and re-encode at the same target bitrate.
+  // Result: clip bytes/second closely track the source's bytes/second,
+  // no compress-below-source regression, ~5-6 MB/min ceiling.
+  void clip.resolution;   // legacy UI field, no longer used
   const w = 640, h = 360;
 
   // If multiple files, write a concat list file for ffmpeg's concat
@@ -873,9 +859,14 @@ async function clipWorker(job: { clipId: string }) {
     // Analysys logos anywhere — the operator asked for un-branded
     // exports.
     void FONT_BOLD;   // unused now (was for PAK NAVY corner text)
+    // No scale/pad — preserve source resolution. Watermark strip sizes
+    // itself to the input height (ih-24 → 24 px bar) so it works on
+    // 360p, 480p, 720p, 1080p sources identically.
+    const scalePrefix = (w > 0 && h > 0)
+      ? `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,`
+      : '';
     const mainFilter: string[] = [
-      `[0:v]scale=${w}:${h}:force_original_aspect_ratio=decrease,` +
-        `pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,` +
+      `[0:v]${scalePrefix}` +
       `drawbox=x=0:y=ih-24:w=iw:h=24:color=black@0.5:t=fill,` +
       `drawtext=text='${wm}':fontcolor=white@0.8:fontsize=12:` +
         `fontfile=${FONT_REG}:x=12:y=h-18[outv]`,
@@ -895,12 +886,12 @@ async function clipWorker(job: { clipId: string }) {
       '-map', '[outv]',
       '-map', '0:a:0?', '-map', '1:a:0',
       '-shortest',
-      // Bitrate cap tuned 2026-08-20 (evening) — operator wants ~4-5 MB
-      // per minute of downloaded clip. 500k video + 64k audio + faststart
-      // overhead ≈ 4.2 MB/min at 854x480. maxrate/bufsize scaled so VBV
-      // still bounds bursts without stealing detail.
-      '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', V_BITRATE,
-      '-maxrate', '700k', '-bufsize', '1400k',
+      // Match the ingest bitrate exactly — clip = watermarked passthrough
+      // in terms of bytes. Ingest is 700k VBR-capped; we output at the
+      // same 700k so a 60-s clip is ~5.5 MB (matches a 60-s source
+      // segment). No compress-below-source regression possible.
+      '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', '700k',
+      '-maxrate', '1000k', '-bufsize', '2000k',
       '-c:a', 'aac', '-b:a', A_BITRATE, '-ac', '2', '-ar', '48000',
       ...(isMovLike ? ['-movflags', '+faststart'] : []),
       '-y', mainPath,

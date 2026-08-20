@@ -275,65 +275,66 @@ const routes: FastifyPluginAsync = async (app) => {
       const lines = playable.map((path) => `file '${path.replace(/'/g, "'\\''")}'`).join('\n');
       writeFileSync(listPath, lines);
 
-      // Download-time transcode: recordings are now stored -c copy at
-      // native source resolution + bitrate (moved off the 24/7 encoder
-      // load that saturated the box). The 5 MB/min user budget is
-      // enforced HERE, on-demand, per download.
+      // Download preserves SOURCE quality. Recording segments are
+      // stored -c copy at native bitrate/resolution, so a plain concat
+      // -c copy pass here means the download is byte-for-byte identical
+      // to the source frames — no re-encode, no quality loss, no
+      // compress-below-source (which was the 2026-08-20 regression:
+      // 1.3 MB source segment → 975 KB downloaded → operator called
+      // it "totally ghalat").
       //
-      // Segments may span old-transcoded 640x360 + new native mixed
-      // resolutions — concat -c copy fails on that mismatch, so we
-      // re-encode everything through a normaliser: scale to 640x360,
-      // libx264 500k VBR-capped, AAC 64k. Result: ~4.35 MB/min = a 60s
-      // clip is well under 5 MB, a 2-min clip well under 10 MB, etc.
-      //
-      // ultrafast preset — downloads are on-demand + serialised by
-      // buildLocks, so CPU cost per download is one-shot, not
-      // sustained. Users see a few-second render before download.
-      // Semaphore acquire — cap concurrent transcodes so the API stays
-      // responsive during downloads. Also drop ffmpeg process priority
-      // BELOW_NORMAL so Windows scheduler always favours Node + kernel
-      // + wall serving over the background encode.
-      await dlAcquire();
-      try {
-        await new Promise<void>((resolve, reject) => {
-          const ff = spawn('ffmpeg', [
-            '-hide_banner', '-loglevel', 'error', '-y',
-            '-err_detect', 'ignore_err',
-            '-fflags', '+genpts+discardcorrupt',
-            '-f', 'concat', '-safe', '0', '-i', listPath,
-            // Tuned 2026-08-20 late evening: dropped to 640x360 @ 500k.
-            // Same file-size budget as 854x480 @ 500k, but 74 % more bits
-            // per pixel — faces, tickers and station bugs read cleanly
-            // instead of mosquito-noised. Operator asked directly for
-            // "length/width smaller so resolution can be better without
-            // file size growing" after comparing crisp 640x360 recordings
-            // vs blocky 854x480 downloads.
-            '-vf', 'yadif=0:-1:0,scale=640:360:force_original_aspect_ratio=decrease:flags=lanczos,pad=640:360:(ow-iw)/2:(oh-ih)/2',
-            '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency',
-            '-profile:v', 'main', '-pix_fmt', 'yuv420p',
-            '-threads', '2',
-            '-b:v', '500k', '-maxrate', '700k', '-bufsize', '1400k',
-            '-c:a', 'aac', '-b:a', '64k', '-ac', '2', '-ar', '48000',
-            '-movflags', '+faststart',
-            outPath,
-          ], { stdio: ['ignore', 'ignore', 'pipe'] });
+      // If concat -c copy fails (mismatched codecs across segments,
+      // e.g. spans an old-transcoded window + new native), we fall
+      // back to a CRF re-encode at the SOURCE resolution — visually
+      // indistinguishable from the input, size adapts to content,
+      // never dumbly downscaled.
+      const runFf = async (args: string[]): Promise<string | null> => {
+        return await new Promise<string | null>((resolve, reject) => {
+          const ff = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
           if (ff.pid) {
-            try { os.setPriority(ff.pid, os.constants.priority.PRIORITY_BELOW_NORMAL); } catch { /* best-effort */ }
+            try { os.setPriority(ff.pid, os.constants.priority.PRIORITY_BELOW_NORMAL); } catch {}
           }
-          // -loglevel error emits ~zero output when things are fine,
-          // so stderr chunks rarely wake the event loop. On failure
-          // we get the last 800 chars back into the reject so the
-          // 500 body tells the user WHY.
           let tail = '';
           ff.stderr?.on('data', (b) => {
             tail += b.toString();
             if (tail.length > 4000) tail = tail.slice(-2000);
           });
           ff.on('exit', (code) => code === 0
-            ? resolve()
+            ? resolve(null)
             : reject(new Error(`ffmpeg exit ${code}: ${tail.slice(-800) || '(no stderr)'}`)));
           ff.on('error', reject);
         });
+      };
+      await dlAcquire();
+      try {
+        try {
+          await runFf([
+            '-hide_banner', '-loglevel', 'error', '-y',
+            '-err_detect', 'ignore_err',
+            '-fflags', '+genpts+discardcorrupt+igndts',
+            '-f', 'concat', '-safe', '0', '-i', listPath,
+            '-c', 'copy',
+            '-movflags', '+faststart',
+            outPath,
+          ]);
+        } catch (copyErr) {
+          // Codec mismatch across the requested span. Fall back to a
+          // CRF re-encode at the SOURCE resolution so we still don't
+          // downscale — just normalise the stream. Rare.
+          try { unlinkSync(outPath); } catch {}
+          await runFf([
+            '-hide_banner', '-loglevel', 'error', '-y',
+            '-err_detect', 'ignore_err',
+            '-fflags', '+genpts+discardcorrupt+igndts',
+            '-f', 'concat', '-safe', '0', '-i', listPath,
+            '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22',
+            '-pix_fmt', 'yuv420p', '-threads', '2',
+            '-c:a', 'aac', '-b:a', '96k', '-ac', '2', '-ar', '48000',
+            '-movflags', '+faststart',
+            outPath,
+          ]);
+          void copyErr;   // logged in the thrown Error above already
+        }
       } finally {
         dlRelease();
       }

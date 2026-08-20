@@ -519,6 +519,20 @@ const routes: FastifyPluginAsync = async (app) => {
         ff.on('exit', (code) => code === 0 ? resolve() : reject(new Error(`ffmpeg exit ${code}: ${tail.slice(-200)}`)));
         ff.on('error', reject);
       });
+      // Drop any 0-byte .ts files. ffmpeg's `-f segment` splitter can
+      // produce an empty trailing slice when the source duration isn't
+      // a clean multiple of segment_time (58-s Al Jazeera clips left a
+      // 0-byte 7.ts alongside valid 0.ts–6.ts). Serving that 0-byte
+      // file to hls.js triggers `fragParsingError` and blanks the
+      // player. Delete the empties so the segment-hls handler's
+      // missing-slice fallback serves the previous good one instead.
+      try {
+        for (const f of readdirSync(outDir)) {
+          if (!f.endsWith('.ts')) continue;
+          const p = join(outDir, f);
+          if (statSync(p).size === 0) unlinkSync(p);
+        }
+      } catch { /* best-effort cleanup */ }
       // Sentinel file signals "all slices done writing".
       writeFileSync(readyMarker, '');
     })().finally(() => setTimeout(() => hlsLocks.delete(seg.id), 500));
@@ -549,7 +563,13 @@ const routes: FastifyPluginAsync = async (app) => {
       return reply.send(EMPTY_TS);
     }
     let filePath = join(HLS_CACHE, seg.id, `${sliceIdx}.ts`);
-    if (!existsSync(filePath)) {
+    // Treat 0-byte slice as missing. `-f segment` occasionally leaves
+    // an empty trailing .ts when the source duration isn't a clean
+    // multiple of segment_time. The post-generation cleanup deletes
+    // those but old cache dirs may still contain them; either way,
+    // serving a 0-byte file triggers hls.js `fragParsingError`.
+    const slicePresent = existsSync(filePath) && statSync(filePath).size > 0;
+    if (!slicePresent) {
       // Off-by-one at the tail of a segment — ffmpeg produced fewer
       // slices than the playlist advertised. Serve the last existing
       // slice so hls.js doesn't stall. (Playlist generator now

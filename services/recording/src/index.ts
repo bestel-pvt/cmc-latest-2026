@@ -310,7 +310,12 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
 
   const args = [
     '-hide_banner', '-loglevel', 'warning', '-nostdin',
-    '-fflags', '+genpts+discardcorrupt',
+    // +igndts added 2026-08-21: abb-tak source emits non-monotonic DTS
+    // ("Application provided invalid, non monotonically increasing dts
+    // to stream 1") which VLC / clip render (has +igndts) tolerate but
+    // the recording ingest was exiting with Windows crash code
+    // 0xBEBE4BB7 within seconds → respawn burst → 4 extra ffmpegs.
+    '-fflags', '+genpts+discardcorrupt+igndts',
     '-err_detect', 'ignore_err',
     // Bigger input queue absorbs source hiccups (IGMP renegotiation,
     // NIC-driver interrupt storm) without dropping segments.
@@ -528,6 +533,11 @@ async function refreshSupervisors() {
     if (dead && idleSince > 60_000) {
       log.warn({ id, slug: sup.slug, exitCode: p?.exitCode, signalCode: p?.signalCode, idleSince },
                'supervisor has no live proc — reseeding');
+      // Mark stopped BEFORE delete so any exit-handler setTimeouts
+      // still queued against this sup bail via their `if (sup._stopped)`
+      // guard. Without this the queued respawn fires 500 ms later, sees
+      // no sup in the Map for its channelId, and spawns a duplicate.
+      (sup as Supervisor & { _stopped?: boolean })._stopped = true;
       supervisors.delete(id);
     }
   }
@@ -565,6 +575,20 @@ async function refreshSupervisors() {
           : Math.min(30_000, 500 * 2 ** Math.min(sup.restarts, 5));
         setTimeout(() => {
           if (sup._stopped) return;
+          // Race guard: if the safety-net "reseed" already ran
+          // (supervisors.delete + fresh spawn on next refreshSupervisors
+          // tick), a NEW supervisor for this channel is now in the Map
+          // and has its own ffmpeg. Respawning from this closure would
+          // duplicate the ffmpeg (orphan we can't track). Skip.
+          //
+          // 2026-08-21: abb-tak crash-loop was spawning 4 ffmpegs
+          // simultaneously because 4 exit-handler setTimeouts all fired
+          // after their sup had been deleted+reseeded.
+          const current = supervisors.get(c.id);
+          if (current !== sup) {
+            log.info({ slug: c.slug }, 'respawn skipped — supervisor already reseeded by safety-net');
+            return;
+          }
           try { spawnAndWatch(); }
           catch (err) { log.error({ err, slug: c.slug }, 'respawn threw — will retry on next refresh tick'); }
         }, delay);

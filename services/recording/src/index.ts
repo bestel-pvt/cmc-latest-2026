@@ -1100,18 +1100,14 @@ async function main() {
     }
   }, 30_000);
 
-  // Age-based recycle — tightened 2026-08-20 late from 90 → 30 min AND
-  // switched from hardKill to graceful `q` shutdown so the current
-  // segment closes with a proper MP4 trailer instead of being cut mid-
-  // frame. That preserves ~every frame across the recycle: sending 'q'
-  // on stdin makes ffmpeg flush the muxer, close the file, and exit
-  // cleanly (0-2 s), then the supervisor's exit handler respawns in
-  // <500 ms. Per-channel data loss per 30 min ≈ 0 (segment file rolls
-  // over on a clean boundary).
+  // Age-based recycle — 30 min cap on per-proc memory growth.
   //
-  // Memory math: at ~1 GB/hour growth, 30-min recycle caps each proc
-  // at ~500 MB → 30 procs × 500 MB = 15 GB total (vs 45 GB at old
-  // 90-min limit). Room for 30 live-hls procs on top.
+  // Graceful `q`-on-stdin was tried 2026-08-20 late but the recording
+  // ffmpegs are spawned with `-nostdin` (they don't read stdin at all)
+  // so `q` was a no-op → 3 s timeout → hardKill → Windows kill
+  // sometimes fails → orphan sweep fires → churn every minute. Not
+  // worth the try to save ~2 s of a 60-s segment; hard-kill it and
+  // let the next spawn take a clean 60-s cut from there.
   const REC_MAX_AGE_MS = 30 * 60 * 1000;
   setInterval(() => {
     try {
@@ -1122,8 +1118,8 @@ async function main() {
       const victim = aged[0];
       if (!victim || !victim.proc) return;
       const ageMin = Math.round((now - victim.lastRestartAt) / 60000);
-      log.info({ slug: victim.slug, ageMin }, 'recording ffmpeg past MAX_AGE — graceful recycle');
-      stopFFmpegGracefully(victim);
+      log.info({ slug: victim.slug, ageMin }, 'recording ffmpeg past MAX_AGE — recycling');
+      hardKill(victim.proc);
     } catch (err) { log.warn({ err }, 'rec age-recycle failed'); }
   }, 60_000);
 

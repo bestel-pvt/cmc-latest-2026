@@ -417,6 +417,12 @@ const routes: FastifyPluginAsync = async (app) => {
     // frame, so the client can send true UTC timestamps instead of
     // `sessionStart + relativeSeconds` math.
     const firstPlayableStart = playable[0]!.startedAt;
+    // Kept for the first segment; per-boundary PDT below re-anchors
+    // every discontinuity so drift can't accumulate across many
+    // segments (reported for HUM News 2026-08-25 — long sessions
+    // drifted clip marks by tens of seconds because hls.js was
+    // extrapolating from a single PDT + EXTINFs that don't exactly
+    // sum to actual segment durations).
     lines.push(`#EXT-X-PROGRAM-DATE-TIME:${firstPlayableStart.toISOString()}`);
     // For each segment we need the ACTUAL slice count that ffmpeg's
     // segment muxer produced (or will produce). Estimating with
@@ -433,7 +439,16 @@ const routes: FastifyPluginAsync = async (app) => {
     // segment starts right after via #EXT-X-DISCONTINUITY anyway.
     for (let i = 0; i < playable.length; i++) {
       const s = playable[i];
-      if (i > 0) lines.push('#EXT-X-DISCONTINUITY');
+      if (i > 0) {
+        lines.push('#EXT-X-DISCONTINUITY');
+        // Re-anchor timeline at every discontinuity so hls.js's
+        // `programDateTime` for the current fragment is always the
+        // TRUE wall-clock start of that segment (from the DB row),
+        // not "first PDT + sum-of-declared-EXTINFs" which drifts
+        // whenever declared durations don't match ffmpeg's actual
+        // slice durations.
+        lines.push(`#EXT-X-PROGRAM-DATE-TIME:${s.startedAt.toISOString()}`);
+      }
       const durS = s.durationMs / 1000;
       const dir = join(HLS_CACHE, s.id);
       let nSub: number;

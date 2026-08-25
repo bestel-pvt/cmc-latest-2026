@@ -57,13 +57,18 @@ export default function NewClipPage() {
   const [current, setCurrent] = useState(0);
   const [markIn, setMarkIn] = useState<number | null>(null);
   const [markOut, setMarkOut] = useState<number | null>(null);
+  // Absolute wall-clock ms captured at mark-press via
+  // `hls.playingDate` — that reflects the CURRENT fragment's PDT
+  // anchor (server now emits PDT at every DISCONTINUITY), so it
+  // stays accurate over hour-long sessions where EXTINF-based
+  // extrapolation would drift by tens of seconds (HUM News clip
+  // regression 2026-08-25). `startAtISO` prefers these when set
+  // and falls back to `playlistStartMs + markIn*1000` otherwise.
+  const [markInMs, setMarkInMs] = useState<number | null>(null);
+  const [markOutMs, setMarkOutMs] = useState<number | null>(null);
   // Wall-clock time of the video's frame 0 — populated from the
-  // manifest's `#EXT-X-PROGRAM-DATE-TIME` tag on MANIFEST_PARSED.
-  // Used as the anchor for absolute startAt/endAt so exports match
-  // the operator's visual marks even when the playlist starts earlier
-  // than the URL's `sessionStart` (server widens the query ~5 min
-  // back to catch straddling segments). Falls back to `effectiveStart`
-  // if the manifest has no PDT (older API).
+  // manifest's first PDT tag on MANIFEST_PARSED. Only used as an
+  // anchor when hls.playingDate isn't available (Safari native HLS).
   const [playlistStartMs, setPlaylistStartMs] = useState<number | null>(null);
   const [playing, setPlaying] = useState(false);
   const [muted, setMuted] = useState(true);
@@ -278,11 +283,22 @@ export default function NewClipPage() {
       ? (new Date(effectiveEnd).getTime() - new Date(effectiveStart).getTime()) / 1000
       : 0);
 
-  // Keyboard shortcuts
-  // Raw video-element time — 0-based seconds from the FIRST playable
-  // frame of the session playlist. Server-side `startAtISO` math uses
-  // `playlistStartMs` (populated from the manifest's PDT tag) as its
-  // anchor, so this simple `currentTime` is exactly what we need.
+  // Snapshot a mark point in BOTH forms at press-time:
+  //   - `seconds`: raw `v.currentTime`, drives the visible
+  //     progress-bar labels and length display
+  //   - `absMs`: hls.js's `playingDate` (from per-fragment PDT), the
+  //     true wall-clock ms of the frame under the playhead — this
+  //     is what the API uses so exports match the visual mark
+  //     exactly, no drift over long sessions
+  const captureMark = (v: HTMLVideoElement | null) => {
+    if (!v) return { seconds: 0, absMs: null as number | null };
+    const hls = hlsRef.current;
+    const pd = hls?.playingDate;
+    const absMs = pd instanceof Date ? pd.getTime() : null;
+    return { seconds: Math.max(0, v.currentTime), absMs };
+  };
+  const setIn  = (v: HTMLVideoElement | null) => { const m = captureMark(v); setMarkIn(m.seconds);  setMarkInMs(m.absMs); };
+  const setOut = (v: HTMLVideoElement | null) => { const m = captureMark(v); setMarkOut(m.seconds); setMarkOutMs(m.absMs); };
   const sessionSecondsAt = (v: HTMLVideoElement | null): number => {
     if (!v) return 0;
     return Math.max(0, v.currentTime);
@@ -294,8 +310,8 @@ export default function NewClipPage() {
       if (tag === 'INPUT' || tag === 'TEXTAREA') return;
       const v = videoRef.current; if (!v) return;
       if (e.key === ' ') { e.preventDefault(); v.paused ? v.play() : v.pause(); }
-      if (e.key === 'i' || e.key === 'I') setMarkIn(sessionSecondsAt(v));
-      if (e.key === 'o' || e.key === 'O') setMarkOut(sessionSecondsAt(v));
+      if (e.key === 'i' || e.key === 'I') setIn(v);
+      if (e.key === 'o' || e.key === 'O') setOut(v);
       if (e.key === 'k') v.pause();
       if (e.key === 'ArrowLeft')  v.currentTime = Math.max(0, v.currentTime - (e.shiftKey ? 5 : 0.5));
       if (e.key === 'ArrowRight') v.currentTime = Math.min(totalSeconds, v.currentTime + (e.shiftKey ? 5 : 0.5));
@@ -313,14 +329,16 @@ export default function NewClipPage() {
   }, [playlistStartMs, effectiveStart]);
 
   const startAtISO = useMemo(() => {
+    if (markInMs !== null) return new Date(markInMs).toISOString();
     if (anchorMs === null || markIn === null) return null;
     return new Date(anchorMs + markIn * 1000).toISOString();
-  }, [anchorMs, markIn]);
+  }, [anchorMs, markIn, markInMs]);
 
   const endAtISO = useMemo(() => {
+    if (markOutMs !== null) return new Date(markOutMs).toISOString();
     if (anchorMs === null || markOut === null) return null;
     return new Date(anchorMs + markOut * 1000).toISOString();
-  }, [anchorMs, markOut]);
+  }, [anchorMs, markOut, markOutMs]);
 
   const canExport = !!(title && channelId && startAtISO && endAtISO && markOut !== null && markIn !== null && markOut > markIn);
 
@@ -462,13 +480,13 @@ export default function NewClipPage() {
 
           <div className="mx-3 h-6 w-px bg-border" />
 
-          <Button variant="secondary" size="sm" onClick={() => { const v = videoRef.current!; setMarkIn(sessionSecondsAt(v)); }} title="Mark in (I)">
+          <Button variant="secondary" size="sm" onClick={() => setIn(videoRef.current)} title="Mark in (I)">
             <ArrowLeftToLine className="h-4 w-4" /> Mark in
           </Button>
-          <Button variant="secondary" size="sm" onClick={() => { const v = videoRef.current!; setMarkOut(sessionSecondsAt(v)); }} title="Mark out (O)">
+          <Button variant="secondary" size="sm" onClick={() => setOut(videoRef.current)} title="Mark out (O)">
             Mark out <ArrowRightToLine className="h-4 w-4" />
           </Button>
-          <Button variant="ghost" size="sm" onClick={() => { setMarkIn(null); setMarkOut(null); }}>
+          <Button variant="ghost" size="sm" onClick={() => { setMarkIn(null); setMarkOut(null); setMarkInMs(null); setMarkOutMs(null); }}>
             <Split className="h-4 w-4" /> Clear
           </Button>
 

@@ -188,6 +188,23 @@ const RECORDING_STRETCH_SLUGS = new Set(
     .split(',').map((s) => s.trim()).filter(Boolean),
 );
 
+// Slugs that get a higher-quality ingest profile at the SAME target
+// bitrate — the wall-visible thumbnail becomes noticeably sharper for
+// per-minute size cost. Ary News specifically had a soft, blocky
+// recording thumbnail (2026-08-25) because the default profile is:
+//   * 640x360 (SD-lite)
+//   * -preset ultrafast (worst quality/bit ratio libx264 supports)
+// HQ profile bumps resolution to 854x480 (1.78× pixels) and preset
+// to veryfast (~30% better perceived quality per bit). Bitrate stays
+// pegged at 700 kb/s / maxrate 1000 kb/s so the target ~5 MB/min
+// disk footprint holds — the file gets sharper, not bigger. Extra
+// CPU is trivial (one encoder per HQ slug, ~2 cores, on a 112-core
+// box).
+const RECORDING_HQ_SLUGS = new Set(
+  (process.env.RECORDING_HQ_SLUGS ?? 'ary-news')
+    .split(',').map((s) => s.trim()).filter(Boolean),
+);
+
 /** Probe primary video codec of a UDP MPEG-TS source (~3 s, once at
  *  supervisor start). Returns "h264" / "hevc" / "mpeg2video" / etc.
  *  or null on failure. Needed so recordings from non-H.264 channels
@@ -297,6 +314,10 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
     || RECORDING_STRETCH_SLUGS.has(slug)
     || (codec !== undefined && codec !== 'h264');
   const useStretch = RECORDING_STRETCH_SLUGS.has(slug);
+  const useHQ = RECORDING_HQ_SLUGS.has(slug);
+  const outW = useHQ ? 854 : 640;
+  const outH = useHQ ? 480 : 360;
+  const preset = useHQ ? 'veryfast' : 'ultrafast';
   // Keyframe every 2 s so the clip editor's HLS slicer (6 s chunks)
   // always finds a keyframe on every slice boundary — cross-slice
   // -c copy works, hls.js plays without black frames.
@@ -313,12 +334,15 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
         //   * dropped yadif      only matters for viewer-side interlace,
         //     not for stored mp4 (player deinterlaces on playback). Yadif
         //     costs ~30-40 % CPU per stream, wasted here.
+        //
+        // HQ slugs (see RECORDING_HQ_SLUGS) override to 854x480 +
+        // veryfast preset — same 700 kb/s ceiling, sharper picture.
         '-vf', useStretch
-          ? 'scale=640:360:flags=lanczos'
-          : 'scale=640:360:force_original_aspect_ratio=decrease:flags=lanczos,pad=640:360:(ow-iw)/2:(oh-ih)/2',
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
+          ? `scale=${outW}:${outH}:flags=lanczos`
+          : `scale=${outW}:${outH}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${outW}:${outH}:(ow-iw)/2:(oh-ih)/2`,
+        '-c:v', 'libx264', '-preset', preset, '-tune', 'zerolatency',
         '-profile:v', 'main', '-pix_fmt', 'yuv420p',
-        '-threads', '1',
+        '-threads', useHQ ? '2' : '1',
         '-b:v', '700k', '-maxrate', '1000k', '-bufsize', '2000k',
         '-force_key_frames', 'expr:gte(t,n_forced*2)',
       ]

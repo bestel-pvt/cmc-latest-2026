@@ -175,6 +175,19 @@ const RECORDING_TRANSCODE_SLUGS = new Set(
     .split(',').map((s) => s.trim()).filter(Boolean),
 );
 
+// Slugs whose recording thumbnail should use pure-stretch scale
+// (`scale=640:360:flags=lanczos`) — same pipeline the live-hls wall
+// uses on these channels. Their source is 4:3 with content extending
+// to edges, so the default pad-fit shows pillar-box bars in the
+// recording thumbnails. Pure stretch fills the frame cleanly.
+// These slugs also FORCE transcode (below) — `-c copy` can't apply
+// a video filter.
+const RECORDING_STRETCH_SLUGS = new Set(
+  (process.env.RECORDING_STRETCH_SLUGS ??
+    'ary-news,samaa-news,aaj-news,k21-news,news-one,dawn-news,city-41-news,express-news')
+    .split(',').map((s) => s.trim()).filter(Boolean),
+);
+
 /** Probe primary video codec of a UDP MPEG-TS source (~3 s, once at
  *  supervisor start). Returns "h264" / "hevc" / "mpeg2video" / etc.
  *  or null on failure. Needed so recordings from non-H.264 channels
@@ -278,7 +291,12 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
     log.info({ slug, codec }, 'source codec detected');
   }
   const codec = channelCodec.get(slug);
-  const needsTranscode = slugForced || (codec !== undefined && codec !== 'h264');
+  // Stretch slugs must transcode — `-c copy` can't apply -vf, so the
+  // stretch would silently no-op and pillar-box would come back.
+  const needsTranscode = slugForced
+    || RECORDING_STRETCH_SLUGS.has(slug)
+    || (codec !== undefined && codec !== 'h264');
+  const useStretch = RECORDING_STRETCH_SLUGS.has(slug);
   // Keyframe every 2 s so the clip editor's HLS slicer (6 s chunks)
   // always finds a keyframe on every slice boundary — cross-slice
   // -c copy works, hls.js plays without black frames.
@@ -295,7 +313,9 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
         //   * dropped yadif      only matters for viewer-side interlace,
         //     not for stored mp4 (player deinterlaces on playback). Yadif
         //     costs ~30-40 % CPU per stream, wasted here.
-        '-vf', 'scale=640:360:force_original_aspect_ratio=decrease:flags=lanczos,pad=640:360:(ow-iw)/2:(oh-ih)/2',
+        '-vf', useStretch
+          ? 'scale=640:360:flags=lanczos'
+          : 'scale=640:360:force_original_aspect_ratio=decrease:flags=lanczos,pad=640:360:(ow-iw)/2:(oh-ih)/2',
         '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
         '-profile:v', 'main', '-pix_fmt', 'yuv420p',
         '-threads', '1',
@@ -895,18 +915,14 @@ async function clipWorker(job: { clipId: string }) {
     // Analysys logos anywhere — the operator asked for un-branded
     // exports.
     void FONT_BOLD;   // unused now (was for PAK NAVY corner text)
-    // No scale/pad — preserve source resolution. Watermark strip sizes
-    // itself to the input height (ih-24 → 24 px bar) so it works on
-    // 360p, 480p, 720p, 1080p sources identically.
+    // Watermark strip removed 2026-08-25 per operator request. Kept
+    // wm/FONT_* references live above so a future re-enable is a
+    // one-line change back.
+    void wm; void FONT_REG;
     const scalePrefix = (w > 0 && h > 0)
-      ? `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,`
-      : '';
-    const mainFilter: string[] = [
-      `[0:v]${scalePrefix}` +
-      `drawbox=x=0:y=ih-24:w=iw:h=24:color=black@0.5:t=fill,` +
-      `drawtext=text='${wm}':fontcolor=white@0.8:fontsize=12:` +
-        `fontfile=${FONT_REG}:x=12:y=h-18[outv]`,
-    ];
+      ? `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2`
+      : 'null';
+    const mainFilter: string[] = [`[0:v]${scalePrefix}[outv]`];
 
     const mainArgs: string[] = [
       '-hide_banner', '-loglevel', 'warning',

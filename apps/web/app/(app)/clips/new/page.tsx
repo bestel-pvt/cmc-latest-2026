@@ -152,13 +152,20 @@ export default function NewClipPage() {
       if (Hls.isSupported()) {
         hls = new Hls({
           xhrSetup: (xhr) => { if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`); },
-          // See recordings/page.tsx for the rationale — 6 s slices +
-          // rolling 12 s buffer = instant seek to any point of a
-          // multi-hour session.
-          maxBufferLength: 12,
-          maxMaxBufferLength: 24,
-          backBufferLength: 12,
-          maxBufferSize: 8 * 1024 * 1024,
+          // Small buffer bump vs the old 12 s live-style config:
+          // 30 s ahead / 30 s back so a slice-generation blip (the
+          // ~500 ms wait when hls.js crosses into an un-batched 60 s
+          // segment) doesn't force a mid-play stall. Also stops
+          // audio-track from advancing ahead of video during any
+          // brief buffer emptying — with 12 s buffer, audio would
+          // drain slower than video (video is bigger), so on stall
+          // the tracks separated visibly. 30 s buffer + smaller
+          // maxBufferHole keeps them tight.
+          maxBufferLength: 30,
+          maxMaxBufferLength: 60,
+          backBufferLength: 30,
+          maxBufferSize: 24 * 1024 * 1024,
+          maxBufferHole: 0.1,
           startFragPrefetch: true,
           lowLatencyMode: false,
         });
@@ -255,14 +262,28 @@ export default function NewClipPage() {
       : 0);
 
   // Keyboard shortcuts
+  // hls.js in VOD mode with discontinuities sometimes reports the
+  // video element's `currentTime` in raw PTS space rather than 0-based
+  // session time — the video's `seekable.start(0)` gives the offset
+  // hls.js chose. Session-relative time = currentTime - seekableStart.
+  // Without this correction, marking in at visual "1:30" would send
+  // (sessionStart + rawPTS) instead of (sessionStart + 90) → clip
+  // render pulls content from a wildly wrong point on the timeline
+  // (reported 2026-08-22 for abn-news + gnn-news).
+  const sessionSecondsAt = (v: HTMLVideoElement | null): number => {
+    if (!v) return 0;
+    const offset = (v.seekable && v.seekable.length > 0) ? v.seekable.start(0) : 0;
+    return Math.max(0, v.currentTime - offset);
+  };
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement).tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA') return;
       const v = videoRef.current; if (!v) return;
       if (e.key === ' ') { e.preventDefault(); v.paused ? v.play() : v.pause(); }
-      if (e.key === 'i' || e.key === 'I') setMarkIn(v.currentTime);
-      if (e.key === 'o' || e.key === 'O') setMarkOut(v.currentTime);
+      if (e.key === 'i' || e.key === 'I') setMarkIn(sessionSecondsAt(v));
+      if (e.key === 'o' || e.key === 'O') setMarkOut(sessionSecondsAt(v));
       if (e.key === 'k') v.pause();
       if (e.key === 'ArrowLeft')  v.currentTime = Math.max(0, v.currentTime - (e.shiftKey ? 5 : 0.5));
       if (e.key === 'ArrowRight') v.currentTime = Math.min(totalSeconds, v.currentTime + (e.shiftKey ? 5 : 0.5));
@@ -423,10 +444,10 @@ export default function NewClipPage() {
 
           <div className="mx-3 h-6 w-px bg-border" />
 
-          <Button variant="secondary" size="sm" onClick={() => { const v = videoRef.current!; setMarkIn(v.currentTime); }} title="Mark in (I)">
+          <Button variant="secondary" size="sm" onClick={() => { const v = videoRef.current!; setMarkIn(sessionSecondsAt(v)); }} title="Mark in (I)">
             <ArrowLeftToLine className="h-4 w-4" /> Mark in
           </Button>
-          <Button variant="secondary" size="sm" onClick={() => { const v = videoRef.current!; setMarkOut(v.currentTime); }} title="Mark out (O)">
+          <Button variant="secondary" size="sm" onClick={() => { const v = videoRef.current!; setMarkOut(sessionSecondsAt(v)); }} title="Mark out (O)">
             Mark out <ArrowRightToLine className="h-4 w-4" />
           </Button>
           <Button variant="ghost" size="sm" onClick={() => { setMarkIn(null); setMarkOut(null); }}>

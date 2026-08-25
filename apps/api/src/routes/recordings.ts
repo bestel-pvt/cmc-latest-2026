@@ -508,12 +508,19 @@ const routes: FastifyPluginAsync = async (app) => {
           '-f', 'segment',
           '-segment_time', '6',
           '-segment_format', 'mpegts',
-          // reset_timestamps=1 + no -copyts: each slice starts at PTS 0
-          // instead of inheriting the source's absolute timeline. hls.js
-          // is more tolerant of slice-relative timestamps; copyts was
-          // producing timestamp gaps that hls.js flagged as parse errors
-          // on the al-jazeera / 50-fps class of clip.
-          '-reset_timestamps', '1',
+          // reset_timestamps=1 was the CAUSE of the 5.9s-then-loading
+          // stall reported 2026-08-21 (network tab showed all .ts
+          // slices served from disk cache, size=0B, 2-10ms — proving
+          // fetches were instant; the stall was on the CLIENT side).
+          // Under reset_timestamps=1 each slice restarted PTS at 0,
+          // and MSE (Media Source Extensions inside hls.js) requires
+          // MONOTONIC PTS across appended fragments. Slice 1's first
+          // frame at PTS 0 was less than slice 0's last frame at ~6s
+          // → MSE stalled waiting for "future" data → visible pause
+          // at every 6-s slice boundary. Removed. Continuous PTS
+          // across slices in the same 60-s segment; the
+          // #EXT-X-DISCONTINUITY between segments still resets on
+          // the 60-s boundary as intended.
           '-avoid_negative_ts', 'make_zero',
           '-muxdelay', '0', '-muxpreload', '0',
           join(outDir, '%d.ts'),

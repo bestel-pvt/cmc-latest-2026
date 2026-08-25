@@ -57,6 +57,14 @@ export default function NewClipPage() {
   const [current, setCurrent] = useState(0);
   const [markIn, setMarkIn] = useState<number | null>(null);
   const [markOut, setMarkOut] = useState<number | null>(null);
+  // Wall-clock time of the video's frame 0 — populated from the
+  // manifest's `#EXT-X-PROGRAM-DATE-TIME` tag on MANIFEST_PARSED.
+  // Used as the anchor for absolute startAt/endAt so exports match
+  // the operator's visual marks even when the playlist starts earlier
+  // than the URL's `sessionStart` (server widens the query ~5 min
+  // back to catch straddling segments). Falls back to `effectiveStart`
+  // if the manifest has no PDT (older API).
+  const [playlistStartMs, setPlaylistStartMs] = useState<number | null>(null);
   const [playing, setPlaying] = useState(false);
   const [muted, setMuted] = useState(true);
 
@@ -175,7 +183,14 @@ export default function NewClipPage() {
             setVideoState({ kind: 'error', message: `${data.type} — ${data.details}` });
           }
         });
-        hls.on(Hls.Events.MANIFEST_PARSED, () => setVideoState({ kind: 'ready' }));
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          setVideoState({ kind: 'ready' });
+          // Grab PDT from the first fragment so absolute startAt/endAt
+          // computation is anchored to the true playlist start time.
+          const frag = hls?.levels?.[0]?.details?.fragments?.[0];
+          const pdt = frag?.programDateTime;
+          if (typeof pdt === 'number' && !Number.isNaN(pdt)) setPlaylistStartMs(pdt);
+        });
         hls.loadSource(src);
         hls.attachMedia(video);
         hlsRef.current = hls;
@@ -264,28 +279,13 @@ export default function NewClipPage() {
       : 0);
 
   // Keyboard shortcuts
-  // Ground-truth mark position via hls.js's PDT-derived `playingDate`
-  // (populated from the `#EXT-X-PROGRAM-DATE-TIME` tag the server now
-  // emits in session.m3u8). `playingDate` is the true wall-clock time
-  // of the frame currently on screen — accurate even when the playlist
-  // starts EARLIER than the URL's `sessionStart` (the server widens
-  // the m3u8 query ~5 min back to catch straddling segments, so up to
-  // one segment length of extra content plays before `sessionStart`).
-  // Without this, marking at visual "1:30" sent (sessionStart + 90 s)
-  // even when the actual on-screen time was ~45 s BEFORE that —
-  // exports came from a point ~45 s AFTER the operator's mark
-  // (reported for ptv-world 2026-08-25). Falls back to the seekable
-  // math for Safari's native HLS (no hls.js instance) and for any
-  // browser that receives an older playlist without a PDT tag.
+  // Raw video-element time — 0-based seconds from the FIRST playable
+  // frame of the session playlist. Server-side `startAtISO` math uses
+  // `playlistStartMs` (populated from the manifest's PDT tag) as its
+  // anchor, so this simple `currentTime` is exactly what we need.
   const sessionSecondsAt = (v: HTMLVideoElement | null): number => {
     if (!v) return 0;
-    const hls = hlsRef.current;
-    const pd = hls?.playingDate;
-    if (pd && effectiveStart) {
-      return Math.max(0, (pd.getTime() - new Date(effectiveStart).getTime()) / 1000);
-    }
-    const offset = (v.seekable && v.seekable.length > 0) ? v.seekable.start(0) : 0;
-    return Math.max(0, v.currentTime - offset);
+    return Math.max(0, v.currentTime);
   };
 
   useEffect(() => {
@@ -306,15 +306,21 @@ export default function NewClipPage() {
     return () => window.removeEventListener('keydown', onKey);
   }, [totalSeconds]);
 
+  const anchorMs = useMemo(() => {
+    if (playlistStartMs !== null) return playlistStartMs;
+    if (effectiveStart) return new Date(effectiveStart).getTime();
+    return null;
+  }, [playlistStartMs, effectiveStart]);
+
   const startAtISO = useMemo(() => {
-    if (!effectiveStart || markIn === null) return null;
-    return new Date(new Date(effectiveStart).getTime() + markIn * 1000).toISOString();
-  }, [effectiveStart, markIn]);
+    if (anchorMs === null || markIn === null) return null;
+    return new Date(anchorMs + markIn * 1000).toISOString();
+  }, [anchorMs, markIn]);
 
   const endAtISO = useMemo(() => {
-    if (!effectiveStart || markOut === null) return null;
-    return new Date(new Date(effectiveStart).getTime() + markOut * 1000).toISOString();
-  }, [effectiveStart, markOut]);
+    if (anchorMs === null || markOut === null) return null;
+    return new Date(anchorMs + markOut * 1000).toISOString();
+  }, [anchorMs, markOut]);
 
   const canExport = !!(title && channelId && startAtISO && endAtISO && markOut !== null && markIn !== null && markOut > markIn);
 

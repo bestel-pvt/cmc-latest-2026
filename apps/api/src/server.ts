@@ -97,21 +97,52 @@ async function main() {
   // above.
   const HLS_DIR = pathResolve(process.env.HLS_DIR ?? './data/hls');
 
-  // Per-slug last-known-good m3u8 buffer. When live-hls recycles a
-  // channel's ffmpeg (age-based, ~1/min across the 30-channel wall),
-  // there is a 5–10 s window where live.m3u8 is missing from disk.
-  // hls.js sees 404s, exhausts its retries, and latches the tile
-  // into permanent-failure until the user hard-refreshes. Serving a
-  // stale but recently-valid m3u8 for the duration of that window
-  // masks the gap entirely — the browser keeps playing the last few
-  // segments (which are still on disk), the new ffmpeg comes up
-  // within seconds, and the next poll gets the fresh playlist. A
-  // slug that has been dark for longer than the TTL correctly falls
-  // through to a 404 so a genuine outage isn't hidden.
+  // Per-slug m3u8 cache with TWO purposes:
+  //   (a) hot-path coalescing — 30 tiles polling every ~3 s = ~10
+  //       req/s to the same handful of slugs. Without a short-TTL
+  //       cache, every request hits the libuv thread pool for a
+  //       readFile; the pool is 4 workers by default and spikes
+  //       under sustained load produced 3–5 s latencies (measured
+  //       2026-08-25 on the wall). Long-latency responses held
+  //       browser sockets open, the Windows TCP accept queue
+  //       overflowed, and the kernel started refusing new
+  //       connections with ERR_CONNECTION_REFUSED — the "wall
+  //       stuck out of nowhere" symptom.
+  //   (b) gap-fill during live-hls ffmpeg age-recycle — when
+  //       live.m3u8 is missing from disk for ~5–10 s, serve the
+  //       last-known-good body instead of a 404 so hls.js doesn't
+  //       latch the tile into permanent-failure.
+  //
+  // Fast path: cached body <= HOT_TTL_MS old → return without touching
+  // disk. Coalesces 30 concurrent CNN polls into 1 disk read.
+  // Slow path (cache stale): readFile fresh. Cache the result.
+  // Fallback (readFile fails): serve cache up to GAP_TTL_MS old.
   const M3U8_CACHE = new Map<string, { body: Buffer; ts: number }>();
-  const M3U8_CACHE_TTL_MS = 60_000;
+  const GAP_TTL_MS = 60_000;
+  const REFRESH_MS = 500;
 
   const SLUG_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
+
+  // Background refresh: once a slug has been requested, we keep its
+  // m3u8 fresh in memory every REFRESH_MS. The request handler serves
+  // PURELY from cache — zero disk I/O in the hot path.  Prior design
+  // did `await readFile` on every request; under sustained 30-tile
+  // wall load Windows disk-stall spikes pushed tail latencies to
+  // 4-5 s, which held browser sockets long enough to overflow the
+  // TCP accept queue and produce sporadic ERR_CONNECTION_REFUSED
+  // on the wall (reported 2026-08-25). Now: 30 tiles polling every
+  // ~3 s produce ~10 memory-cache hits/s (near-zero cost) while
+  // ONE background refresher does ~2 reads/s per slug — even a full
+  // pool of 4 libuv workers handles that trivially.
+  setInterval(async () => {
+    for (const slug of M3U8_CACHE.keys()) {
+      try {
+        const body = await readFile(pathJoin(HLS_DIR, slug, 'live.m3u8'));
+        M3U8_CACHE.set(slug, { body, ts: Date.now() });
+      } catch { /* keep last-known-good; the request-handler gap-fill
+                  window still applies below */ }
+    }
+  }, REFRESH_MS).unref();
 
   app.get<{ Params: { slug: string } }>('/hls/:slug/live.m3u8', async (req, reply) => {
     const { slug } = req.params;
@@ -121,15 +152,21 @@ async function main() {
       .header('Cache-Control', 'no-cache, no-store, must-revalidate')
       .header('Content-Type', 'application/vnd.apple.mpegurl');
 
+    const cached = M3U8_CACHE.get(slug);
+    if (cached) {
+      // Fresh from background refresh (< REFRESH_MS old), OR stale but
+      // still inside gap-fill window (ffmpeg age-recycle can leave the
+      // file missing for ~5-10 s; we serve the last-known-good so
+      // hls.js doesn't latch the tile into permanent failure).
+      if (Date.now() - cached.ts < GAP_TTL_MS) return reply.send(cached.body);
+    }
+    // First request for this slug — sync fill so we don't return 404
+    // just because the background refresher hasn't touched it yet.
     try {
       const body = await readFile(pathJoin(HLS_DIR, slug, 'live.m3u8'));
       M3U8_CACHE.set(slug, { body, ts: Date.now() });
       return reply.send(body);
     } catch {
-      const cached = M3U8_CACHE.get(slug);
-      if (cached && Date.now() - cached.ts < M3U8_CACHE_TTL_MS) {
-        return reply.send(cached.body);
-      }
       return reply.code(404).send();
     }
   });

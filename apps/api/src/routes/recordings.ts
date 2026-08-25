@@ -405,6 +405,19 @@ const routes: FastifyPluginAsync = async (app) => {
       '#EXT-X-PLAYLIST-TYPE:VOD',
       '#EXT-X-INDEPENDENT-SEGMENTS',
     ];
+    // Anchor the timeline to the actual first playable segment's wall
+    // clock. Without this, the client had to derive absolute timestamps
+    // from a `sessionStart` URL param that could differ from the true
+    // first-segment start by up to a segment length (the m3u8 query
+    // widens the window ~5 min back to catch straddling segments), so
+    // mark-in/out coordinates were offset by ~30-60 s and exported
+    // clips came from a different point than the operator marked
+    // (reported for ptv-world 2026-08-25). With PDT emitted, hls.js
+    // exposes `hls.playingDate` = wall-clock time of the current
+    // frame, so the client can send true UTC timestamps instead of
+    // `sessionStart + relativeSeconds` math.
+    const firstPlayableStart = playable[0]!.startedAt;
+    lines.push(`#EXT-X-PROGRAM-DATE-TIME:${firstPlayableStart.toISOString()}`);
     // For each segment we need the ACTUAL slice count that ffmpeg's
     // segment muxer produced (or will produce). Estimating with
     // ceil(dur/6) is wrong when the tail is short — ffmpeg emits N

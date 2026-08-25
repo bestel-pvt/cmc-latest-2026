@@ -49,6 +49,7 @@ export default function NewClipPage() {
   const segmentId = sp.get('segmentId');
 
   const videoRef = useRef<HTMLVideoElement>(null);
+  const hlsRef = useRef<Hls | null>(null);
   const waveRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WaveSurfer | null>(null);
 
@@ -177,6 +178,7 @@ export default function NewClipPage() {
         hls.on(Hls.Events.MANIFEST_PARSED, () => setVideoState({ kind: 'ready' }));
         hls.loadSource(src);
         hls.attachMedia(video);
+        hlsRef.current = hls;
       } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
         video.src = src;
         setVideoState({ kind: 'ready' });
@@ -262,16 +264,26 @@ export default function NewClipPage() {
       : 0);
 
   // Keyboard shortcuts
-  // hls.js in VOD mode with discontinuities sometimes reports the
-  // video element's `currentTime` in raw PTS space rather than 0-based
-  // session time — the video's `seekable.start(0)` gives the offset
-  // hls.js chose. Session-relative time = currentTime - seekableStart.
-  // Without this correction, marking in at visual "1:30" would send
-  // (sessionStart + rawPTS) instead of (sessionStart + 90) → clip
-  // render pulls content from a wildly wrong point on the timeline
-  // (reported 2026-08-22 for abn-news + gnn-news).
+  // Ground-truth mark position via hls.js's PDT-derived `playingDate`
+  // (populated from the `#EXT-X-PROGRAM-DATE-TIME` tag the server now
+  // emits in session.m3u8). `playingDate` is the true wall-clock time
+  // of the frame currently on screen — accurate even when the playlist
+  // starts EARLIER than the URL's `sessionStart` (the server widens
+  // the m3u8 query ~5 min back to catch straddling segments, so up to
+  // one segment length of extra content plays before `sessionStart`).
+  // Without this, marking at visual "1:30" sent (sessionStart + 90 s)
+  // even when the actual on-screen time was ~45 s BEFORE that —
+  // exports came from a point ~45 s AFTER the operator's mark
+  // (reported for ptv-world 2026-08-25). Falls back to the seekable
+  // math for Safari's native HLS (no hls.js instance) and for any
+  // browser that receives an older playlist without a PDT tag.
   const sessionSecondsAt = (v: HTMLVideoElement | null): number => {
     if (!v) return 0;
+    const hls = hlsRef.current;
+    const pd = hls?.playingDate;
+    if (pd && effectiveStart) {
+      return Math.max(0, (pd.getTime() - new Date(effectiveStart).getTime()) / 1000);
+    }
     const offset = (v.seekable && v.seekable.length > 0) ? v.seekable.start(0) : 0;
     return Math.max(0, v.currentTime - offset);
   };

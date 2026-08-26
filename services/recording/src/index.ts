@@ -403,11 +403,40 @@ function stopFFmpegGracefully(sup: Supervisor): void {
   }, 3000);
 }
 
+// Fingerprint = sha256 of the first 1 MB + last 1 MB + size, prefixed
+// so it can never collide with a full-file sha256 of the same content.
+// 2026-08-26: switched from full-file sha256 because -c copy channels
+// write source-native segments up to 60-70 MB and streaming a full
+// hash through the sequential ingest scan starved every downstream
+// channel — only 2 of 30 tiles were catalogued per 3-min window. A
+// fixed 2 MB read + tiny hash is O(1) per file regardless of size,
+// and still detects any corruption in the video header, keyframes
+// near the boundaries, or a truncated tail. Cryptographic tamper
+// resistance was never the actual requirement here.
 async function sha256(path: string): Promise<string> {
-  return new Promise((res, rej) => {
-    const h = createHash('sha256');
-    createReadStream(path).on('data', (c) => h.update(c)).on('end', () => res(h.digest('hex'))).on('error', rej);
-  });
+  const { open } = await import('node:fs/promises');
+  const h = createHash('sha256');
+  const st = statSync(path);
+  const size = st.size;
+  const CHUNK = 1024 * 1024; // 1 MB
+  const fh = await open(path, 'r');
+  try {
+    const head = Buffer.alloc(Math.min(CHUNK, size));
+    if (head.length > 0) { await fh.read(head, 0, head.length, 0); h.update(head); }
+    if (size > CHUNK * 2) {
+      const tail = Buffer.alloc(CHUNK);
+      await fh.read(tail, 0, CHUNK, size - CHUNK);
+      h.update(tail);
+    } else if (size > head.length) {
+      const rest = Buffer.alloc(size - head.length);
+      await fh.read(rest, 0, rest.length, head.length);
+      h.update(rest);
+    }
+  } finally {
+    await fh.close();
+  }
+  h.update(Buffer.from(`|size=${size}`));
+  return 'fp1:' + h.digest('hex');
 }
 
 function sign(payload: string): string {

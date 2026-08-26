@@ -169,41 +169,24 @@ function channelOutDir(channelId: string, when: Date = new Date()): string {
 // so `-c copy` produces 0-byte segments (no I-frame to start on). For
 // these we transcode with libx264 ultrafast + `-force_key_frames` at
 // every segment boundary — one keyframe per 60 s guaranteed.
-const RECORDING_TRANSCODE_SLUGS = new Set(
-  (process.env.RECORDING_TRANSCODE_SLUGS ??
-    'cnn,365-news,gtv-news,samaa-news,92-news,bol-news,aik-news,ary-news')
-    .split(',').map((s) => s.trim()).filter(Boolean),
-);
-
-// Slugs whose recording thumbnail should use pure-stretch scale
-// (`scale=640:360:flags=lanczos`) — same pipeline the live-hls wall
-// uses on these channels. Their source is 4:3 with content extending
-// to edges, so the default pad-fit shows pillar-box bars in the
-// recording thumbnails. Pure stretch fills the frame cleanly.
-// These slugs also FORCE transcode (below) — `-c copy` can't apply
-// a video filter.
-const RECORDING_STRETCH_SLUGS = new Set(
-  (process.env.RECORDING_STRETCH_SLUGS ??
-    'ary-news,samaa-news,aaj-news,k21-news,news-one,dawn-news,city-41-news,express-news')
-    .split(',').map((s) => s.trim()).filter(Boolean),
-);
-
-// Slugs that get a higher-quality ingest profile at the SAME target
-// bitrate — the wall-visible thumbnail becomes noticeably sharper for
-// per-minute size cost. Ary News specifically had a soft, blocky
-// recording thumbnail (2026-08-25) because the default profile is:
-//   * 640x360 (SD-lite)
-//   * -preset ultrafast (worst quality/bit ratio libx264 supports)
-// HQ profile bumps resolution to 854x480 (1.78× pixels) and preset
-// to veryfast (~30% better perceived quality per bit). Bitrate stays
-// pegged at 700 kb/s / maxrate 1000 kb/s so the target ~5 MB/min
-// disk footprint holds — the file gets sharper, not bigger. Extra
-// CPU is trivial (one encoder per HQ slug, ~2 cores, on a 112-core
-// box).
-const RECORDING_HQ_SLUGS = new Set(
-  (process.env.RECORDING_HQ_SLUGS ?? 'ary-news')
-    .split(',').map((s) => s.trim()).filter(Boolean),
-);
+// 2026-08-26 quality bump per operator request:
+//   - target ingest resolution 854x480 (was 640x360; 1.78x pixels,
+//     visibly sharper faces)
+//   - pure-stretch scale for EVERY channel (was: per-slug set for the
+//     8 known letterbox sources). No pillar-box / letterbox anywhere.
+//   - veryfast preset (was ultrafast; ~30% better perceived quality
+//     per bit at the same bitrate)
+//   - 700 kb/s / max 1000 kb/s bitrate ceiling unchanged, so a 60 s
+//     recording still lands at ~5 MB
+//   - transcode is now UNIVERSAL (drop the per-slug transcode list) so
+//     downloads / clip exports pull from a uniform-quality corpus and
+//     never surprise the operator with a soft `-c copy` slice from a
+//     mismatched source
+// Env override still supported for both settings if the deployment
+// ever needs a different target.
+const REC_W = Number(process.env.RECORDING_W ?? 854);
+const REC_H = Number(process.env.RECORDING_H ?? 480);
+const REC_PRESET = process.env.RECORDING_PRESET ?? 'veryfast';
 
 /** Probe primary video codec of a UDP MPEG-TS source (~3 s, once at
  *  supervisor start). Returns "h264" / "hevc" / "mpeg2video" / etc.
@@ -286,71 +269,35 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
     }
   }
 
-  // Decide transcode:
-  //   1. Slug in RECORDING_TRANSCODE_SLUGS (slow-KF sources) → always
-  //      transcode so we get clean 60-s segment cuts.
-  //   2. Source codec is not H.264 (probed once) → transcode so the
-  //      browser + hls.js can play the recording.
-  //   3. Otherwise `-c copy` (near-zero CPU, native quality preserved).
-  //
-  // The 2026-08-20 late-late "force transcode ALL channels" experiment
-  // pushed CPU to 100 % on the 112-core box because 30 concurrent x264
-  // encodes cost ~20-40 cores on top of live-hls's ~40 cores.
-  // Recording = download consistency is now preserved by:
-  //   * -c copy segments  →  download uses letterbox-padded re-encode
-  //     at the same 640x360 content size (net: download size tracks
-  //     source size, no compress-below-source regression).
-  const slugForced = RECORDING_TRANSCODE_SLUGS.has(slug);
-  if (!slugForced && !channelCodec.has(slug)) {
+  // Universal transcode — every channel now goes through the same
+  // ingest pipeline so clip / download consumers pull from a uniform
+  // corpus. Pure stretch (no pad, no crop) fills every frame edge
+  // to edge — no black borders anywhere. The 2026-08-20 "force
+  // transcode ALL" experiment DID overload the box, but that was at
+  // -preset ultrafast with two-threads-per-encoder and no live-hls
+  // co-tenant tuning; veryfast + 2 threads at 854x480 on the
+  // 112-core box is comfortable.
+  if (!channelCodec.has(slug)) {
     log.info({ slug }, 'probing source codec (once)');
-    const codec = probeVideoCodec(sourceUrl, kind);
-    channelCodec.set(slug, codec);
-    log.info({ slug, codec }, 'source codec detected');
+    channelCodec.set(slug, probeVideoCodec(sourceUrl, kind));
+    log.info({ slug, codec: channelCodec.get(slug) }, 'source codec detected');
   }
-  const codec = channelCodec.get(slug);
-  // Stretch slugs must transcode — `-c copy` can't apply -vf, so the
-  // stretch would silently no-op and pillar-box would come back.
-  const needsTranscode = slugForced
-    || RECORDING_STRETCH_SLUGS.has(slug)
-    || (codec !== undefined && codec !== 'h264');
-  const useStretch = RECORDING_STRETCH_SLUGS.has(slug);
-  const useHQ = RECORDING_HQ_SLUGS.has(slug);
-  const outW = useHQ ? 854 : 640;
-  const outH = useHQ ? 480 : 360;
-  const preset = useHQ ? 'veryfast' : 'ultrafast';
   // Keyframe every 2 s so the clip editor's HLS slicer (6 s chunks)
   // always finds a keyframe on every slice boundary — cross-slice
   // -c copy works, hls.js plays without black frames.
-  const videoArgs = needsTranscode
-    ? [
-        // Ingest stays at 640x360 — 30 concurrent x264 encodes must
-        // fit under the server's steady CPU budget. Server has 112
-        // logical cores but was hitting 98 % because each encoder was
-        // using 2.2 cores × 30 = 66 cores plus 30 live-hls transcodes.
-        //
-        // Cuts applied:
-        //   * -threads 1 (was 2)  ~1.6 GB/hour still recycled at 30 min
-        //     so 2 threads bought no throughput at 640x360; halves core use
-        //   * dropped yadif      only matters for viewer-side interlace,
-        //     not for stored mp4 (player deinterlaces on playback). Yadif
-        //     costs ~30-40 % CPU per stream, wasted here.
-        //
-        // HQ slugs (see RECORDING_HQ_SLUGS) override to 854x480 +
-        // veryfast preset — same 700 kb/s ceiling, sharper picture.
-        '-vf', useStretch
-          ? `scale=${outW}:${outH}:flags=lanczos`
-          : `scale=${outW}:${outH}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${outW}:${outH}:(ow-iw)/2:(oh-ih)/2`,
-        '-c:v', 'libx264', '-preset', preset, '-tune', 'zerolatency',
-        '-profile:v', 'main', '-pix_fmt', 'yuv420p',
-        '-threads', useHQ ? '2' : '1',
-        '-b:v', '700k', '-maxrate', '1000k', '-bufsize', '2000k',
-        '-force_key_frames', 'expr:gte(t,n_forced*2)',
-      ]
-    : ['-c:v', 'copy'];
+  const videoArgs = [
+    '-vf', `scale=${REC_W}:${REC_H}:flags=lanczos`,
+    '-c:v', 'libx264', '-preset', REC_PRESET, '-tune', 'zerolatency',
+    '-profile:v', 'main', '-pix_fmt', 'yuv420p',
+    '-threads', '2',
+    '-b:v', '700k', '-maxrate', '1000k', '-bufsize', '2000k',
+    '-force_key_frames', 'expr:gte(t,n_forced*2)',
+  ];
+  const needsTranscode = true;
   const audioArgs = needsTranscode
     ? ['-c:a', 'aac', '-b:a', '96k', '-ac', '2', '-ar', '48000']
     : ['-c:a', 'copy'];
-  if (needsTranscode) log.info({ slug }, 'recording will transcode (uniform 640x360@700k)');
+  if (needsTranscode) log.info({ slug, w: REC_W, h: REC_H }, 'recording will transcode');
 
   const args = [
     '-hide_banner', '-loglevel', 'warning', '-nostdin',
@@ -862,7 +809,10 @@ async function clipWorker(job: { clipId: string }) {
   // padding compresses to almost nothing so file size stays around
   // the same as a raw 640x360@700k encode.
   void clip.resolution;   // legacy UI field, no longer used
-  const w = 1280, h = 720;
+  // Clip export resolution now matches ingest (854x480) so we
+  // never upscale a source pixel and every clip stays at the same
+  // per-minute size the operator sees for recordings (~5 MB/min).
+  const w = REC_W, h = REC_H;
 
   // If multiple files, write a concat list file for ffmpeg's concat
   // demuxer (safer than concat filter for pre-encoded MP4 pieces).
@@ -943,8 +893,11 @@ async function clipWorker(job: { clipId: string }) {
     // wm/FONT_* references live above so a future re-enable is a
     // one-line change back.
     void wm; void FONT_REG;
+    // Pure stretch — same as ingest. No pillars, no letterbox. If the
+    // source is already this exact size the scaler is essentially a
+    // no-op, no quality loss.
     const scalePrefix = (w > 0 && h > 0)
-      ? `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2`
+      ? `scale=${w}:${h}:flags=lanczos`
       : 'null';
     const mainFilter: string[] = [`[0:v]${scalePrefix}[outv]`];
 

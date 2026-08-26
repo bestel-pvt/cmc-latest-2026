@@ -305,13 +305,11 @@ const routes: FastifyPluginAsync = async (app) => {
           ff.on('error', reject);
         });
       };
-      // Recording download: re-encode with letterbox padding — content
-      // stays 640x360 (matches on-disk ingest), padded to 1280x720
-      // canvas with black borders. Black regions compress to almost
-      // nothing so the output size stays close to the source total,
-      // but fullscreen playback upscales 1.5x (1280→1920) instead of
-      // 3x (640→1920), giving much sharper text/faces on the operator's
-      // reference monitor. Same 700k target as ingest.
+      // Recording download: pure-stretch to 854x480 (matches ingest —
+      // no upscaling, no black borders, no pillar-box). Ingest is now
+      // uniformly 854x480 across every channel, so this concat re-encode
+      // is effectively 1:1 with the source segments. Same 700k target
+      // → ~5 MB/min output regardless of duration.
       //
       // Serialised by buildLocks + capped by dlAcquire semaphore so
       // this can't dogpile with 24/7 recording ffmpegs.
@@ -322,7 +320,7 @@ const routes: FastifyPluginAsync = async (app) => {
           '-err_detect', 'ignore_err',
           '-fflags', '+genpts+discardcorrupt+igndts',
           '-f', 'concat', '-safe', '0', '-i', listPath,
-          '-vf', 'scale=640:360:force_original_aspect_ratio=decrease:flags=lanczos,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black',
+          '-vf', 'scale=854:480:flags=lanczos',
           '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency',
           '-profile:v', 'main', '-pix_fmt', 'yuv420p',
           '-threads', '2',
@@ -527,7 +525,7 @@ const routes: FastifyPluginAsync = async (app) => {
           // MPEG-TS. Forcing constant 25 fps at the filter stage produces
           // slices every browser handles uniformly regardless of source
           // frame rate (25 / 25.4 / 30 / 50).
-          '-vf', 'scale=640:360:force_original_aspect_ratio=decrease:flags=lanczos,pad=640:360:(ow-iw)/2:(oh-ih)/2,fps=25',
+          '-vf', 'scale=854:480:flags=lanczos,fps=25',
           '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
           '-profile:v', 'main', '-pix_fmt', 'yuv420p',
           '-g', '48', '-force_key_frames', 'expr:gte(t,n_forced*2)',

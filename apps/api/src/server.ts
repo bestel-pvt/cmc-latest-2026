@@ -134,13 +134,27 @@ async function main() {
   // ~3 s produce ~10 memory-cache hits/s (near-zero cost) while
   // ONE background refresher does ~2 reads/s per slug — even a full
   // pool of 4 libuv workers handles that trivially.
+  //
+  // In-flight guard: without this, a single disk stall would let the
+  // 500 ms setInterval fire a NEW iteration on top of the still-
+  // running previous one. Over minutes, dozens of concurrent readFile
+  // calls stacked, leaked libuv threads / handles, and eventually
+  // the API stopped accepting connections — every tile went to
+  // ERR_CONNECTION_REFUSED at once (screenshot 2026-08-26).
+  let refreshing = false;
   setInterval(async () => {
-    for (const slug of M3U8_CACHE.keys()) {
-      try {
-        const body = await readFile(pathJoin(HLS_DIR, slug, 'live.m3u8'));
-        M3U8_CACHE.set(slug, { body, ts: Date.now() });
-      } catch { /* keep last-known-good; the request-handler gap-fill
-                  window still applies below */ }
+    if (refreshing) return;
+    refreshing = true;
+    try {
+      for (const slug of M3U8_CACHE.keys()) {
+        try {
+          const body = await readFile(pathJoin(HLS_DIR, slug, 'live.m3u8'));
+          M3U8_CACHE.set(slug, { body, ts: Date.now() });
+        } catch { /* keep last-known-good; the request-handler gap-fill
+                    window still applies below */ }
+      }
+    } finally {
+      refreshing = false;
     }
   }, REFRESH_MS).unref();
 
@@ -198,7 +212,12 @@ async function main() {
   process.on('SIGINT',  () => void shutdown('SIGINT'));
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
 
-  await app.listen({ port: env.API_PORT, host: '0.0.0.0' });
+  // backlog=1024 raises the pending-accept queue well above the 30
+  // simultaneous reconnects a wall gets after any tile-refresh burst.
+  // Windows caps at SOMAXCONN (default 200), but asking for 1024
+  // lets us take advantage of any raised registry value without a
+  // rebuild.
+  await app.listen({ port: env.API_PORT, host: '0.0.0.0', backlog: 1024 });
   app.log.info(`CMC API listening on http://0.0.0.0:${env.API_PORT}`);
 }
 

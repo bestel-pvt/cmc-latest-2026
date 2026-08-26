@@ -298,13 +298,15 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
     ? [
         // Re-encode at NATIVE resolution — no -vf scale here so
         // the download/clip re-encode later has full source pixels
-        // to work from. Preset veryfast keeps the CPU trivial on
-        // the 8 known transcode channels; if we ever add more to
-        // the list, this scales gracefully.
+        // to work from. Preset veryfast + 1000 kb/s ceiling keeps
+        // per-segment files around 7-8 MB — small enough that the
+        // ingest scan (sha256 + prisma insert) stays fast even with
+        // 8 force-transcode channels running. Was 2000 kb/s which
+        // pushed per-segment files to 15+ MB and starved the scan.
         '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency',
         '-profile:v', 'main', '-pix_fmt', 'yuv420p',
         '-threads', '2',
-        '-b:v', '2000k', '-maxrate', '3000k', '-bufsize', '6000k',
+        '-b:v', '1000k', '-maxrate', '1500k', '-bufsize', '3000k',
         '-force_key_frames', 'expr:gte(t,n_forced*2)',
       ]
     : ['-c:v', 'copy'];

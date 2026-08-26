@@ -269,31 +269,39 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
     }
   }
 
-  // Universal transcode — every channel now goes through the same
-  // ingest pipeline so clip / download consumers pull from a uniform
-  // corpus. Pure stretch (no pad, no crop) fills every frame edge
-  // to edge — no black borders anywhere. The 2026-08-20 "force
-  // transcode ALL" experiment DID overload the box, but that was at
-  // -preset ultrafast with two-threads-per-encoder and no live-hls
-  // co-tenant tuning; veryfast + 2 threads at 854x480 on the
-  // 112-core box is comfortable.
+  // Ingest strategy — CPU-first, quality-preserving:
+  //   * H.264 sources → `-c copy` (raw). No re-encode, near-zero CPU,
+  //     source native resolution + bitrate preserved on disk. Clip /
+  //     download endpoints do the target-profile re-encode on demand.
+  //   * Non-H.264 sources → transcode to H.264 at NATIVE resolution
+  //     so the file plays in the browser without a client-side
+  //     decoder that hls.js can't drive. Still no downscale here —
+  //     any resolution shaping happens at export time.
+  //
+  // 2026-08-26: reverted from a universal 854x480 veryfast transcode
+  // that pushed the 112-core box to 95%+ CPU (30 encoders × 2 cores
+  // + live-hls's 30 encoders + everything else = hang). Per operator
+  // request, quality shaping now happens ONLY on download / clip
+  // export, not on the 24/7 ingest.
   if (!channelCodec.has(slug)) {
     log.info({ slug }, 'probing source codec (once)');
     channelCodec.set(slug, probeVideoCodec(sourceUrl, kind));
     log.info({ slug, codec: channelCodec.get(slug) }, 'source codec detected');
   }
-  // Keyframe every 2 s so the clip editor's HLS slicer (6 s chunks)
-  // always finds a keyframe on every slice boundary — cross-slice
-  // -c copy works, hls.js plays without black frames.
-  const videoArgs = [
-    '-vf', `scale=${REC_W}:${REC_H}:flags=lanczos`,
-    '-c:v', 'libx264', '-preset', REC_PRESET, '-tune', 'zerolatency',
-    '-profile:v', 'main', '-pix_fmt', 'yuv420p',
-    '-threads', '2',
-    '-b:v', '700k', '-maxrate', '1000k', '-bufsize', '2000k',
-    '-force_key_frames', 'expr:gte(t,n_forced*2)',
-  ];
-  const needsTranscode = true;
+  const codec = channelCodec.get(slug);
+  const needsTranscode = codec !== undefined && codec !== 'h264';
+  const videoArgs = needsTranscode
+    ? [
+        // Non-h264 source: re-encode to h264 at NATIVE resolution.
+        // No -vf scale so we preserve source pixel count for the
+        // later download/clip re-encode to work from.
+        '-c:v', 'libx264', '-preset', REC_PRESET, '-tune', 'zerolatency',
+        '-profile:v', 'main', '-pix_fmt', 'yuv420p',
+        '-threads', '2',
+        '-b:v', '2000k', '-maxrate', '3000k', '-bufsize', '6000k',
+        '-force_key_frames', 'expr:gte(t,n_forced*2)',
+      ]
+    : ['-c:v', 'copy'];
   const audioArgs = needsTranscode
     ? ['-c:a', 'aac', '-b:a', '96k', '-ac', '2', '-ar', '48000']
     : ['-c:a', 'copy'];

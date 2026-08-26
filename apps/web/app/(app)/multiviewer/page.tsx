@@ -151,6 +151,12 @@ export default function MultiviewerPage() {
   const [saveDialogOpen, setSaveDialogOpen] = useState(false);
   const [templateName, setTemplateName] = useState('');
   const [isFullscreen, setIsFullscreen] = useState(false);
+  // Bumped by pressing 'R' anywhere on the wall (fullscreen or not).
+  // Fed into each HlsTile's React key so a bump forces a full unmount+
+  // remount → the hls.js instance inside is destroyed and rebuilt from
+  // scratch, so any tile that latched into a permanent-failure state
+  // (post-recycle 404, socket refused, source hiccup) comes back live.
+  const [refreshTick, setRefreshTick] = useState(0);
   /** Slot index whose audio is currently ON, or null if all muted.
    * Enforces "only one channel makes noise at a time" — clicking a
    * different tile's volume icon switches audio to that tile and
@@ -258,6 +264,25 @@ export default function MultiviewerPage() {
       setAudioSlotIdx(snap.audioSlotIdx);
       return null;
     });
+  }, []);
+
+  /** Always-on: `r` (or `R`) refreshes every tile — unmount+remount
+   *  every HlsTile so hls.js drops any latched failure and reconnects
+   *  fresh. Works in fullscreen too. Ignores modifier combos so
+   *  browser shortcuts like Ctrl-R for a full page reload still fire. */
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement | null)?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement)?.isContentEditable) return;
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      if (e.key === 'r' || e.key === 'R') {
+        e.preventDefault();
+        setRefreshTick((t) => t + 1);
+        toast.success('Wall refreshed');
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
   }, []);
 
   /** Esc while soloing → exit solo. `s` in solo OR single-layout →
@@ -406,6 +431,7 @@ export default function MultiviewerPage() {
                 }}
               >
                 <HlsTile
+                  key={`${slug ?? 'empty'}-${refreshTick}`}
                   slug={slug}
                   channelName={ch?.name}
                   logoUrl={ch?.logoUrl ?? undefined}

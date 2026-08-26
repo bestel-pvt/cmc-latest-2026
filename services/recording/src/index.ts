@@ -169,21 +169,21 @@ function channelOutDir(channelId: string, when: Date = new Date()): string {
 // so `-c copy` produces 0-byte segments (no I-frame to start on). For
 // these we transcode with libx264 ultrafast + `-force_key_frames` at
 // every segment boundary — one keyframe per 60 s guaranteed.
-// 2026-08-26 quality bump per operator request:
-//   - target ingest resolution 854x480 (was 640x360; 1.78x pixels,
-//     visibly sharper faces)
-//   - pure-stretch scale for EVERY channel (was: per-slug set for the
-//     8 known letterbox sources). No pillar-box / letterbox anywhere.
-//   - veryfast preset (was ultrafast; ~30% better perceived quality
-//     per bit at the same bitrate)
-//   - 700 kb/s / max 1000 kb/s bitrate ceiling unchanged, so a 60 s
-//     recording still lands at ~5 MB
-//   - transcode is now UNIVERSAL (drop the per-slug transcode list) so
-//     downloads / clip exports pull from a uniform-quality corpus and
-//     never surprise the operator with a soft `-c copy` slice from a
-//     mismatched source
-// Env override still supported for both settings if the deployment
-// ever needs a different target.
+// Force-transcode slugs — channels whose source has slow keyframes
+// (or DTS quirks) that break `-c copy`'s segment muxer, so segments
+// either never close (file stays 0 bytes until next keyframe, minutes
+// later) or ffmpeg crash-loops. For these we re-encode at NATIVE
+// resolution with a 2-s keyframe cadence so 60-s segments cut cleanly.
+// Everything downstream (download / clip export) still re-encodes to
+// 854x480 for the operator's target profile — this list only exists
+// because the source itself isn't friendly to a byte-copy pipeline.
+const RECORDING_TRANSCODE_SLUGS = new Set(
+  (process.env.RECORDING_TRANSCODE_SLUGS ??
+    'cnn,365-news,gtv-news,samaa-news,92-news,bol-news,aik-news,ary-news')
+    .split(',').map((s) => s.trim()).filter(Boolean),
+);
+// Download / clip target — everything above is about the on-disk
+// recording, not the download. The download endpoint reads these.
 const REC_W = Number(process.env.RECORDING_W ?? 854);
 const REC_H = Number(process.env.RECORDING_H ?? 480);
 const REC_PRESET = process.env.RECORDING_PRESET ?? 'veryfast';
@@ -289,13 +289,19 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
     log.info({ slug, codec: channelCodec.get(slug) }, 'source codec detected');
   }
   const codec = channelCodec.get(slug);
-  const needsTranscode = codec !== undefined && codec !== 'h264';
+  // Transcode when: source isn't h264 (browser can't play) OR the
+  // source is on the "slow-KF" list (segment muxer needs the 2-s
+  // forced keyframes we add below to cut 60-s segments cleanly).
+  const needsTranscode = RECORDING_TRANSCODE_SLUGS.has(slug)
+    || (codec !== undefined && codec !== 'h264');
   const videoArgs = needsTranscode
     ? [
-        // Non-h264 source: re-encode to h264 at NATIVE resolution.
-        // No -vf scale so we preserve source pixel count for the
-        // later download/clip re-encode to work from.
-        '-c:v', 'libx264', '-preset', REC_PRESET, '-tune', 'zerolatency',
+        // Re-encode at NATIVE resolution — no -vf scale here so
+        // the download/clip re-encode later has full source pixels
+        // to work from. Preset veryfast keeps the CPU trivial on
+        // the 8 known transcode channels; if we ever add more to
+        // the list, this scales gracefully.
+        '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency',
         '-profile:v', 'main', '-pix_fmt', 'yuv420p',
         '-threads', '2',
         '-b:v', '2000k', '-maxrate', '3000k', '-bufsize', '6000k',

@@ -286,16 +286,19 @@ export default function NewClipPage() {
   // Snapshot a mark point in BOTH forms at press-time:
   //   - `seconds`: raw `v.currentTime`, drives the visible
   //     progress-bar labels and length display
-  //   - `absMs`: hls.js's `playingDate` (from per-fragment PDT), the
-  //     true wall-clock ms of the frame under the playhead — this
-  //     is what the API uses so exports match the visual mark
-  //     exactly, no drift over long sessions
+  //   - `absMs`: deterministic — first-fragment PDT (frame-0 wall
+  //     clock) + video.currentTime. `hls.playingDate` was tried
+  //     first but returned wrong values on multi-fragment sessions
+  //     with per-boundary PDT (an 88-s clip export from a 38-s mark
+  //     on 2026-08-27), so we no longer trust it and instead
+  //     compute the offset ourselves against the known-good anchor.
   const captureMark = (v: HTMLVideoElement | null) => {
     if (!v) return { seconds: 0, absMs: null as number | null };
-    const hls = hlsRef.current;
-    const pd = hls?.playingDate;
-    const absMs = pd instanceof Date ? pd.getTime() : null;
-    return { seconds: Math.max(0, v.currentTime), absMs };
+    const seconds = Math.max(0, v.currentTime);
+    const absMs = playlistStartMs !== null
+      ? playlistStartMs + Math.round(seconds * 1000)
+      : null;
+    return { seconds, absMs };
   };
   const setIn  = (v: HTMLVideoElement | null) => { const m = captureMark(v); setMarkIn(m.seconds);  setMarkInMs(m.absMs); };
   const setOut = (v: HTMLVideoElement | null) => { const m = captureMark(v); setMarkOut(m.seconds); setMarkOutMs(m.absMs); };

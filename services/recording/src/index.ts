@@ -959,6 +959,14 @@ async function clipWorker(job: { clipId: string }) {
       '-filter_complex', mainFilter.join(';'),
       '-map', '[outv]',
       '-map', '0:a:0?', '-map', '1:a:0',
+      // Authoritative OUTPUT-side duration cap. -ss/-to at input level
+      // interact oddly with -filter_complex + -shortest: when the source
+      // audio track extends past the requested -to, ffmpeg was letting
+      // the output run to source-EOF (~60 s for a single-segment clip)
+      // even though the operator marked out at 38 s (reported for a
+      // 92-news clip on 2026-08-27). `-t duration` after the input
+      // guarantees the output stops at exactly the marked length.
+      '-t', String(duration),
       '-shortest',
       // Match the ingest bitrate exactly — clip = watermarked passthrough
       // in terms of bytes. Ingest is 700k VBR-capped; we output at the

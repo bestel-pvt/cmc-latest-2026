@@ -70,6 +70,13 @@ export default function NewClipPage() {
   // manifest's first PDT tag on MANIFEST_PARSED. Only used as an
   // anchor when hls.playingDate isn't available (Safari native HLS).
   const [playlistStartMs, setPlaylistStartMs] = useState<number | null>(null);
+  // Ref mirror so `captureMark` always reads the latest value —
+  // captureMark is called from a keydown handler installed inside a
+  // useEffect with `[totalSeconds]` deps, so a plain closure over
+  // playlistStartMs would freeze at whatever it was when the handler
+  // was installed. Ref sidesteps that.
+  const playlistStartMsRef = useRef<number | null>(null);
+  useEffect(() => { playlistStartMsRef.current = playlistStartMs; }, [playlistStartMs]);
   const [playing, setPlaying] = useState(false);
   const [muted, setMuted] = useState(true);
 
@@ -295,8 +302,9 @@ export default function NewClipPage() {
   const captureMark = (v: HTMLVideoElement | null) => {
     if (!v) return { seconds: 0, absMs: null as number | null };
     const seconds = Math.max(0, v.currentTime);
-    const absMs = playlistStartMs !== null
-      ? playlistStartMs + Math.round(seconds * 1000)
+    const anchor = playlistStartMsRef.current;
+    const absMs = anchor !== null
+      ? anchor + Math.round(seconds * 1000)
       : null;
     return { seconds, absMs };
   };

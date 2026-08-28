@@ -63,12 +63,13 @@ function RecordingsInner() {
   // both endpoints and Date parsing accept it consistently).
   const now = new Date();
   const todayLocal = fmtLocalDT(now);
-  // Default window: today from 00:00 — was 30 days, which pulled
-  // ~150 K RecordingSegment rows and made the page hang for 8 s
-  // before showing anything. Operators overwhelmingly look at
-  // today's recordings; older data is still one click on the date
-  // picker away.
-  const thirtyDaysAgo = (() => {
+  // Default window: today from 00:00 — keeps first-paint fast on a
+  // busy box (a 30-day default pulled ~150 K rows and hung the page).
+  // Operators explicitly picking a past date via the URL / date
+  // picker gets that date honoured — the previous "reset to today"
+  // clamp silently dropped user-selected past dates, so operators
+  // couldn't see recordings older than today.
+  const todayStartLocal = (() => {
     const d = new Date(now.getTime()); d.setHours(0, 0, 0, 0);
     return fmtLocalDT(d);
   })();
@@ -77,19 +78,13 @@ function RecordingsInner() {
   // means back-nav from an inline modal / detail page restores the
   // exact rows and controls the operator was looking at.
   const channelId = sp.get('channelId') ?? 'all';
-  // Ignore a saved URL `from` that predates today's 00:00 — the
-  // default changed 2026-08-20 from 30 days ago to today, and users
-  // reloading their old bookmarks otherwise get the 30-day-ago value
-  // silently reapplied (and pay the 8-second load penalty). Use the
-  // saved value only when it's inside today's window.
-  const rawFrom = sp.get('from');
-  const from = (rawFrom && rawFrom >= thirtyDaysAgo) ? rawFrom : thirtyDaysAgo;
+  const from = sp.get('from') ?? todayStartLocal;
   const to   = sp.get('to')   ?? todayLocal;
   const q    = sp.get('q')    ?? '';
 
   function setParam(key: string, value: string | null) {
     const next = new URLSearchParams(sp.toString());
-    if (value === null || value === '' || value === 'all' || (key === 'from' && value === thirtyDaysAgo) || (key === 'to' && value === todayLocal)) {
+    if (value === null || value === '' || value === 'all' || (key === 'from' && value === todayStartLocal) || (key === 'to' && value === todayLocal)) {
       next.delete(key);
     } else {
       next.set(key, value);

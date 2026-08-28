@@ -357,6 +357,22 @@ function ffArgs(url: string, kind: string, outDir: string, transcodeVideo: boole
     '-hls_flags', 'delete_segments+append_list+omit_endlist+independent_segments',
     '-hls_segment_type', 'mpegts',
     '-hls_allow_cache', '0',
+    // Root cause of "wall stuck till hard-refresh": the MAX_ENCODER_AGE
+    // recycle (~ every 60 min per channel) killed ffmpeg and restarted
+    // it. Old ffmpeg's last playlist advertised e.g. `#EXT-X-MEDIA-
+    // SEQUENCE:487`; new ffmpeg started fresh at 0. hls.js on the wall
+    // sees the sequence go BACKWARDS and silently drops the update
+    // (per HLS spec), so the tile freezes on its last buffered segment
+    // and never recovers until the operator refreshes.
+    //
+    // `-hls_start_number_source epoch` anchors the sequence to UNIX
+    // epoch seconds. A recycled ffmpeg's first segment gets a media-
+    // sequence higher than anything the old one produced, and its
+    // segment files land under a fresh name range (seg_1735234567.ts
+    // etc.) so they don't collide with the old seg_0..487 still on
+    // disk. hls.js sees a monotonically-increasing sequence, accepts
+    // the update, buffers new content, plays through seamlessly.
+    '-hls_start_number_source', 'epoch',
     '-hls_segment_filename', join(outDir, 'seg_%d.ts'),
     join(outDir, 'live.m3u8'),
   ];

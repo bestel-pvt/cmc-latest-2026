@@ -156,27 +156,36 @@ export function HlsTile({
       video.play().catch(() => {});
       setStatus('playing');
     });
-    // Track when we last saw video.currentTime advance. If it stays
-    // frozen for >20 s the tile is stuck (hls.js buffer went empty,
-    // an internal fatal fired that we can't recover from in-place,
-    // a segment 404 storm consumed every retry, etc.). Trigger a
-    // full remount by bumping remountNonce — same effect as the
-    // operator pressing R on that one tile, but automatic.
+    // Stall watchdog — poll video.currentTime every 3 s. If it stays
+    // frozen for >20 s and the tile is playing (not paused), rebuild.
     //
-    // Cheap: 3-s poll, sub-millisecond compare. Fires AT MOST once
-    // per stall event (not a retry loop) because the remount replaces
-    // this whole effect + timer with a fresh one.
+    // JITTER is critical here: when the server-side has a brief hiccup
+    // (live-hls stalls, m3u8 write blip), ALL tiles may enter the
+    // 20-s-frozen state at nearly the same instant. Without a random
+    // remount delay they'd all destroy+recreate hls.js in the SAME
+    // tick — 30 fresh connections to the API within one accept-queue
+    // window, ERR_CONNECTION_REFUSED cascade (memory: this exact
+    // failure hit us on 2026-08-25 and again 2026-09-01). Spreading
+    // the remount over 0-8 s keeps the request rate below ~4/s so the
+    // accept queue never overflows.
+    //
+    // Also: only ONE remount can be queued per hls instance. Bail if
+    // one is already pending.
     let lastSeenTime = -1;
     let lastAdvanceAt = Date.now();
+    let remountQueued = false;
+    const queueRemount = (): void => {
+      if (remountQueued) return;
+      remountQueued = true;
+      window.clearInterval(stallCheck);
+      window.setTimeout(() => setRemountNonce((n) => n + 1), Math.floor(Math.random() * 8000));
+    };
     const stallCheck = window.setInterval(() => {
       const t = video.currentTime;
       const now = Date.now();
       if (t !== lastSeenTime) { lastSeenTime = t; lastAdvanceAt = now; return; }
       if (video.paused) { lastAdvanceAt = now; return; } // paused = expected
-      if (now - lastAdvanceAt > 20_000) {
-        window.clearInterval(stallCheck);
-        setRemountNonce((n) => n + 1);
-      }
+      if (now - lastAdvanceAt > 20_000) queueRemount();
     }, 3_000);
 
     hls.on(Hls.Events.ERROR, (_evt, data) => {
@@ -189,9 +198,8 @@ export function HlsTile({
         hls.recoverMediaError();
         setStatus('loading');
       } else {
-        // Everything else fatal (buffer-stalled, other-error, key-system,
-        // etc.) — no in-place recover exists. Full remount.
-        setRemountNonce((n) => n + 1);
+        // Everything else fatal — jittered remount (same herd-safe path).
+        queueRemount();
       }
     });
 

@@ -119,44 +119,25 @@ async function main() {
   // Fallback (readFile fails): serve cache up to GAP_TTL_MS old.
   const M3U8_CACHE = new Map<string, { body: Buffer; ts: number }>();
   const GAP_TTL_MS = 60_000;
-  const REFRESH_MS = 500;
 
   const SLUG_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 
-  // Background refresh: once a slug has been requested, we keep its
-  // m3u8 fresh in memory every REFRESH_MS. The request handler serves
-  // PURELY from cache — zero disk I/O in the hot path.  Prior design
-  // did `await readFile` on every request; under sustained 30-tile
-  // wall load Windows disk-stall spikes pushed tail latencies to
-  // 4-5 s, which held browser sockets long enough to overflow the
-  // TCP accept queue and produce sporadic ERR_CONNECTION_REFUSED
-  // on the wall (reported 2026-08-25). Now: 30 tiles polling every
-  // ~3 s produce ~10 memory-cache hits/s (near-zero cost) while
-  // ONE background refresher does ~2 reads/s per slug — even a full
-  // pool of 4 libuv workers handles that trivially.
+  // On-demand read with short hot cache. Prior design ran a background
+  // setInterval every 500 ms re-reading EVERY known slug's m3u8 — 30
+  // slugs × 2 reads/s ≈ 60 disk ops/s on the SAME drive the live-hls
+  // ffmpegs are writing seg_*.ts to. Disk queue depth climbed to 24+,
+  // encoders fell behind real-time (17 of 30 channels producing 11-52 s
+  // segment gaps vs the 6 s target), the wall got stuck (2026-08-29).
   //
-  // In-flight guard: without this, a single disk stall would let the
-  // 500 ms setInterval fire a NEW iteration on top of the still-
-  // running previous one. Over minutes, dozens of concurrent readFile
-  // calls stacked, leaked libuv threads / handles, and eventually
-  // the API stopped accepting connections — every tile went to
-  // ERR_CONNECTION_REFUSED at once (screenshot 2026-08-26).
-  let refreshing = false;
-  setInterval(async () => {
-    if (refreshing) return;
-    refreshing = true;
-    try {
-      for (const slug of M3U8_CACHE.keys()) {
-        try {
-          const body = await readFile(pathJoin(HLS_DIR, slug, 'live.m3u8'));
-          M3U8_CACHE.set(slug, { body, ts: Date.now() });
-        } catch { /* keep last-known-good; the request-handler gap-fill
-                    window still applies below */ }
-      }
-    } finally {
-      refreshing = false;
-    }
-  }, REFRESH_MS).unref();
+  // Now: only read on request. If two polls for the same slug arrive
+  // within HOT_TTL_MS, the second is served from cache — coalesces
+  // hls.js's per-tile ~3 s poll rate down to at most one disk read per
+  // slug per second even when the wall has many mirrors. Gap-fill
+  // window preserved: if disk read fails (ffmpeg mid-rename), serve
+  // the last cached body up to GAP_TTL_MS old so hls.js doesn't latch
+  // the tile into permanent failure.
+  const HOT_TTL_MS = 1000;
+  const inFlight = new Map<string, Promise<Buffer | null>>();
 
   app.get<{ Params: { slug: string } }>('/hls/:slug/live.m3u8', async (req, reply) => {
     const { slug } = req.params;
@@ -166,23 +147,30 @@ async function main() {
       .header('Cache-Control', 'no-cache, no-store, must-revalidate')
       .header('Content-Type', 'application/vnd.apple.mpegurl');
 
+    const now = Date.now();
     const cached = M3U8_CACHE.get(slug);
-    if (cached) {
-      // Fresh from background refresh (< REFRESH_MS old), OR stale but
-      // still inside gap-fill window (ffmpeg age-recycle can leave the
-      // file missing for ~5-10 s; we serve the last-known-good so
-      // hls.js doesn't latch the tile into permanent failure).
-      if (Date.now() - cached.ts < GAP_TTL_MS) return reply.send(cached.body);
+    if (cached && now - cached.ts < HOT_TTL_MS) {
+      return reply.send(cached.body);
     }
-    // First request for this slug — sync fill so we don't return 404
-    // just because the background refresher hasn't touched it yet.
-    try {
-      const body = await readFile(pathJoin(HLS_DIR, slug, 'live.m3u8'));
-      M3U8_CACHE.set(slug, { body, ts: Date.now() });
-      return reply.send(body);
-    } catch {
-      return reply.code(404).send();
+
+    // Coalesce concurrent disk reads for the same slug so 10 wall
+    // tiles mirroring one channel don't all fire a separate readFile.
+    let read = inFlight.get(slug);
+    if (!read) {
+      read = readFile(pathJoin(HLS_DIR, slug, 'live.m3u8'))
+        .then((body): Buffer | null => {
+          M3U8_CACHE.set(slug, { body, ts: Date.now() });
+          return body;
+        })
+        .catch((): Buffer | null => null)
+        .finally(() => { inFlight.delete(slug); });
+      inFlight.set(slug, read);
     }
+    const body = await read;
+    if (body) return reply.send(body);
+    // Read failed — serve last-known-good if still inside the gap-fill.
+    if (cached && Date.now() - cached.ts < GAP_TTL_MS) return reply.send(cached.body);
+    return reply.code(404).send();
   });
 
   await app.register(fastifyStatic, {

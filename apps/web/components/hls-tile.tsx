@@ -65,6 +65,14 @@ export function HlsTile({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hlsRef = useRef<Hls | null>(null);
   const [status, setStatus] = useState<'idle' | 'loading' | 'playing' | 'error'>('idle');
+  // Bumped by the stall watchdog and by "give up" fatal errors to
+  // force the effect to fully re-mount hls.js — same effect as the
+  // operator pressing R on that one tile, but automatic and only
+  // fires when the tile is genuinely stuck.
+  const [remountNonce, setRemountNonce] = useState(0);
+  // Reset the nonce whenever the assigned slug changes so a fresh
+  // channel starts from a clean recovery count.
+  useEffect(() => { setRemountNonce(0); }, [slug]);
 
   /** Single vs. double click disambiguation. A DOM `click` fires as
    * part of a `dblclick` too, so we delay the single-click action by
@@ -148,25 +156,51 @@ export function HlsTile({
       video.play().catch(() => {});
       setStatus('playing');
     });
+    // Track when we last saw video.currentTime advance. If it stays
+    // frozen for >20 s the tile is stuck (hls.js buffer went empty,
+    // an internal fatal fired that we can't recover from in-place,
+    // a segment 404 storm consumed every retry, etc.). Trigger a
+    // full remount by bumping remountNonce — same effect as the
+    // operator pressing R on that one tile, but automatic.
+    //
+    // Cheap: 3-s poll, sub-millisecond compare. Fires AT MOST once
+    // per stall event (not a retry loop) because the remount replaces
+    // this whole effect + timer with a fresh one.
+    let lastSeenTime = -1;
+    let lastAdvanceAt = Date.now();
+    const stallCheck = window.setInterval(() => {
+      const t = video.currentTime;
+      const now = Date.now();
+      if (t !== lastSeenTime) { lastSeenTime = t; lastAdvanceAt = now; return; }
+      if (video.paused) { lastAdvanceAt = now; return; } // paused = expected
+      if (now - lastAdvanceAt > 20_000) {
+        window.clearInterval(stallCheck);
+        setRemountNonce((n) => n + 1);
+      }
+    }, 3_000);
+
     hls.on(Hls.Events.ERROR, (_evt, data) => {
-      if (data.fatal) {
-        setStatus('error');
-        // Try to recover network + media errors; give up on other-fatal.
-        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-          hls.startLoad();
-          setStatus('loading');
-        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-          hls.recoverMediaError();
-          setStatus('loading');
-        }
+      if (!data.fatal) return;
+      setStatus('error');
+      if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+        hls.startLoad();
+        setStatus('loading');
+      } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+        hls.recoverMediaError();
+        setStatus('loading');
+      } else {
+        // Everything else fatal (buffer-stalled, other-error, key-system,
+        // etc.) — no in-place recover exists. Full remount.
+        setRemountNonce((n) => n + 1);
       }
     });
 
     return () => {
+      window.clearInterval(stallCheck);
       hls.destroy();
       hlsRef.current = null;
     };
-  }, [slug]);
+  }, [slug, remountNonce]);
 
   // Sync audio state with the media element. `audioActive` from the
   // parent is the single source of truth — muted whenever another

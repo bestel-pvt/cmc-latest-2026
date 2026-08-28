@@ -502,16 +502,14 @@ function launch(sup: Sup): void {
 // each proc caps at ~500 MB → 15 GB total (fits well inside 128 GB
 // server with plenty of headroom for recording + node + OS cache).
 // Recycle is one-at-a-time so at worst one tile blinks every ~60 s.
-// 2026-08-28: raised from 30 min to 90 min. Every recycle blanks the
-// m3u8 and starts new ffmpeg from segment 0, so hls.js sees a fresh
-// playlist and snaps to the new live edge — the operator saw this as
-// "purani stream chall rhi hoti, phir khud auto-update ho ke aage ho
-// jati" on capital/dawn/24/bbc. 3x less recycling = 3x less snap.
-// A cleaner segment-continuation fix was tried (preserve m3u8 +
-// hls_start_number) but consistently crashed ffmpeg on Windows
-// (exit 2880417800, file-sharing violation with the API's m3u8
-// reader). Bumping recycle interval is the safe path.
-const MAX_ENCODER_AGE_MS = Number(process.env.LIVE_HLS_MAX_AGE_MINUTES ?? 90) * 60 * 1000;
+// 60 min compromise: 30 min was snappy (recycle-jump every minute
+// across 30 channels), 90 min let ffmpeg buffers accumulate long
+// enough that encoders visibly fell behind real-time (2026-08-28,
+// after ~75 min the encoder started producing 20-40 s segment gaps
+// instead of the 6 s target, causing distortion and stalls on the
+// wall). 60 min drains buffers before they degrade playback while
+// still halving the snap frequency vs the old 30-min setting.
+const MAX_ENCODER_AGE_MS = Number(process.env.LIVE_HLS_MAX_AGE_MINUTES ?? 60) * 60 * 1000;
 function recycleAgedFFmpegs(): void {
   const now = Date.now();
   const aged = Array.from(supervisors.values())

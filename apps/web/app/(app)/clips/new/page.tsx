@@ -77,6 +77,15 @@ export default function NewClipPage() {
   // was installed. Ref sidesteps that.
   const playlistStartMsRef = useRef<number | null>(null);
   useEffect(() => { playlistStartMsRef.current = playlistStartMs; }, [playlistStartMs]);
+  // Current playing fragment's PDT + start (video.currentTime at fragment
+  // start). Copy-mode recording segments have variable actual durations
+  // (60-70 s per keyframe cadence) but the playlist declares uniform
+  // 60-s EXTINFs — so `firstFragmentPDT + v.currentTime` drifts by
+  // seconds after 3-4 fragments. Per-fragment PDT lets us anchor to the
+  // TRUE wall time at any playback point. Reported 2026-09-02 on abb-tak
+  // (interlaced PAL, copy-mode) where a 3-min-in mark landed correctly
+  // in the first-fragment case but drifted for later marks.
+  const currentFragRef = useRef<{ pdt: number; start: number } | null>(null);
   const [playing, setPlaying] = useState(false);
   const [muted, setMuted] = useState(true);
 
@@ -202,6 +211,23 @@ export default function NewClipPage() {
           const frag = hls?.levels?.[0]?.details?.fragments?.[0];
           const pdt = frag?.programDateTime;
           if (typeof pdt === 'number' && !Number.isNaN(pdt)) setPlaylistStartMs(pdt);
+          // Seed the current-fragment ref too so a mark before FRAG_CHANGED
+          // fires still gets accurate PDT (fragment 0 is trivially current).
+          if (frag && typeof frag.programDateTime === 'number' && typeof frag.start === 'number') {
+            currentFragRef.current = { pdt: frag.programDateTime, start: frag.start };
+          }
+        });
+        // Track the currently-playing fragment. Each fragment carries its
+        // own PDT from the session playlist (re-anchored at every
+        // discontinuity). Using the CURRENT fragment's PDT + offset
+        // within that fragment gives frame-accurate wall time even when
+        // the playlist's declared EXTINF durations differ from the
+        // physical MP4 segment durations (copy-mode drift).
+        hls.on(Hls.Events.FRAG_CHANGED, (_e, data) => {
+          const f = data?.frag;
+          if (f && typeof f.programDateTime === 'number' && typeof f.start === 'number') {
+            currentFragRef.current = { pdt: f.programDateTime, start: f.start };
+          }
         });
         hls.loadSource(src);
         hls.attachMedia(video);
@@ -302,10 +328,17 @@ export default function NewClipPage() {
   const captureMark = (v: HTMLVideoElement | null) => {
     if (!v) return { seconds: 0, absMs: null as number | null };
     const seconds = Math.max(0, v.currentTime);
-    const anchor = playlistStartMsRef.current;
-    const absMs = anchor !== null
-      ? anchor + Math.round(seconds * 1000)
-      : null;
+    // Prefer per-fragment PDT: currentFragPDT + (v.currentTime - fragStart).
+    // Falls back to first-PDT anchor + full currentTime when no fragment
+    // info is available (Safari native HLS, pre-FRAG_CHANGED).
+    const cur = currentFragRef.current;
+    let absMs: number | null = null;
+    if (cur) {
+      absMs = cur.pdt + Math.round((seconds - cur.start) * 1000);
+    } else {
+      const anchor = playlistStartMsRef.current;
+      absMs = anchor !== null ? anchor + Math.round(seconds * 1000) : null;
+    }
     return { seconds, absMs };
   };
   const setIn  = (v: HTMLVideoElement | null) => { const m = captureMark(v); setMarkIn(m.seconds);  setMarkInMs(m.absMs); };

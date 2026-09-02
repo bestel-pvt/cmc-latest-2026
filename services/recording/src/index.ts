@@ -413,6 +413,34 @@ function stopFFmpegGracefully(sup: Supervisor): void {
 // and still detects any corruption in the video header, keyframes
 // near the boundaries, or a truncated tail. Cryptographic tamper
 // resistance was never the actual requirement here.
+/**
+ * Probe the first video frame's PTS offset inside a segment container.
+ * MP4 segments cut by ffmpeg's segmenter with `-reset_timestamps 1`
+ * align container time 0 with the earliest stream; when audio arrived
+ * before video from the source, the first VIDEO frame ends up at PTS
+ * ~0.1-0.3s inside the file even though the container starts at 0. Clip
+ * render's ss (derived from filename → wall time) needs to add this
+ * offset back in, otherwise the seek lands ~one-A/V-skew earlier than
+ * the operator's mark-in. Uses ffmpeg's stderr banner rather than
+ * ffprobe (which isn't bundled with this ffmpeg build on Windows).
+ * Returns 0 on any failure — the correction is a fine-tune, not
+ * load-bearing.
+ */
+async function probeVideoStart(path: string): Promise<number> {
+  return new Promise((resolve) => {
+    const p = spawn('ffmpeg', ['-hide_banner', '-i', path], { stdio: ['ignore', 'ignore', 'pipe'] });
+    let stderr = '';
+    p.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+    p.on('close', () => {
+      const line = stderr.split('\n').find((l) => /Stream .*: Video:/.test(l)) ?? '';
+      const m = line.match(/start\s+([\d.]+)/);
+      const v = m ? parseFloat(m[1] ?? '0') : 0;
+      resolve(Number.isFinite(v) && v >= 0 && v < 5 ? v : 0);
+    });
+    p.on('error', () => resolve(0));
+  });
+}
+
 async function sha256(path: string): Promise<string> {
   const { open } = await import('node:fs/promises');
   const h = createHash('sha256');
@@ -877,33 +905,35 @@ async function clipWorker(job: { clipId: string }) {
     '-analyzeduration', '20000000',
     '-probesize', '20000000',
   ];
+  // Compensate for per-segment video-stream-start offset. The recording
+  // segmenter uses `-reset_timestamps 1`, but container time 0 aligns
+  // with the earliest stream (audio, if audio arrived first) — video
+  // first frame may sit at PTS 0.1-0.3s into the container. Filename
+  // reflects container t=0 (wall time of segment cut), so mapping
+  // wall→seek needs to add the video offset back in, otherwise the
+  // clip's content ends up N-tenths-of-a-second earlier than mark-in.
+  // Only matters for copy-mode recordings with A/V PTS skew (abb-tak
+  // reported 2026-09-02); transcoded copies have video start ≈ 0.
+  const firstVideoOffset = await probeVideoStart(first.path);
+  const ssAdj = ss + firstVideoOffset;
+  const toAdj = to + firstVideoOffset;
+  log.info({ clipId: clip.id, firstVideoOffset, ss, ssAdj }, 'clip: video-start offset applied');
+
   let ffInputArgs: string[];
   const concatListPath = join(tmpdir(), `clip-concat-${clip.id}.txt`);
-  // Accurate frame-level seek: place -ss AFTER -i (input option applied
-  // after -i means "decode from nearest keyframe before ss, discard
-  // frames until ss"). Frame-accurate — no forward keyframe snap that
-  // shifts both mark-in AND mark-out past their intended timestamps.
-  // Prior form used -ss/-to BEFORE -i (fast keyframe seek): with
-  // slow-GOP copy-mode recordings a seek at 09.6s would land on the
-  // keyframe at 10.0s, then -t duration extended from there → content
-  // ran from mark_in+0.4 to mark_out+0.4. Reported 2026-09-02 on abb-tak
-  // clip. Small performance cost (must decode leading GOP) is fine for
-  // manual clip render.
-  const durArg = String(Math.max(0.5, to - ss));
   if (covering.length === 1) {
-    ffInputArgs = [...TOLERANCE_IN, '-i', first.path, '-ss', String(ss), '-t', durArg];
+    ffInputArgs = [...TOLERANCE_IN, '-ss', String(ssAdj), '-to', String(Math.max(ssAdj + 1, toAdj)), '-i', first.path];
   } else {
     const lines = covering.map((c) => `file '${c.path.replace(/\\/g, '/').replace(/'/g, "'\\''")}'`).join('\n');
     writeFileSync(concatListPath, lines);
     ffInputArgs = [
       ...TOLERANCE_IN,
       '-f', 'concat', '-safe', '0',
+      '-ss', String(ssAdj), '-to', String(Math.max(ssAdj + 1, toAdj)),
       '-i', concatListPath,
-      '-ss', String(ss),
-      '-t', durArg,
     ];
   }
-  log.info({ clipId: clip.id, files: covering.length, span_s: totalSpan, ss, to, duration }, 'clip: covering files located');
+  log.info({ clipId: clip.id, files: covering.length, span_s: totalSpan, ss, to }, 'clip: covering files located');
 
   // Watermark text — email + timestamp — flattened + ASCII-safe.
   const wmRaw = (clip.watermarkText ?? '').replace(/'/g, '');

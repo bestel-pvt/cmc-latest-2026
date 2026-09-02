@@ -407,6 +407,25 @@ export default function NewClipPage() {
   const outPct = markOut !== null && totalSeconds ? (markOut / totalSeconds) * 100 : null;
   const curPct = totalSeconds ? (current / totalSeconds) * 100 : 0;
 
+  // Wall-time-based display values. The video's currentTime advances by
+  // playlist-declared EXTINF durations, which under-report actual segment
+  // lengths for copy-mode/interlaced recordings (declared 60 s vs actual
+  // 60-70 s). markInMs/markOutMs are the TRUE wall time captured via
+  // per-fragment PDT; expressing them as offsets from the session anchor
+  // gives what the operator should see on the scrubber so the on-screen
+  // length matches the rendered clip's real duration. Falls back to
+  // v.currentTime seconds when wall data isn't available (Safari native
+  // HLS, or before the first fragment loads).
+  const inWallSec = (markInMs !== null && anchorMs !== null)
+    ? (markInMs - anchorMs) / 1000
+    : markIn;
+  const outWallSec = (markOutMs !== null && anchorMs !== null)
+    ? (markOutMs - anchorMs) / 1000
+    : markOut;
+  const lengthWallSec = (markInMs !== null && markOutMs !== null)
+    ? (markOutMs - markInMs) / 1000
+    : (markIn !== null && markOut !== null && markOut > markIn ? markOut - markIn : null);
+
   // Landing view when the URL has neither ?segmentId= nor ?sessionStart=
   if (!segmentId && !(sessionStart && sessionEnd)) {
     return <RecordingPicker />;
@@ -501,10 +520,10 @@ export default function NewClipPage() {
           <div className="pt-2 border-t border-border">
             <div className="text-[10px] uppercase tracking-widest text-muted-2 mb-1">Clip window</div>
             <div className="font-mono text-[11px]">
-              <div>in  <span className="text-accent-green">{markIn === null ? '—' : fmtTimeCode(markIn)}</span></div>
-              <div>out <span className="text-accent-red">{markOut === null ? '—' : fmtTimeCode(markOut)}</span></div>
+              <div>in  <span className="text-accent-green">{inWallSec === null ? '—' : fmtTimeCode(inWallSec)}</span></div>
+              <div>out <span className="text-accent-red">{outWallSec === null ? '—' : fmtTimeCode(outWallSec)}</span></div>
               <div className="text-muted-2 mt-0.5">
-                length {markIn !== null && markOut !== null && markOut > markIn ? fmtTimeCode(markOut - markIn) : '—'}
+                length {lengthWallSec !== null && lengthWallSec > 0 ? fmtTimeCode(lengthWallSec) : '—'}
               </div>
             </div>
           </div>

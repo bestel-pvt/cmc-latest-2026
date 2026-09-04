@@ -237,26 +237,21 @@ const routes: FastifyPluginAsync = async (app) => {
     });
   }
 
-  /** Read a finished MP4's Duration from the ffmpeg -i banner. Returns
-   *  ms rounded to 10, or null if the file is unreadable / doesn't have
-   *  a Duration line (still writing). Used to lazily correct the
-   *  hardcoded 60 000 ms rows the recording ingest stamped before the
-   *  probe-at-ingest fix landed. */
-  async function probeMp4DurationMs(path: string): Promise<number | null> {
-    return new Promise((resolve) => {
-      const p = spawn('ffmpeg', ['-hide_banner', '-nostdin', '-i', path], { stdio: ['ignore', 'ignore', 'pipe'] });
-      let stderr = '';
-      p.stderr.on('data', (b) => { stderr += b.toString(); });
-      const kill = setTimeout(() => { try { p.kill('SIGKILL'); } catch { /* */ } }, 4000);
-      p.on('close', () => {
-        clearTimeout(kill);
-        const m = stderr.match(/Duration:\s+(\d{2}):(\d{2}):(\d{2})\.(\d{2})/);
-        if (!m) return resolve(null);
-        const ms = (+m[1]! * 3600 + +m[2]! * 60 + +m[3]!) * 1000 + +m[4]! * 10;
-        resolve(ms > 500 && ms < 900_000 ? ms : null);
-      });
-      p.on('error', () => { clearTimeout(kill); resolve(null); });
-    });
+  /** Estimate a segment's playable duration from its file mtime relative
+   *  to `startedAt`. Anchored to a value the OS actually records — the
+   *  ffmpeg -i banner Duration is unreliable on our fragmented-mp4
+   *  segments (empty_moov leaves mvhd carrying multi-minute nonsense;
+   *  a real 11-sec segment probed as 4:14 on 2026-09-04 and poisoned
+   *  the session playlist with 42 phantom sub-segments).
+   *  Range-guarded 1 s – 15 min. Returns null when out of range or
+   *  the file is gone. */
+  function estimateSegmentDurationMs(path: string, startedAtMs: number): number | null {
+    try {
+      const mtime = statSync(path).mtimeMs;
+      const ms = Math.round(mtime - startedAtMs);
+      if (ms >= 1000 && ms <= 900_000) return ms;
+      return null;
+    } catch { return null; }
   }
 
   async function buildSessionMp4(channelId: string, from: Date, to: Date): Promise<string | null> {
@@ -406,19 +401,20 @@ const routes: FastifyPluginAsync = async (app) => {
       if (statSync(s.path).size < 4096) continue;
       if (!(await isPlayable(s.path))) continue;
       // Session HLS depends on ACCURATE durationMs — hls.js interpolates
-      // fragment PDT from declared EXTINFs, so a stale 60 000 ms default
-      // on a real-22-s file makes 6/10 sub-segment slots 404 and drifts
-      // the client's wall-time reading (reported 2026-09-04 on 92-news).
-      // If the row still shows the untouched SEG_SECONDS default and the
-      // file has a readable Duration banner, re-probe once and update
-      // the row so future playlists + clip renders agree with reality.
-      if (s.durationMs === 60000) {
-        const probed = await probeMp4DurationMs(s.path);
-        if (probed && Math.abs(probed - 60000) > 300) {
+      // fragment PDT from declared EXTINFs, so a stale value makes
+      // sub-segment slots 404 and drifts the client's wall-time reading
+      // (reported 2026-09-04 on 92-news). We re-estimate from mtime -
+      // startedAt on any row that still carries the pre-fix defaults
+      // (hardcoded 60 000 or the earlier probe run that returned bogus
+      // 250 000+ ms values from fMP4 empty_moov). New ingests write the
+      // correct value up-front so this loop is a no-op there.
+      if (s.durationMs === 60000 || s.durationMs > 120000) {
+        const measured = estimateSegmentDurationMs(s.path, s.startedAt.getTime());
+        if (measured && Math.abs(measured - s.durationMs) > 300) {
           try {
-            await app.prisma.recordingSegment.update({ where: { id: s.id }, data: { durationMs: probed } });
-            s.durationMs = probed;
-          } catch { /* other writer got there first; leave */ }
+            await app.prisma.recordingSegment.update({ where: { id: s.id }, data: { durationMs: measured } });
+            s.durationMs = measured;
+          } catch { /* concurrent writer beat us; leave */ }
         }
       }
       playable.push(s);

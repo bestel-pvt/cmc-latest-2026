@@ -189,31 +189,29 @@ const REC_H = Number(process.env.RECORDING_H ?? 480);
 const REC_PRESET = process.env.RECORDING_PRESET ?? 'veryfast';
 
 /**
- * Read the actual duration of a finished MP4 segment file (ms).
- * Uses ffmpeg's -i banner (ffprobe isn't in the bundled Windows build).
- * Returns null on unreadable / malformed / probe-timeout so the caller
- * can fall back to the SEG_SECONDS default without corrupting the row.
+ * Estimate a segment's playable duration from disk (ms). Uses
+ * (mtime − startedAt) which for finished fragmented-mp4 segments is
+ * the wall-clock span the recording ffmpeg spent writing to that file.
  *
- * The segment file must have finished writing (moov atom present).
- * The recording ingest only scans files with a `.recorded` marker on
- * disk, so this is safe to call there.
+ * DO NOT use `ffmpeg -i` banner Duration for this: the recording
+ * ffmpeg writes with `movflags=+empty_moov+frag_keyframe+default_base_moof`,
+ * so the moov atom's mvhd carries a fake timescale-scaled duration
+ * that reads as multi-minute nonsense (2026-09-04: 11-sec real
+ * segments came back as 4:14). The mtime approach is anchored to a
+ * quantity the OS actually recorded truthfully.
+ *
+ * Range-guarded 1 s – 15 min so a stat oddity can't poison the row.
+ * Returns null when the file is gone or the delta is out of range.
  */
-async function probeFileDurationMs(path: string): Promise<number | null> {
-  return new Promise((resolve) => {
-    const p = spawn('ffmpeg', ['-hide_banner', '-nostdin', '-i', path], { stdio: ['ignore', 'ignore', 'pipe'] });
-    let stderr = '';
-    p.stderr.on('data', (b: Buffer) => { stderr += b.toString(); });
-    const kill = setTimeout(() => { try { p.kill('SIGKILL'); } catch { /* */ } }, 4000);
-    p.on('close', () => {
-      clearTimeout(kill);
-      // Banner line: `Duration: 00:00:22.10, start: 0.000000, bitrate: 3900 kb/s`
-      const m = stderr.match(/Duration:\s+(\d{2}):(\d{2}):(\d{2})\.(\d{2})/);
-      if (!m) return resolve(null);
-      const ms = (+m[1]! * 3600 + +m[2]! * 60 + +m[3]!) * 1000 + +m[4]! * 10;
-      resolve(ms > 500 && ms < 900_000 ? ms : null);
-    });
-    p.on('error', () => { clearTimeout(kill); resolve(null); });
-  });
+function estimateSegmentDurationMs(path: string, startedAt: Date): number | null {
+  try {
+    const mtime = statSync(path).mtimeMs;
+    const ms = Math.round(mtime - startedAt.getTime());
+    if (ms >= 1000 && ms <= 900_000) return ms;
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 /** Probe primary video codec of a UDP MPEG-TS source (~3 s, once at
@@ -516,11 +514,11 @@ async function ingestClosedSegments(sup: Supervisor) {
       // the session HLS playlist: `session.m3u8` declared 10 sub-segments
       // × 6 s for a real-22-s file, so hls.js interpolated PDT into
       // fragments that returned 404 and the on-screen v.currentTime
-      // scale diverged from wall time. Probing gives us the true
-      // duration; falls back to the SEG_SECONDS default only when
-      // ffmpeg can't read the header (should be rare on a healthy file).
-      const probedDurMs = await probeFileDurationMs(full);
-      const durationMs = probedDurMs ?? (SEG_SECONDS * 1000);
+      // scale diverged from wall time. Use file mtime − startedAt to
+      // get the true recording span (the -i banner is not reliable on
+      // our fragmented-mp4 segments — see estimateSegmentDurationMs).
+      const measuredDurMs = estimateSegmentDurationMs(full, startedAt);
+      const durationMs = measuredDurMs ?? (SEG_SECONDS * 1000);
 
       const seg = await prisma.recordingSegment.create({
         data: {

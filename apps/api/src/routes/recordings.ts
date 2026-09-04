@@ -509,7 +509,7 @@ const routes: FastifyPluginAsync = async (app) => {
     // single pre-warm covers the whole first minute of playback with
     // ~200 ms of server work. Fire-and-forget.
     if (playable.length > 0) {
-      segmentToHlsSlices(playable[0]).catch(() => {});
+      segmentToHlsSlices({ id: playable[0]!.id, path: playable[0]!.path, durationMs: playable[0]!.durationMs }).catch(() => {});
     }
 
     reply
@@ -528,12 +528,25 @@ const routes: FastifyPluginAsync = async (app) => {
   mkdirSync(HLS_CACHE, { recursive: true });
   const hlsLocks = new Map<string, Promise<void>>();
 
-  async function segmentToHlsSlices(seg: { id: string; path: string }): Promise<void> {
+  async function segmentToHlsSlices(seg: { id: string; path: string; durationMs?: number }): Promise<void> {
     mkdirSync(HLS_CACHE, { recursive: true });
     const outDir = join(HLS_CACHE, seg.id);
     const readyMarker = join(outDir, '.ready');
     if (existsSync(readyMarker)) return;
     if (hlsLocks.has(seg.id)) return hlsLocks.get(seg.id)!;
+
+    // Cap the slicer at the segment's known real duration. Without this
+    // the recording ffmpeg's fragmented-mp4 headers (empty_moov +
+    // fake-timescale mvhd, e.g. 4:14 for a 1.66-s file) cause the
+    // re-encode pass to pad frames out to the bogus header duration and
+    // spit out dozens of phantom slices of black. Reported 2026-09-04
+    // on hum-news — cache dir grew to 22 slices for a 1.66-s segment
+    // and the playlist referenced all of them, wrecking wall-time
+    // alignment and blowing up as bufferAppendError when hls.js hit a
+    // slice with no matching PDT context.
+    const capSec = seg.durationMs && seg.durationMs > 500 && seg.durationMs < 900_000
+      ? (seg.durationMs / 1000).toFixed(3)
+      : null;
 
     const p = (async () => {
       mkdirSync(outDir, { recursive: true });
@@ -548,11 +561,15 @@ const routes: FastifyPluginAsync = async (app) => {
         // handles them uniformly regardless of source (transcoded
         // fMP4 or -c copy source-quality mp4). AAC 64k audio matches
         // what the download endpoint uses.
-        const ff = spawn('ffmpeg', [
+        const ffArgs: string[] = [
           '-hide_banner', '-loglevel', 'error', '-y',
           '-err_detect', 'ignore_err',
           '-fflags', '+genpts+discardcorrupt',
           '-i', seg.path,
+        ];
+        if (capSec) { ffArgs.push('-t', capSec); }
+        const ff = spawn('ffmpeg', [
+          ...ffArgs,
           // fps=25 coerces high-framerate sources to a browser-safe rate.
           // Al Jazeera Arabic ships 1080p @ 50 fps with mp3 audio; hls.js
           // throws fragParsingError after ~2 s of black on the resulting
@@ -622,7 +639,7 @@ const routes: FastifyPluginAsync = async (app) => {
     if (!existsSync(seg.path)) return reply.notFound('source missing');
 
     try {
-      await segmentToHlsSlices({ id: seg.id, path: seg.path });
+      await segmentToHlsSlices({ id: seg.id, path: seg.path, durationMs: seg.durationMs });
     } catch (e) {
       // Broken source MP4 (recorder killed mid-write, 'Invalid data
       // found on input') — don't 500 in a loop. Return an empty valid
@@ -668,7 +685,7 @@ const routes: FastifyPluginAsync = async (app) => {
         orderBy: { startedAt: 'asc' },
       });
       if (nextSeg && existsSync(nextSeg.path)) {
-        segmentToHlsSlices({ id: nextSeg.id, path: nextSeg.path }).catch(() => {});
+        segmentToHlsSlices({ id: nextSeg.id, path: nextSeg.path, durationMs: nextSeg.durationMs }).catch(() => {});
       }
     }
 

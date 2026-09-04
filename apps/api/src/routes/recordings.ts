@@ -400,6 +400,22 @@ const routes: FastifyPluginAsync = async (app) => {
       if (!existsSync(s.path)) continue;
       if (statSync(s.path).size < 4096) continue;
       if (!(await isPlayable(s.path))) continue;
+      // Skip crash-tail micro-segments (< 20 s). These come from ffmpeg
+      // getting killed mid-write: it flushes whatever's buffered into
+      // the current .mp4, then a fresh segment starts. The truncated
+      // file has a syntactically-valid mvhd but multi-minute nonsense
+      // Duration and packet PTS spread across that lie — the slicer's
+      // re-encode of it produces a TS with almost no decodable frames
+      // ('no TS found at start of file'), which hls.js rejects as
+      // bufferAppendError on the very first append and stalls the
+      // whole session. Losing < 20 s out of a 10-min session is
+      // invisible (there's a #EXT-X-DISCONTINUITY at every segment
+      // boundary anyway); serving a broken slice bricks the player.
+      // Reported 2026-09-05 on HUM News 23:11 UTC: 4 crash-tail
+      // segments of 11.4 s / 1.7 s / 1.9 s / 13.3 s preceded 60-s
+      // good ones — the 11.4 s file's mvhd claimed 4:14 with only 206
+      // frames, and its 0.ts probed as 70 ms unplayable.
+      if (s.durationMs < 20000) continue;
       // Session HLS depends on ACCURATE durationMs — hls.js interpolates
       // fragment PDT from declared EXTINFs, so a stale value makes
       // sub-segment slots 404 and drifts the client's wall-time reading

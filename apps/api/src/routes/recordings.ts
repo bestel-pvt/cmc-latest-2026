@@ -237,6 +237,28 @@ const routes: FastifyPluginAsync = async (app) => {
     });
   }
 
+  /** Read a finished MP4's Duration from the ffmpeg -i banner. Returns
+   *  ms rounded to 10, or null if the file is unreadable / doesn't have
+   *  a Duration line (still writing). Used to lazily correct the
+   *  hardcoded 60 000 ms rows the recording ingest stamped before the
+   *  probe-at-ingest fix landed. */
+  async function probeMp4DurationMs(path: string): Promise<number | null> {
+    return new Promise((resolve) => {
+      const p = spawn('ffmpeg', ['-hide_banner', '-nostdin', '-i', path], { stdio: ['ignore', 'ignore', 'pipe'] });
+      let stderr = '';
+      p.stderr.on('data', (b) => { stderr += b.toString(); });
+      const kill = setTimeout(() => { try { p.kill('SIGKILL'); } catch { /* */ } }, 4000);
+      p.on('close', () => {
+        clearTimeout(kill);
+        const m = stderr.match(/Duration:\s+(\d{2}):(\d{2}):(\d{2})\.(\d{2})/);
+        if (!m) return resolve(null);
+        const ms = (+m[1]! * 3600 + +m[2]! * 60 + +m[3]!) * 1000 + +m[4]! * 10;
+        resolve(ms > 500 && ms < 900_000 ? ms : null);
+      });
+      p.on('error', () => { clearTimeout(kill); resolve(null); });
+    });
+  }
+
   async function buildSessionMp4(channelId: string, from: Date, to: Date): Promise<string | null> {
     // Ensure cache dir exists on every call — a manual /tmp cleanup
     // (or a systemd tmpfiles reboot) can wipe it out from under us.
@@ -383,6 +405,22 @@ const routes: FastifyPluginAsync = async (app) => {
       if (!existsSync(s.path)) continue;
       if (statSync(s.path).size < 4096) continue;
       if (!(await isPlayable(s.path))) continue;
+      // Session HLS depends on ACCURATE durationMs — hls.js interpolates
+      // fragment PDT from declared EXTINFs, so a stale 60 000 ms default
+      // on a real-22-s file makes 6/10 sub-segment slots 404 and drifts
+      // the client's wall-time reading (reported 2026-09-04 on 92-news).
+      // If the row still shows the untouched SEG_SECONDS default and the
+      // file has a readable Duration banner, re-probe once and update
+      // the row so future playlists + clip renders agree with reality.
+      if (s.durationMs === 60000) {
+        const probed = await probeMp4DurationMs(s.path);
+        if (probed && Math.abs(probed - 60000) > 300) {
+          try {
+            await app.prisma.recordingSegment.update({ where: { id: s.id }, data: { durationMs: probed } });
+            s.durationMs = probed;
+          } catch { /* other writer got there first; leave */ }
+        }
+      }
       playable.push(s);
     }
     if (playable.length === 0) return reply.notFound('no playable segments in range');

@@ -188,6 +188,34 @@ const REC_W = Number(process.env.RECORDING_W ?? 854);
 const REC_H = Number(process.env.RECORDING_H ?? 480);
 const REC_PRESET = process.env.RECORDING_PRESET ?? 'veryfast';
 
+/**
+ * Read the actual duration of a finished MP4 segment file (ms).
+ * Uses ffmpeg's -i banner (ffprobe isn't in the bundled Windows build).
+ * Returns null on unreadable / malformed / probe-timeout so the caller
+ * can fall back to the SEG_SECONDS default without corrupting the row.
+ *
+ * The segment file must have finished writing (moov atom present).
+ * The recording ingest only scans files with a `.recorded` marker on
+ * disk, so this is safe to call there.
+ */
+async function probeFileDurationMs(path: string): Promise<number | null> {
+  return new Promise((resolve) => {
+    const p = spawn('ffmpeg', ['-hide_banner', '-nostdin', '-i', path], { stdio: ['ignore', 'ignore', 'pipe'] });
+    let stderr = '';
+    p.stderr.on('data', (b: Buffer) => { stderr += b.toString(); });
+    const kill = setTimeout(() => { try { p.kill('SIGKILL'); } catch { /* */ } }, 4000);
+    p.on('close', () => {
+      clearTimeout(kill);
+      // Banner line: `Duration: 00:00:22.10, start: 0.000000, bitrate: 3900 kb/s`
+      const m = stderr.match(/Duration:\s+(\d{2}):(\d{2}):(\d{2})\.(\d{2})/);
+      if (!m) return resolve(null);
+      const ms = (+m[1]! * 3600 + +m[2]! * 60 + +m[3]!) * 1000 + +m[4]! * 10;
+      resolve(ms > 500 && ms < 900_000 ? ms : null);
+    });
+    p.on('error', () => { clearTimeout(kill); resolve(null); });
+  });
+}
+
 /** Probe primary video codec of a UDP MPEG-TS source (~3 s, once at
  *  supervisor start). Returns "h264" / "hevc" / "mpeg2video" / etc.
  *  or null on failure. Needed so recordings from non-H.264 channels
@@ -482,7 +510,17 @@ async function ingestClosedSegments(sup: Supervisor) {
       const startedAt = m
         ? new Date(+m[1]!, +m[2]! - 1, +m[3]!, +m[4]!, +m[5]!, +m[6]!)
         : new Date(st.mtimeMs - SEG_SECONDS * 1000);
-      const durationMs = SEG_SECONDS * 1000;
+      // Segments may be shorter than SEG_SECONDS when the recording
+      // ffmpeg was recycled mid-window (age-recycle, source flap,
+      // supervisor restart). Storing the hardcoded 60 000 ms threw off
+      // the session HLS playlist: `session.m3u8` declared 10 sub-segments
+      // × 6 s for a real-22-s file, so hls.js interpolated PDT into
+      // fragments that returned 404 and the on-screen v.currentTime
+      // scale diverged from wall time. Probing gives us the true
+      // duration; falls back to the SEG_SECONDS default only when
+      // ffmpeg can't read the header (should be rare on a healthy file).
+      const probedDurMs = await probeFileDurationMs(full);
+      const durationMs = probedDurMs ?? (SEG_SECONDS * 1000);
 
       const seg = await prisma.recordingSegment.create({
         data: {

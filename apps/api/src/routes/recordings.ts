@@ -416,9 +416,22 @@ const routes: FastifyPluginAsync = async (app) => {
       // (reported 2026-09-04 on 92-news). We re-estimate from mtime -
       // startedAt on any row that still carries the pre-fix defaults
       // (hardcoded 60 000 or the earlier probe run that returned bogus
-      // 250 000+ ms values from fMP4 empty_moov). New ingests write the
-      // correct value up-front so this loop is a no-op there.
-      if (s.durationMs === 60000 || s.durationMs > 120000) {
+      // 250 000+ ms values from fMP4 empty_moov).
+      //
+      // 2026-09-07: also re-estimate anything < 55 000 that references a
+      // file bigger than ~4 MB. Windows' NTFS updates mtime lazily while
+      // ffmpeg is still writing, so the ingest scan (which runs every
+      // few seconds and only skips files whose mtime is < 2 s old) can
+      // read a mid-write file, compute mtime - startedAt = ~7 s, insert
+      // a 7-s row, then write the .recorded marker. When ffmpeg
+      // eventually closes the file 60 s later, the DB row never gets
+      // updated — every clip that intersects that hour returned <1/8 of
+      // the real content. Fresh recompute here reads the NOW-final mtime
+      // and heals the row for the future.
+      const suspiciouslyShort = s.durationMs < 55000
+        && existsSync(s.path)
+        && statSync(s.path).size > 4_000_000;
+      if (s.durationMs === 60000 || s.durationMs > 120000 || suspiciouslyShort) {
         const measured = estimateSegmentDurationMs(s.path, s.startedAt.getTime());
         if (measured && Math.abs(measured - s.durationMs) > 300) {
           try {

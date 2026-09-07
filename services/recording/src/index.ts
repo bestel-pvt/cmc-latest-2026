@@ -867,6 +867,30 @@ async function clipWorker(job: { clipId: string }) {
   }
   covering.sort((a, b) => a.startedAt.getTime() - b.startedAt.getTime());
 
+  // Dedup overlapping segments. Multiple concurrent recording
+  // ffmpegs write the same wall-clock window into different .mp4
+  // files (spawn respawns ~20-40 s apart while the previous is still
+  // writing). Concat-ing all of them plays the same seconds twice
+  // and — because ss/to are computed relative to the FIRST file's
+  // start — the exported clip covers a different wall-clock range
+  // than the marks the operator saw in the editor. First-in wins:
+  // drop any file whose start is BEFORE the previously kept file's
+  // computed end. (Reported 2026-09-07 on HUM News 15:13-15:15 —
+  // export produced a "different video" from the marks.)
+  {
+    const kept: CoveringFile[] = [];
+    for (const f of covering) {
+      const prev = kept[kept.length - 1];
+      if (prev) {
+        const prevEnd = prev.startedAt.getTime() + SEG_SECONDS * 1000;
+        if (f.startedAt.getTime() < prevEnd) continue;
+      }
+      kept.push(f);
+    }
+    covering.length = 0;
+    covering.push(...kept);
+  }
+
   if (covering.length === 0) {
     await prisma.clip.update({ where: { id: clip.id }, data: { status: 'FAILED' } });
     log.warn({ clipId: clip.id, channelId: clip.channelId, startAt: clip.startAt, endAt: clip.endAt },

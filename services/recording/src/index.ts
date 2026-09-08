@@ -353,10 +353,18 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
     // Bigger input queue absorbs source hiccups (IGMP renegotiation,
     // NIC-driver interrupt storm) without dropping segments.
     '-thread_queue_size', '512',
-    // VLC-tolerant probing — match live-hls. Bumped to 40s/50MB
-    // after observing CNN take ~30s to lock in VLC (2026-08-18).
-    '-analyzeduration', '40000000',
-    '-probesize', '50000000',
+    // Fast probe — 5s/5MB. Was 40s/50MB, which caused the recorder
+    // to accumulate ~40 s of buffered UDP packets in memory before
+    // opening the segment file, so the file's first written frame
+    // was 40-90 s BEHIND the wall-clock time in its own basename.
+    // Downstream: the session editor's position 0 played content
+    // whose burn-in clock was 1-2 min earlier than the "STARTED"
+    // column in the recordings table, and clip cuts landed on the
+    // wrong on-screen moment (reported 2026-09-08 on Dunya/SUNO/92/
+    // GNN/Neo/Aik). Live-hls uses 3 s / 3 MB with no issues, so 5 s
+    // / 5 MB is comfortably above what real sources need.
+    '-analyzeduration', '5000000',
+    '-probesize', '5000000',
     ...(kind === 'UDP' || kind === 'RTP' ? ['-f', 'mpegts'] : []),
     '-i', input,
     // Optional video map — audio-only bursts don't crash the recorder.

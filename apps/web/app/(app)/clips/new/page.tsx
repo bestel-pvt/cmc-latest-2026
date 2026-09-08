@@ -216,6 +216,24 @@ export default function NewClipPage() {
           if (frag && typeof frag.programDateTime === 'number' && typeof frag.start === 'number') {
             currentFragRef.current = { pdt: frag.programDateTime, start: frag.start };
           }
+          // Auto-seek to the operator's requested `from` so position 0
+          // of the visible timeline is EXACTLY the wall-clock they
+          // asked for, not the earlier PDT of the covering segment.
+          // The session widens its query by 5 min to catch straddling
+          // segments, so playlist PDT can be up to ~60 s BEFORE `from`
+          // — landing there confused operators ("I picked 01:05 but
+          // it starts at 01:03 something", reported 2026-09-08 across
+          // Dunya/SUNO/etc). Seek forward when there's a real gap
+          // (> 3 s). If effectiveStart is BEFORE the playlist (rare),
+          // stay at 0.
+          const v = videoRef.current;
+          const askedMs = effectiveStart ? new Date(effectiveStart).getTime() : null;
+          if (v && askedMs !== null && typeof pdt === 'number') {
+            const skipSec = (askedMs - pdt) / 1000;
+            if (skipSec > 3) {
+              try { v.currentTime = skipSec; } catch { /* noop */ }
+            }
+          }
         });
         // Track the currently-playing fragment. Each fragment carries its
         // own PDT from the session playlist (re-anchored at every

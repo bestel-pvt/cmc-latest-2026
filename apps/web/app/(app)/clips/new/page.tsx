@@ -109,7 +109,10 @@ export default function NewClipPage() {
   const [title, setTitle] = useState('');
   const [notes, setNotes] = useState('');
   const [format, setFormat] = useState<'MP4' | 'MOV' | 'MKV' | 'WEBM'>('MP4');
-  const [resolution, setResolution] = useState('1920x1080');
+  // Export quality — dropdown in the inspector panel. `source` maps
+  // to the ingest resolution (854x480 today); the enumerated values
+  // let the operator upscale/downscale for delivery.
+  const [resolution, setResolution] = useState('source');
 
   // If the operator arrived from a session ("Create clip" on the
   // Recordings page), we already have startedAt/endedAt. If they arrived
@@ -410,10 +413,10 @@ export default function NewClipPage() {
       body: {
         channelId, title, notes,
         startAt: startAtISO, endAt: endAtISO,
-        // Format + resolution are locked to MP4 / 1920x1080 — the
-        // operator UI no longer surfaces the dropdowns. Server still
-        // accepts the fields for back-compat.
-        format: 'MP4', resolution: '1920x1080',
+        // Format is fixed to MP4. Resolution is operator-selected via
+        // the Export Quality dropdown — the server maps it to matching
+        // bitrate so per-minute file size scales predictably.
+        format: 'MP4', resolution,
         watermarkText: `${user?.email ?? 'unknown'} - ${new Date().toISOString()}`,
       },
     }),
@@ -529,7 +532,22 @@ export default function NewClipPage() {
               className="mt-1.5 w-full rounded-md border border-border bg-panel2/50 p-2 text-sm resize-none"
             />
           </div>
-          {/* Format + Resolution locked to MP4 1080p — dropdowns removed. */}
+          <div>
+            <Label>Export quality</Label>
+            <Select value={resolution} onValueChange={setResolution}>
+              <SelectTrigger className="mt-1.5"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="source">Source (as recorded)</SelectItem>
+                <SelectItem value="640x360">360p — ~3 MB/min</SelectItem>
+                <SelectItem value="854x480">480p — ~5 MB/min</SelectItem>
+                <SelectItem value="1280x720">720p — ~11 MB/min</SelectItem>
+                <SelectItem value="1920x1080">1080p — ~22 MB/min</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-[10px] text-muted-2 mt-1">
+              Higher quality = larger file. Source keeps the recorded size (~5 MB/min).
+            </p>
+          </div>
           <div className="pt-2 border-t border-border">
             <div className="text-[10px] uppercase tracking-widest text-muted-2 mb-2">Watermark</div>
             <div className="font-mono text-[11px] text-muted break-all">{user?.email} - {new Date().toISOString().slice(0, 19)}Z</div>

@@ -947,11 +947,30 @@ async function clipWorker(job: { clipId: string }) {
   // instead of 640→1920 (3x), so faces/tickers stay sharp. Black
   // padding compresses to almost nothing so file size stays around
   // the same as a raw 640x360@700k encode.
-  void clip.resolution;   // legacy UI field, no longer used
-  // Clip export resolution now matches ingest (854x480) so we
-  // never upscale a source pixel and every clip stays at the same
-  // per-minute size the operator sees for recordings (~5 MB/min).
-  const w = REC_W, h = REC_H;
+  // Operator-chosen export resolution + matching bitrate. The UI
+  // exposes a dropdown (360p / 480p / 720p / 1080p / Source); the
+  // string arrives as "WxH" (or null / "source" for pass-through at
+  // ingest resolution).
+  //
+  // Bitrate targets are picked so per-minute size scales predictably:
+  //   360p   ≈ 3 MB/min, 480p ≈ 5 MB/min, 720p ≈ 11 MB/min,
+  //   1080p  ≈ 22 MB/min. Source falls back to ingest defaults.
+  let w = REC_W, h = REC_H;
+  let vBitrate = '700k', vMaxrate = '1000k', vBufsize = '2000k';
+  const rawRes = (clip.resolution ?? '').toLowerCase().trim();
+  const parsedWh = /^(\d{2,4})x(\d{2,4})$/.exec(rawRes);
+  if (parsedWh) {
+    const pw = Number(parsedWh[1]), ph = Number(parsedWh[2]);
+    if (pw > 0 && ph > 0 && pw <= 3840 && ph <= 2160) {
+      w = pw; h = ph;
+      const px = pw * ph;
+      if      (px <= 640 * 360)   { vBitrate = '400k';  vMaxrate = '600k';  vBufsize = '1200k'; }
+      else if (px <= 854 * 480)   { vBitrate = '700k';  vMaxrate = '1000k'; vBufsize = '2000k'; }
+      else if (px <= 1280 * 720)  { vBitrate = '1500k'; vMaxrate = '2200k'; vBufsize = '4000k'; }
+      else                        { vBitrate = '3000k'; vMaxrate = '4500k'; vBufsize = '9000k'; }
+    }
+  }
+  log.info({ clipId: clip.id, w, h, vBitrate, resolution: clip.resolution }, 'clip: export resolution chosen');
 
   // If multiple files, write a concat list file for ffmpeg's concat
   // demuxer (safer than concat filter for pre-encoded MP4 pieces).
@@ -1066,8 +1085,8 @@ async function clipWorker(job: { clipId: string }) {
       // in terms of bytes. Ingest is 700k VBR-capped; we output at the
       // same 700k so a 60-s clip is ~5.5 MB (matches a 60-s source
       // segment). No compress-below-source regression possible.
-      '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', '700k',
-      '-maxrate', '1000k', '-bufsize', '2000k',
+      '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', vBitrate,
+      '-maxrate', vMaxrate, '-bufsize', vBufsize,
       '-c:a', 'aac', '-b:a', A_BITRATE, '-ac', '2', '-ar', '48000',
       ...(isMovLike ? ['-movflags', '+faststart'] : []),
       '-y', mainPath,

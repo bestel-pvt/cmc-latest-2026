@@ -867,17 +867,36 @@ async function clipWorker(job: { clipId: string }) {
   }
   covering.sort((a, b) => a.startedAt.getTime() - b.startedAt.getTime());
 
-  // Dedup overlapping segments. Multiple concurrent recording
-  // ffmpegs write the same wall-clock window into different .mp4
-  // files (spawn respawns ~20-40 s apart while the previous is still
-  // writing). Concat-ing all of them plays the same seconds twice
-  // and — because ss/to are computed relative to the FIRST file's
-  // start — the exported clip covers a different wall-clock range
-  // than the marks the operator saw in the editor. First-in wins:
-  // drop any file whose start is BEFORE the previously kept file's
-  // computed end. (Reported 2026-09-07 on HUM News 15:13-15:15 —
-  // export produced a "different video" from the marks.)
-  {
+  // Overlapping-segment strategy (multiple concurrent recording ffmpegs
+  // write the SAME wall-clock window into different .mp4 files, spawn
+  // respawn ~20-40 s apart while the previous is still writing):
+  //
+  //   1. If ANY single covering file contains the entire clip window
+  //      [clip.startAt, clip.endAt], use ONLY that file with a
+  //      single-input `-ss/-to`. This is the common case (>90 % of
+  //      clips are < 60 s and fit in one 60-s segment); it gives a
+  //      frame-accurate cut, no concat, no overlap ambiguity.
+  //
+  //   2. Otherwise (long clip spanning multiple segments), fall back
+  //      to first-in-wins dedup + concat + relative `-ss/-to`.
+  //
+  // Was: always concat all covering files → double-count wall time,
+  // relative -ss maps clip.startAt onto FIRST file, so if user marked
+  // content that physically lives in a LATER overlapping file the
+  // export came out completely different (reported for Dunya/92/GNN/
+  // Neo/SUNO/Aik 2026-09-08 — user tang aa gaya sunn sunn ke).
+  const clipStartMs = clip.startAt.getTime();
+  const clipEndMs   = clip.endAt.getTime();
+  const singleCover = covering.find((f) => {
+    const start = f.startedAt.getTime();
+    const end   = start + SEG_SECONDS * 1000;
+    return start <= clipStartMs && end >= clipEndMs;
+  });
+  if (singleCover) {
+    covering.length = 0;
+    covering.push(singleCover);
+    log.info({ clipId: clip.id, chosen: singleCover.path }, 'clip: single-segment cut (window fits in one file)');
+  } else {
     const kept: CoveringFile[] = [];
     for (const f of covering) {
       const prev = kept[kept.length - 1];
@@ -889,6 +908,7 @@ async function clipWorker(job: { clipId: string }) {
     }
     covering.length = 0;
     covering.push(...kept);
+    log.info({ clipId: clip.id, files: covering.length }, 'clip: multi-segment concat (dedup applied)');
   }
 
   if (covering.length === 0) {

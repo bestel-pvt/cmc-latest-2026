@@ -280,14 +280,17 @@ const routes: FastifyPluginAsync = async (app) => {
 
       // Filter out corrupt / half-written segments — concat demuxer
       // bails on the first bad file and stops before the rest.
-      // Dedup overlapping segments (same reason as session.m3u8 handler
-      // — two ffmpegs writing the same wall-clock window in parallel).
+      // Dedup HEAVILY overlapping segments (>= 5 s). Same rationale as
+      // the session.m3u8 handler — small (1-2 s) overlaps between
+      // consecutive segments from a single ffmpeg are normal jitter
+      // from keyframe-aligned splits and MUST be kept.
       const dedupedCov: typeof covering = [];
       for (const s of covering) {
         const prev = dedupedCov[dedupedCov.length - 1];
         if (prev) {
           const prevEnd = prev.startedAt.getTime() + prev.durationMs;
-          if (s.startedAt.getTime() < prevEnd) continue;
+          const overlapMs = prevEnd - s.startedAt.getTime();
+          if (overlapMs >= 5000) continue;
         }
         dedupedCov.push(s);
       }
@@ -455,30 +458,32 @@ const routes: FastifyPluginAsync = async (app) => {
     }
     if (playable.length === 0) return reply.notFound('no playable segments in range');
 
-    // Dedup overlapping segments. The recording supervisor sometimes
-    // has two ffmpegs running simultaneously for the same channel
-    // (spawn respawns in a different minute while the previous one is
-    // still writing), so two consecutive .mp4 files can cover the
-    // SAME wall-clock window with a ~20-40 s overlap. Playing both
-    // shows the same content twice and (worse) the two files' PDT
-    // anchors point at different offsets in the same wall time —
-    // hls.js's per-fragment PDT then reports the WRONG wall time for
-    // a given player position, so mark-in/out send server timestamps
-    // that map to a different physical file than what the operator
-    // saw (reported 2026-09-07 on HUM News 15:13-15:15 — session
-    // reported 3:24 of playback for a 2:22 real window; exported
-    // clip came from a different portion than the marks).
+    // Dedup HEAVILY overlapping segments (>= 5 s). The recording
+    // supervisor sometimes has two ffmpegs running in parallel for the
+    // same channel (spawn respawns while the previous is still
+    // writing), so two consecutive .mp4 files can cover the same
+    // wall-clock window with a 20-40 s overlap. Playing both shows
+    // the same content twice and — because the two files' PDT anchors
+    // point at different offsets within the same wall time — hls.js's
+    // per-fragment PDT reports the wrong wall time for a given player
+    // position, so mark-in/out send server timestamps that map to a
+    // different physical file than what the operator saw.
     //
-    // Keep segments sorted by startedAt; drop any segment that starts
-    // BEFORE the previously kept one ends. First-in wins. Losing the
-    // dropped ones is safe — every wall-clock second is still covered
-    // by the earlier segment.
+    // The 5-second threshold matters: sequential 60-s segments from a
+    // single ffmpeg naturally overlap by 1-2 s (ffmpeg's -segment_time
+    // splits at the nearest keyframe, so real segment boundaries are
+    // ±1 s jitter). Treating that jitter as "overlap" and dropping
+    // alternates leaves the session with only every-other 60-s chunk,
+    // and the player shows ~half the real content — reported for
+    // Dunya News 2026-09-08 where a 6-min real recording played back
+    // as 3:47 (also 92/GNN/Neo/SUNO/Aik).
     const deduped: typeof playable = [];
     for (const s of playable) {
       const prev = deduped[deduped.length - 1];
       if (prev) {
         const prevEnd = prev.startedAt.getTime() + prev.durationMs;
-        if (s.startedAt.getTime() < prevEnd) continue;   // overlaps prev — skip
+        const overlapMs = prevEnd - s.startedAt.getTime();
+        if (overlapMs >= 5000) continue;   // real duplicate — skip
       }
       deduped.push(s);
     }

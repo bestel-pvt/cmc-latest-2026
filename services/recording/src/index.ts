@@ -902,7 +902,13 @@ async function clipWorker(job: { clipId: string }) {
       const prev = kept[kept.length - 1];
       if (prev) {
         const prevEnd = prev.startedAt.getTime() + SEG_SECONDS * 1000;
-        if (f.startedAt.getTime() < prevEnd) continue;
+        // Only skip HEAVY overlaps (>= 5 s). Consecutive 60-s segments
+        // from a single ffmpeg naturally jitter ±1-2 s at keyframe
+        // boundaries and MUST be kept — dropping them halves the
+        // real content (reported for Dunya News 2026-09-08: 6-min
+        // recording played back as 3:47).
+        const overlapMs = prevEnd - f.startedAt.getTime();
+        if (overlapMs >= 5000) continue;
       }
       kept.push(f);
     }

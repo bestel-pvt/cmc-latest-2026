@@ -136,8 +136,14 @@ const supervisors = new Map<string, Supervisor>();
  *  handler fired 86 ms after the orphan kill each cycle.  */
 const recentlySpawnedPids = new Map<number, number>();
 /** Sweep is expensive (wmic ~50-100 ms) and dangerous (can race with
- *  a spawn). Only run at this cadence, not once per refresh tick.  */
-const ORPHAN_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+ *  a spawn). The 90-s young-process exemption keeps live spawns safe,
+ *  so the cadence can be short — was 5 min, tightened to 60 s after
+ *  2026-09-10 BOL/Dawn: kernel-blocked orphan ffmpegs held their UDP
+ *  multicast sockets, starved the fresh respawns, and node had to
+ *  wait up to 5 min for the next sweep to reap them. Recording rows
+ *  vanished from the DB for the full window. Sweeping once a minute
+ *  bounds the "invisible-to-DB" gap to ~90 s.  */
+const ORPHAN_SWEEP_INTERVAL_MS = 60 * 1000;
 let lastOrphanSweepAt = 0;
 
 /**
@@ -642,6 +648,19 @@ async function refreshSupervisors() {
       p.on('exit', (code) => {
         if (sup._stopped) return;
         log.warn({ slug: c.slug, code, restarts: sup.restarts }, 'recorder ffmpeg exited');
+        // Windows LIES: node fires the 'exit' event when the parent
+        // ffmpeg.exe handle is released, but the kernel process may
+        // still be alive (kernel-blocked on recvfrom, holding its UDP
+        // multicast socket). If we respawn now, the new ffmpeg races
+        // the zombie for the same source socket, and both starve.
+        // Verify with tasklist; hardKill if still there. Was the root
+        // cause of the 2026-09-10 BOL/Dawn stall (5 h of missing DB
+        // rows while a 20-min-old orphan monopolised the mcast).
+        const oldPid = p.pid;
+        if (typeof oldPid === 'number' && pidAlive(oldPid)) {
+          log.warn({ slug: c.slug, pid: oldPid }, 'recorder exited event fired but pid still alive — hardKill');
+          try { spawnSync('taskkill', ['/F', '/T', '/PID', String(oldPid)], { stdio: 'ignore' }); } catch { /* noop */ }
+        }
         const now = Date.now();
         sup.restarts = now - sup.lastRestartAt > 30_000 ? 0 : sup.restarts + 1;
         // Chronic-offender cooldown: when the upstream source dies

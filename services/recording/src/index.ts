@@ -136,14 +136,13 @@ const supervisors = new Map<string, Supervisor>();
  *  handler fired 86 ms after the orphan kill each cycle.  */
 const recentlySpawnedPids = new Map<number, number>();
 /** Sweep is expensive (wmic ~50-100 ms) and dangerous (can race with
- *  a spawn). The 90-s young-process exemption keeps live spawns safe,
- *  so the cadence can be short — was 5 min, tightened to 60 s after
- *  2026-09-10 BOL/Dawn: kernel-blocked orphan ffmpegs held their UDP
- *  multicast sockets, starved the fresh respawns, and node had to
- *  wait up to 5 min for the next sweep to reap them. Recording rows
- *  vanished from the DB for the full window. Sweeping once a minute
- *  bounds the "invisible-to-DB" gap to ~90 s.  */
-const ORPHAN_SWEEP_INTERVAL_MS = 60 * 1000;
+ *  a spawn). Only run at this cadence, not once per refresh tick.
+ *  Was briefly 60 s (2026-09-10) hoping to bound the BOL/Dawn stall
+ *  window, but the actual root causes for those (duplicate supervisor
+ *  processes, malformed 2nd audio track) were fixed elsewhere and
+ *  the tighter sweep just added wmic overhead every minute for no
+ *  gain. Back to 5 min.  */
+const ORPHAN_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 let lastOrphanSweepAt = 0;
 
 /**

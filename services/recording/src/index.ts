@@ -321,11 +321,18 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
     log.info({ slug, codec: channelCodec.get(slug) }, 'source codec detected');
   }
   const codec = channelCodec.get(slug);
-  // Transcode when: source isn't h264 (browser can't play) OR the
-  // source is on the "slow-KF" list (segment muxer needs the 2-s
-  // forced keyframes we add below to cut 60-s segments cleanly).
+  // Transcode when: source is on the "slow-KF" list OR probe
+  // POSITIVELY identified a non-h264 codec (hevc / mpeg2). Null-codec
+  // (probe failed to lock in 2 s) is treated as h264 and passed to
+  // -c copy — ffmpeg's own 5-s analyzeduration then identifies the
+  // real stream during recording. Was: null-codec forced libx264,
+  // which spawns an encoder with NO input stream info and dies
+  // instantly on any source whose 2-s probe was jittery (root cause
+  // of dawn-news stall 2026-09-10 — probe returned null after every
+  // service restart, transcode crashed on spawn, recording never
+  // wrote a single file).
   const needsTranscode = RECORDING_TRANSCODE_SLUGS.has(slug)
-    || (codec !== undefined && codec !== 'h264');
+    || (codec !== undefined && codec !== null && codec !== 'h264');
   const videoArgs = needsTranscode
     ? [
         // Re-encode at NATIVE resolution — no -vf scale here so
@@ -359,19 +366,32 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
     // Bigger input queue absorbs source hiccups (IGMP renegotiation,
     // NIC-driver interrupt storm) without dropping segments.
     '-thread_queue_size', '512',
-    // 5 s / 5 MB probe. Was briefly 20 s (2026-09-10) trying to help
-    // dawn-news / bol-news, but the same probe worked fine at 5 s in
-    // controlled tests — the "no stream" failure had a different
-    // cause (fMP4 segment muxer + this specific source's PMT). Kept
-    // at 5 s so first written frame stays close to file basename
-    // time (fixes clip-editor timeline alignment for Dunya/SUNO/etc,
-    // 2026-09-08).
-    '-analyzeduration', '5000000',
-    '-probesize', '5000000',
+    // 5 s / 5 MB probe by default. Channels whose 2-s probeVideoCodec
+    // returned null get bumped to 40 s / 50 MB (matching live-hls) —
+    // those sources need a full IGMP-join+PAT/PMT-refresh cycle to
+    // identify streams. Reported 2026-09-10 on dawn-news: 5-s probe
+    // failed with EINVAL "Output file does not contain any stream"
+    // even in -c copy, because ffmpeg's mpeg-ts demuxer never got a
+    // full PAT/PMT to lock streams. Live-hls uses 40 s and works on
+    // the same source. Trade-off is up to 40 s delay on first frame
+    // for those specific channels, which is invisible for 24/7
+    // recording (only visible on service restart).
+    ...(codec === null
+      ? ['-analyzeduration', '40000000', '-probesize', '50000000']
+      : ['-analyzeduration', '5000000',  '-probesize', '5000000']),
     ...(kind === 'UDP' || kind === 'RTP' ? ['-f', 'mpegts'] : []),
     '-i', input,
     // Optional video map — audio-only bursts don't crash the recorder.
-    '-map', '0:v:0?', '-map', '0:a?', '-dn', '-sn',
+    // Pin to FIRST audio only. Was `-map 0:a?` (all audio streams) —
+    // broadcasters occasionally add a secondary SAP/descriptive-audio
+    // track alongside the primary. When that secondary track is
+    // malformed (mp3, 0 channels, no sample rate — observed on
+    // dawn-news 2026-09-10) the fMP4 segment muxer rejects it with
+    // "Could not write header (incorrect codec parameters ?)" and
+    // ffmpeg exits with EINVAL (code 4294967274 on Windows) before
+    // writing a single frame. Recording only ever needed the primary
+    // language anyway; the download endpoint re-mixes to 2ch AAC.
+    '-map', '0:v:0?', '-map', '0:a:0?', '-dn', '-sn',
     ...videoArgs,
     ...audioArgs,
     '-f', 'segment',

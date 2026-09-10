@@ -359,20 +359,15 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
     // Bigger input queue absorbs source hiccups (IGMP renegotiation,
     // NIC-driver interrupt storm) without dropping segments.
     '-thread_queue_size', '512',
-    // 20 s / 20 MB probe — middle-ground. Was originally 40 s / 50 MB
-    // (which pushed first-written-frame ~40 s behind file basename,
-    // breaking clip-editor timeline alignment on Dunya / SUNO / etc,
-    // fixed 2026-09-08). Then briefly dropped to 5 s / 5 MB — turned
-    // out too short for dawn-news + bol-news, whose MPEG-TS on
-    // 239.1.1.27 and 239.1.1.19 needs ~10-15 s of packets before
-    // ffmpeg can identify streams (test 2026-09-10: 5 s probe failed
-    // with "Could not detect TS packet size" and "Output file does
-    // not contain any stream" for both `-c copy` and libx264; the
-    // recorder crashed on spawn every ~3 min while live-hls kept
-    // running on longer probes). 20 s covers the pickiest sources
-    // and keeps first-frame drift under ~20 s.
-    '-analyzeduration', '20000000',
-    '-probesize', '20000000',
+    // 5 s / 5 MB probe. Was briefly 20 s (2026-09-10) trying to help
+    // dawn-news / bol-news, but the same probe worked fine at 5 s in
+    // controlled tests — the "no stream" failure had a different
+    // cause (fMP4 segment muxer + this specific source's PMT). Kept
+    // at 5 s so first written frame stays close to file basename
+    // time (fixes clip-editor timeline alignment for Dunya/SUNO/etc,
+    // 2026-09-08).
+    '-analyzeduration', '5000000',
+    '-probesize', '5000000',
     ...(kind === 'UDP' || kind === 'RTP' ? ['-f', 'mpegts'] : []),
     '-i', input,
     // Optional video map — audio-only bursts don't crash the recorder.

@@ -359,18 +359,20 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
     // Bigger input queue absorbs source hiccups (IGMP renegotiation,
     // NIC-driver interrupt storm) without dropping segments.
     '-thread_queue_size', '512',
-    // Fast probe — 5s/5MB. Was 40s/50MB, which caused the recorder
-    // to accumulate ~40 s of buffered UDP packets in memory before
-    // opening the segment file, so the file's first written frame
-    // was 40-90 s BEHIND the wall-clock time in its own basename.
-    // Downstream: the session editor's position 0 played content
-    // whose burn-in clock was 1-2 min earlier than the "STARTED"
-    // column in the recordings table, and clip cuts landed on the
-    // wrong on-screen moment (reported 2026-09-08 on Dunya/SUNO/92/
-    // GNN/Neo/Aik). Live-hls uses 3 s / 3 MB with no issues, so 5 s
-    // / 5 MB is comfortably above what real sources need.
-    '-analyzeduration', '5000000',
-    '-probesize', '5000000',
+    // 20 s / 20 MB probe — middle-ground. Was originally 40 s / 50 MB
+    // (which pushed first-written-frame ~40 s behind file basename,
+    // breaking clip-editor timeline alignment on Dunya / SUNO / etc,
+    // fixed 2026-09-08). Then briefly dropped to 5 s / 5 MB — turned
+    // out too short for dawn-news + bol-news, whose MPEG-TS on
+    // 239.1.1.27 and 239.1.1.19 needs ~10-15 s of packets before
+    // ffmpeg can identify streams (test 2026-09-10: 5 s probe failed
+    // with "Could not detect TS packet size" and "Output file does
+    // not contain any stream" for both `-c copy` and libx264; the
+    // recorder crashed on spawn every ~3 min while live-hls kept
+    // running on longer probes). 20 s covers the pickiest sources
+    // and keeps first-frame drift under ~20 s.
+    '-analyzeduration', '20000000',
+    '-probesize', '20000000',
     ...(kind === 'UDP' || kind === 'RTP' ? ['-f', 'mpegts'] : []),
     '-i', input,
     // Optional video map — audio-only bursts don't crash the recorder.

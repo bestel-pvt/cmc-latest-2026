@@ -108,18 +108,33 @@ const routes: FastifyPluginAsync = async (app) => {
     // startedAt >= bound by one segment length and post-filter to keep
     // the query planner-friendly.
     const widenMs = (Number(process.env.RECORDING_SEGMENT_SECONDS ?? 60) + 5) * 1000;
+    // Pull ONLY the columns we need for the group-by. Was including the
+    // full RecordingSegment row + a joined Channel object per row; on a
+    // 24-hour window with 30 channels that's 115K+ rows × ~1KB = 100+ MB
+    // pulled through Prisma and materialised into JS objects, blocking
+    // the Node event loop for tens of seconds on JSON.stringify and
+    // freezing every other request (login included). Reported 2026-09-11
+    // as recurring "api hangs, login times out" — trace showed the
+    // sessions call in flight when everything froze.
+    // Channel names are fetched once for the small set of channels
+    // referenced by these segments, then attached in-memory.
+    const channelsPromise = app.prisma.channel.findMany({
+      select: { id: true, name: true, slug: true },
+      ...(q.channelId ? { where: { id: q.channelId } } : {}),
+    });
     const segments = (await app.prisma.recordingSegment.findMany({
       where: {
         ...(q.channelId ? { channelId: q.channelId } : {}),
         startedAt: { gte: new Date(from.getTime() - widenMs), lte: to },
       },
-      include: { channel: { select: { id: true, name: true, slug: true } } },
+      select: { id: true, channelId: true, startedAt: true, durationMs: true, sizeBytes: true },
       orderBy: [{ channelId: 'asc' }, { startedAt: 'asc' }],
     })).filter((s) => {
-      // exact overlap check now that segments are in hand
       const segEnd = s.startedAt.getTime() + s.durationMs;
       return segEnd >= from.getTime() && s.startedAt <= to;
     });
+    const channels = await channelsPromise;
+    const channelById = new Map(channels.map((c) => [c.id, c]));
     // Bucket into sessions by (channelId, gap ≥ 3 min)
     const GAP_MS = 3 * 60 * 1000;
     interface Session {
@@ -136,9 +151,10 @@ const routes: FastifyPluginAsync = async (app) => {
       const end = new Date(s.startedAt.getTime() + s.durationMs);
       if (!cur || cur.channelId !== s.channelId ||
           (s.startedAt.getTime() - cur.endedAt.getTime()) > GAP_MS) {
+        const ch = channelById.get(s.channelId) ?? { id: s.channelId, name: s.channelId, slug: s.channelId };
         cur = {
           id: `sess-${s.id}`,
-          channelId: s.channelId, channel: s.channel,
+          channelId: s.channelId, channel: ch,
           startedAt: s.startedAt, endedAt: end,
           durationMs: s.durationMs, sizeBytes: BigInt(s.sizeBytes ?? 0n),
           segmentCount: 1,

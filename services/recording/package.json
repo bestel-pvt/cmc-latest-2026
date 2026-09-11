@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
-    "start": "tsx src/index.ts",
+    "start": "node -e \"console.error('\\n*** BLOCKED ***\\ncmc-recording is managed by nssm — running pnpm start manually spawns a SECOND supervisor that duplicates every ffmpeg (60 concurrent instead of 30), spikes CPU to 100%, and hangs the api log.\\nUse:  Restart-Service cmc-recording   (or nssm start cmc-recording)\\nIf you REALLY need a foreground launch for debugging, use:  pnpm start:force\\n'); process.exit(1);\"",
+    "start:force": "tsx src/index.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

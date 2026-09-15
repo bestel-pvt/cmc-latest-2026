@@ -6,18 +6,10 @@
 
 import type { FastifyPluginAsync } from 'fastify';
 import os from 'node:os';
-import { existsSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { execSync } from 'node:child_process';
 
-const DATA_DIR       = process.env.DATA_DIR       ? path.resolve(process.env.DATA_DIR)       : path.resolve('./data');
-// Per-workload paths. These may point to a different volume than
-// DATA_DIR — recordings and clips typically live on the big storage
-// drive (D:) while DATA_DIR is on C: for hls / frames / logos. The
-// dashboard breakdown looks at each configured path individually.
-const RECORDINGS_DIR = process.env.RECORDINGS_DIR ? path.resolve(process.env.RECORDINGS_DIR) : path.join(DATA_DIR, 'recordings');
-const CLIPS_DIR      = process.env.CLIPS_DIR      ? path.resolve(process.env.CLIPS_DIR)      : path.join(DATA_DIR, 'clips');
-const FRAMES_ROOT    = process.env.FRAMES_DIR     ? path.resolve(process.env.FRAMES_DIR)     : path.join(DATA_DIR, 'frames');
+const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.resolve('./data');
 
 /** Instant CPU utilisation across every core.
  *  Takes two `os.cpus()` snapshots ~150 ms apart. Was 500 ms which
@@ -95,26 +87,22 @@ function allDisks(): Array<{ mount: string; total: number; free: number; used: n
   } catch { return []; }
 }
 
-/** Recursive directory size in bytes. Skips symlinks. Silent on errors. */
-function dirSize(dir: string): number {
-  if (!existsSync(dir)) return 0;
-  let total = 0;
-  const stack: string[] = [dir];
-  while (stack.length) {
-    const d = stack.pop()!;
-    let entries: import('node:fs').Dirent[] = [];
-    try { entries = readdirSync(d, { withFileTypes: true }); } catch { continue; }
-    for (const e of entries) {
-      const full = path.join(d, e.name);
-      if (e.isSymbolicLink()) continue;
-      if (e.isDirectory()) { stack.push(full); continue; }
-      if (e.isFile()) {
-        try { total += statSync(full).size; } catch { /* file vanished mid-scan */ }
-      }
-    }
-  }
-  return total;
-}
+/**
+ * Storage per-directory breakdown DISABLED (2026-09-13).
+ *
+ * The previous synchronous dirSize walk over D:\cmc\recordings blocked
+ * the Node event loop for 25 s to several minutes on a live server
+ * (hundreds of thousands of segment files, plus IO contention with 30
+ * concurrent recording ffmpegs). Even wrapped in setImmediate + a 5-min
+ * cache, every fifth request from a stale cache re-triggered the walk,
+ * freezing every other API call and every wall HLS segment fetch —
+ * which is what the client saw as "wall goes black, APIs return 500".
+ *
+ * The dashboard now shows the overall drive-level used/free (which
+ * comes from a cheap Windows logical-disk query) without per-workload
+ * split. If someone wants the breakdown back, it needs a worker_thread
+ * (or streaming async fs) — not a sync walk on the API event loop.
+ */
 
 const routes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.authenticate);
@@ -195,21 +183,9 @@ const routes: FastifyPluginAsync = async (app) => {
    * reload all share the same cached response.
    */
   app.get('/resources', async () => {
-    // Stale-while-revalidate. The dirSize walk over D:\cmc\recordings
-    // was measured at 25–30 s on this box (hundreds of thousands of
-    // .mp4 files, each stat'd sync). Blocking the browser dashboard
-    // for that long is what made the whole UI feel "stuck loading".
-    // New policy: cheap fields (CPU, memory, disk free/total via
-    // logical-drive query) ALWAYS return in <150 ms. The expensive
-    // per-directory breakdown is served from cache only; a background
-    // refresh runs at most once per REFRESH_MS. On first call after
-    // boot the breakdown is zeroed (dashboard just shows the
-    // top-level bar); once the first refresh finishes (~30 s later)
-    // the numbers populate.
-    const REFRESH_MS = 5 * 60_000;  // 5 min — matches how fast disk usage actually changes
-    const nowMs = Date.now();
-
-    // Cheap fields — always fresh.
+    // All cheap, non-blocking calls. Volume-level used/free comes from
+    // a Windows logical-disk WMIC query (<50 ms). No dirSize walks —
+    // see comment above dirSize's removed body for why.
     const cpus = os.cpus();
     const totalMem = os.totalmem();
     const freeMem  = os.freemem();
@@ -218,23 +194,6 @@ const routes: FastifyPluginAsync = async (app) => {
     const disks = allDisks();
     const primary = disks[0] ?? diskUsage(DATA_DIR);
     const primaryMount = disks[0]?.mount ?? DATA_DIR;
-
-    // Kick off background refresh if cache is stale / empty. Never
-    // await — always returns from cache (or zeros on cold boot).
-    if (!breakdownRefreshInFlight && (!breakdownCache || nowMs - breakdownCache.at > REFRESH_MS)) {
-      breakdownRefreshInFlight = true;
-      setImmediate(() => {
-        try {
-          const recordingsBytes = dirSize(RECORDINGS_DIR);
-          const clipsBytes      = dirSize(CLIPS_DIR);
-          const framesBytes     = dirSize(FRAMES_ROOT);
-          breakdownCache = { at: Date.now(), recordingsBytes, clipsBytes, framesBytes };
-        } finally {
-          breakdownRefreshInFlight = false;
-        }
-      });
-    }
-    const bd = breakdownCache ?? { recordingsBytes: 0, clipsBytes: 0, framesBytes: 0 };
 
     return {
       at: new Date().toISOString(),
@@ -256,10 +215,10 @@ const routes: FastifyPluginAsync = async (app) => {
         freeBytes: primary.free,
         usedPct: primary.total > 0 ? Math.round((primary.used / primary.total) * 100) : 0,
         breakdown: {
-          recordingsBytes: bd.recordingsBytes,
-          clipsBytes: bd.clipsBytes,
-          framesBytes: bd.framesBytes,
-          otherBytes: Math.max(0, primary.used - bd.recordingsBytes - bd.clipsBytes - bd.framesBytes),
+          recordingsBytes: 0,
+          clipsBytes: 0,
+          framesBytes: 0,
+          otherBytes: 0,
         },
         volumes: disks,
       },
@@ -267,11 +226,5 @@ const routes: FastifyPluginAsync = async (app) => {
     };
   });
 };
-
-// Module-scope caches. breakdownCache holds ONLY the per-directory
-// dirSize numbers (the expensive part). Everything else is computed
-// fresh on each request in <150 ms.
-let breakdownCache: { at: number; recordingsBytes: number; clipsBytes: number; framesBytes: number } | null = null;
-let breakdownRefreshInFlight = false;
 
 export default routes;

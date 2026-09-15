@@ -116,17 +116,17 @@ export default function ClipsPage() {
           {(clips?.length ?? 0) === 0 ? (
             <div className="p-10 text-center text-sm text-muted"><Film className="h-8 w-8 mx-auto mb-3 text-muted-2" />No clips yet.</div>
           ) : (
-            <table className="w-full text-sm">
+            <table className="w-full text-sm table-fixed">
               <thead className="bg-panel2/50 text-[10px] uppercase tracking-widest text-muted-2">
                 <tr>
-                  <th className="text-left px-4 py-2">Title</th>
-                  <th className="text-left px-4 py-2">Channel</th>
-                  <th className="text-left px-4 py-2">Duration</th>
-                  <th className="text-left px-4 py-2">Format</th>
-                  <th className="text-left px-4 py-2">Size</th>
-                  <th className="text-left px-4 py-2">Status</th>
-                  <th className="text-left px-4 py-2">By</th>
-                  <th className="px-4 py-2 w-20"></th>
+                  <th className="text-left px-4 py-2 w-[26%]">Title</th>
+                  <th className="text-left px-4 py-2 w-[14%]">Channel</th>
+                  <th className="text-left px-4 py-2 w-[9%]">Duration</th>
+                  <th className="text-left px-4 py-2 w-[14%]">Format</th>
+                  <th className="text-left px-4 py-2 w-[10%]">Size</th>
+                  <th className="text-left px-4 py-2 w-[10%]">Status</th>
+                  <th className="text-left px-4 py-2 w-[11%]">By</th>
+                  <th className="px-4 py-2 w-[6%]"></th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-border">
@@ -134,7 +134,9 @@ export default function ClipsPage() {
                   const dur = (new Date(c.endAt).getTime() - new Date(c.startAt).getTime()) / 1000;
                   return (
                     <tr key={c.id} className="hover:bg-panel/40">
-                      <td className="px-4 py-3 font-medium">{c.title}</td>
+                      <td className="px-4 py-3 font-medium">
+                        <div className="truncate" title={c.title}>{c.title}</div>
+                      </td>
                       <td className="px-4 py-3 text-muted">{c.channel.name}</td>
                       <td className="px-4 py-3 font-mono text-xs">{Math.floor(dur)}s</td>
                       <td className="px-4 py-3"><Badge variant="outline">{c.format} · {c.resolution}</Badge></td>

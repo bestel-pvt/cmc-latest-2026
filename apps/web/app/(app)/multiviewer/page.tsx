@@ -38,7 +38,7 @@ interface Slot {
 }
 
 interface Layout {
-  id: 'single' | 'dual' | 'grid8' | 'mosaic' | 'grid32';
+  id: 'single' | 'dual' | 'grid4' | 'grid8' | 'mosaic' | 'grid32';
   label: string;
   slots: Slot[];
 }
@@ -72,6 +72,15 @@ function buildLayouts(): Layout[] {
     }
   }
 
+  // Grid4: 2 cols × 2 rows = 4 slots — big tiles for a small
+  // priority set (e.g. focus mode on 4 channels).
+  const grid4: Slot[] = [];
+  for (let r = 0; r < 2; r++) {
+    for (let c = 0; c < 2; c++) {
+      grid4.push({ x: c / 2, y: r / 2, w: 1 / 2, h: 1 / 2 });
+    }
+  }
+
   // Grid8: 4 cols × 2 rows = 8 slots. Fills the wall with fewer,
   // larger tiles than grid32 — better for shifts that follow a
   // priority set of ~8 channels without needing full-wall detail.
@@ -94,9 +103,10 @@ function buildLayouts(): Layout[] {
   return [
     { id: 'single', label: '1 · Single',       slots: single },
     { id: 'dual',   label: '2 · Dual',         slots: dual },
-    { id: 'grid8',  label: '3 · Grid (8)',     slots: grid8 },
-    { id: 'mosaic', label: '4 · Mosaic (20)',  slots: mosaic },
-    { id: 'grid32', label: '5 · Grid (32)',    slots: grid32 },
+    { id: 'grid4',  label: '3 · Grid (4)',     slots: grid4 },
+    { id: 'grid8',  label: '4 · Grid (8)',     slots: grid8 },
+    { id: 'mosaic', label: '5 · Mosaic (20)',  slots: mosaic },
+    { id: 'grid32', label: '6 · Grid (32)',    slots: grid32 },
   ];
 }
 

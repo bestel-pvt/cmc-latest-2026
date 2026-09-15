@@ -940,24 +940,20 @@ async function clipWorker(job: { clipId: string }) {
     covering.push(singleCover);
     log.info({ clipId: clip.id, chosen: singleCover.path }, 'clip: single-segment cut (window fits in one file)');
   } else {
-    const kept: CoveringFile[] = [];
-    for (const f of covering) {
-      const prev = kept[kept.length - 1];
-      if (prev) {
-        const prevEnd = prev.startedAt.getTime() + SEG_SECONDS * 1000;
-        // Only skip HEAVY overlaps (>= 5 s). Consecutive 60-s segments
-        // from a single ffmpeg naturally jitter ±1-2 s at keyframe
-        // boundaries and MUST be kept — dropping them halves the
-        // real content (reported for Dunya News 2026-09-08: 6-min
-        // recording played back as 3:47).
-        const overlapMs = prevEnd - f.startedAt.getTime();
-        if (overlapMs >= 5000) continue;
-      }
-      kept.push(f);
-    }
-    covering.length = 0;
-    covering.push(...kept);
-    log.info({ clipId: clip.id, files: covering.length }, 'clip: multi-segment concat (dedup applied)');
+    // KEEP every covering file — don't drop overlapping ones. The old
+    // "skip if overlap >= 5 s" rule silently discarded the second file
+    // of a respawn-overlap pair, permanently losing the tail of the
+    // clip window (2026-09-15: Al Jazeera Testing clip lost 13 s of a
+    // 49 s window because dedup dropped T083000Z, whose 25 s overlap
+    // with T082925Z included the last-13-s portion of the clip). The
+    // fix is to feed ALL covering files into the concat demuxer AND
+    // use its `inpoint` directive on each subsequent file to skip
+    // exactly the overlap region, so no bytes are read twice.
+    //
+    // Result: concat's PTS timeline collapses down to real wall-clock
+    // time — the same `ss`/`to` math that worked for cleanly-adjacent
+    // segments now works for overlapping ones too, no double-count.
+    log.info({ clipId: clip.id, files: covering.length }, 'clip: multi-segment concat (all covering kept, inpoints will skip overlaps)');
   }
 
   if (covering.length === 0) {
@@ -1025,21 +1021,109 @@ async function clipWorker(job: { clipId: string }) {
     '-analyzeduration', '20000000',
     '-probesize', '20000000',
   ];
+  // Rewrite 2026-09-16 — per-file trim + filter-graph concat (no more
+  // concat demuxer).
+  //
+  // Why: the concat demuxer approach has cost us a week of fights.
+  // Its PTS timeline is CONTIGUOUS regardless of wall-clock gaps or
+  // overlaps between input files, so input-side -ss/-to inside the
+  // wall-clock frame keeps drifting; every fix (output-ss, in-filter
+  // trim, inpoint, -t input) hit a different edge case (half-clip,
+  // 3-s mid-jump, 2-5-s trailing tail, PTV-News byte-only render).
+  //
+  // The clean design skips concat demuxer entirely and drives ffmpeg
+  // with one `-i` per covering file + a filter_complex that (a) trims
+  // each input's video and audio to the exact wall-clock slice it
+  // uniquely contributes, then (b) concatenates the trimmed streams
+  // via the concat filter (which respects each input's own PTS zero
+  // — no ambiguity). Overlap between two adjacent files becomes
+  // simple math on the per-file start offset (we skip the portion
+  // that belongs to the previous file), so no bytes are read twice
+  // and no bytes are dropped.
+  //
+  // Single covering file: keep the original input-side -ss/-to path
+  // (already frame-accurate for that case, cheaper, less to break).
+  //
+  // Watermark/scale runs on the concat-filter output as before.
+  // Silent audio fallback is still appended as the last input.
+  interface Slice {
+    file: CoveringFile;
+    /** seconds into file where our slice begins */
+    ssIn: number;
+    /** slice duration in seconds */
+    dur: number;
+  }
   let ffInputArgs: string[];
-  const concatListPath = join(tmpdir(), `clip-concat-${clip.id}.txt`);
+  let perFileVideoConcat: string | null = null;   // filter fragment; null for single-file case
+  let perFileAudioConcat: string | null = null;
+  let sliceCount = 0;
   if (covering.length === 1) {
     ffInputArgs = [...TOLERANCE_IN, '-ss', String(ss), '-to', String(Math.max(ss + 1, to)), '-i', first.path];
   } else {
-    const lines = covering.map((c) => `file '${c.path.replace(/\\/g, '/').replace(/'/g, "'\\''")}'`).join('\n');
-    writeFileSync(concatListPath, lines);
-    ffInputArgs = [
-      ...TOLERANCE_IN,
-      '-f', 'concat', '-safe', '0',
-      '-ss', String(ss), '-to', String(Math.max(ss + 1, to)),
-      '-i', concatListPath,
-    ];
+    // Build a Slice per covering file after respecting overlap with
+    // the previous file: each slice's wall-clock start is
+    //   max(clipStart, prevFileEnd, fileStart)
+    // and wall-clock end is min(clipEnd, fileEnd).
+    const slices: Slice[] = [];
+    let prevWallEnd = 0;   // ms since epoch of the last kept slice's wall-clock end
+    for (const f of covering) {
+      const fileStartMs = f.startedAt.getTime();
+      const fileEndMs   = fileStartMs + SEG_SECONDS * 1000;
+      const sliceStartWallMs = Math.max(clipStartMs, prevWallEnd, fileStartMs);
+      const sliceEndWallMs   = Math.min(clipEndMs, fileEndMs);
+      const sliceDurMs = sliceEndWallMs - sliceStartWallMs;
+      if (sliceDurMs <= 0) continue;   // this file adds nothing after overlap
+      slices.push({
+        file: f,
+        ssIn: (sliceStartWallMs - fileStartMs) / 1000,
+        dur:  sliceDurMs / 1000,
+      });
+      prevWallEnd = sliceEndWallMs;
+    }
+    if (slices.length === 0) {
+      // Should never happen after the covering scan already passed.
+      await prisma.clip.update({ where: { id: clip.id }, data: { status: 'FAILED' } });
+      log.warn({ clipId: clip.id }, 'clip: per-file slicing produced 0 slices');
+      return;
+    }
+    // One -i per slice. Each -i gets its own -ss/-t so the demuxer
+    // only feeds ffmpeg the exact bytes we want. TOLERANCE_IN before
+    // each -i is required per-input in ffmpeg's arg model.
+    ffInputArgs = [];
+    for (const s of slices) {
+      ffInputArgs.push(
+        ...TOLERANCE_IN,
+        '-ss', s.ssIn.toFixed(3),
+        '-t',  s.dur.toFixed(3),
+        '-i',  s.file.path,
+      );
+    }
+    sliceCount = slices.length;
+    // Build the filter fragments — each input i gets a per-stream
+    // setpts/asetpts (so its PTS starts at 0 in the concat filter's
+    // eyes), then all inputs are joined with the concat filter.
+    const vLines: string[] = [];
+    const aLines: string[] = [];
+    for (let i = 0; i < slices.length; i++) {
+      vLines.push(`[${i}:v]setpts=PTS-STARTPTS[v${i}]`);
+      aLines.push(`[${i}:a:0]asetpts=PTS-STARTPTS[a${i}]`);
+    }
+    const vJoin = slices.map((_, i) => `[v${i}]`).join('') + `concat=n=${slices.length}:v=1:a=0[vraw]`;
+    const aJoin = slices.map((_, i) => `[a${i}]`).join('') + `concat=n=${slices.length}:v=0:a=1[outa_src]`;
+    perFileVideoConcat = [...vLines, vJoin].join(';');
+    perFileAudioConcat = [...aLines, aJoin].join(';');
   }
-  log.info({ clipId: clip.id, files: covering.length, span_s: totalSpan, ss, to }, 'clip: covering files located');
+  // Path kept only so the finally's unlinkSync stays valid for the
+  // single-file path (which never wrote it anyway — safely no-ops).
+  // Multi-slice path skips concat demuxer entirely, so also no-op.
+  const concatListPath = join(tmpdir(), `clip-concat-${clip.id}.txt`);
+  void concatListPath;
+  log.info({
+    clipId: clip.id,
+    files: covering.length,
+    span_s: totalSpan, ss, to,
+    slices: sliceCount || 'single',
+  }, 'clip: covering files located');
 
   // Watermark text — email + timestamp — flattened + ASCII-safe.
   const wmRaw = (clip.watermarkText ?? '').replace(/'/g, '');
@@ -1092,21 +1176,48 @@ async function clipWorker(job: { clipId: string }) {
     const scalePrefix = (w > 0 && h > 0)
       ? `scale=${w}:${h}:flags=lanczos`
       : 'null';
-    const mainFilter: string[] = [`[0:v]${scalePrefix}[outv]`];
+    // Two shapes for the filter graph:
+    //   Single-file: [0:v] scale [outv]. Audio is untouched — the
+    //     single-file input-side -ss/-to is already frame-accurate.
+    //   Multi-slice: per-file trim + concat filter builds [vraw] and
+    //     [outa_src], then we scale [vraw] into [outv]. Every source
+    //     stream's PTS is rebased to 0 before concat so the filter
+    //     never confuses one file's timeline with another's.
+    const mainFilter: string[] = [];
+    if (perFileVideoConcat && perFileAudioConcat) {
+      mainFilter.push(perFileVideoConcat);
+      mainFilter.push(perFileAudioConcat);
+      mainFilter.push(`[vraw]${scalePrefix}[outv]`);
+    } else {
+      mainFilter.push(`[0:v]${scalePrefix}[outv]`);
+    }
 
     const mainArgs: string[] = [
       '-hide_banner', '-loglevel', 'warning',
       ...ffInputArgs,
-      // Silent audio fallback — mapped only if source has no audio.
+      // Silent audio fallback — used only if source audio wasn't
+      // mapped. For the multi-slice path, [outa_src] carries the
+      // trimmed+concatenated real audio; for single-file, 0:a:0?
+      // carries it. Either way this input is a belt-and-suspenders
+      // stream so the mux never runs dry on audio.
       '-f', 'lavfi', '-t', String(duration + 1), '-i', 'anullsrc=r=48000:cl=stereo',
     ];
     // Branding disabled — PAK_LOGO/ANL_LOGO removed; keep gate false-only path.
     // if (hasBranding) mainArgs.push('-i', PAK_LOGO, '-i', ANL_LOGO);
     void hasBranding;
+    // Silent-audio fallback input's index depends on how many source
+    // inputs we have: single-file = index 1, multi-slice = index N.
+    const silentIdx = perFileVideoConcat ? sliceCount : 1;
+    // Audio map differs by shape:
+    //   Single: 0:a:0? (source, optional) + silent fallback
+    //   Multi:  [outa_src] (trimmed+concat real audio) + silent fallback
+    const audioMap = perFileAudioConcat
+      ? ['-map', '[outa_src]', '-map', `${silentIdx}:a:0`]
+      : ['-map', '0:a:0?', '-map', `${silentIdx}:a:0`];
     mainArgs.push(
       '-filter_complex', mainFilter.join(';'),
       '-map', '[outv]',
-      '-map', '0:a:0?', '-map', '1:a:0',
+      ...audioMap,
       // Authoritative OUTPUT-side duration cap. -ss/-to at input level
       // interact oddly with -filter_complex + -shortest: when the source
       // audio track extends past the requested -to, ffmpeg was letting

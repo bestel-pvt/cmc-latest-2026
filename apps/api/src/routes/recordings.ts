@@ -567,7 +567,23 @@ const routes: FastifyPluginAsync = async (app) => {
         // slice durations.
         lines.push(`#EXT-X-PROGRAM-DATE-TIME:${s.startedAt.toISOString()}`);
       }
-      const durS = s.durationMs / 1000;
+      // CLAMP declared duration to actual wall-clock room before the
+      // next segment (or before the `to` query bound for the last
+      // segment). Prevents the "player says 4:02 but recording is
+      // 2:06" bug where a stale/inflated durationMs (rollover files,
+      // bad probe of mid-write MP4, 24h span accidentally recorded)
+      // makes hls.js compute a timeline longer than the real content
+      // — the operator then marks past the end and the clip window
+      // maps to nothing on disk (2026-09-15 PTV News 25-s clip came
+      // back as 261 B). Real content in the .ts slices doesn't change;
+      // we only trim what the manifest tells the player.
+      let effectiveDurMs = s.durationMs;
+      const nextStartMs = i + 1 < playable.length
+        ? playable[i + 1]!.startedAt.getTime()
+        : to.getTime();
+      const roomMs = nextStartMs - s.startedAt.getTime();
+      if (roomMs > 0 && effectiveDurMs > roomMs) effectiveDurMs = roomMs;
+      const durS = effectiveDurMs / 1000;
       const dir = join(HLS_CACHE, s.id);
       let nSub: number;
       if (existsSync(join(dir, '.ready'))) {

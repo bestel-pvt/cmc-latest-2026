@@ -184,7 +184,14 @@ function channelOutDir(channelId: string, when: Date = new Date()): string {
 // because the source itself isn't friendly to a byte-copy pipeline.
 const RECORDING_TRANSCODE_SLUGS = new Set(
   (process.env.RECORDING_TRANSCODE_SLUGS ??
-    'cnn,365-news,gtv-news,samaa-news,92-news,bol-news,aik-news,ary-news')
+    // 2026-09-16: removed bol-news — its source emits intermittent
+    // SPS/PPS (`non-existing SPS 0 referenced`) and mp3 header holes
+    // that libx264 could not survive; ffmpeg crashed every 30-150 s
+    // and left ~256 KB stubs across the hour, so clips landed on empty
+    // ranges (261-byte renders). `-c copy` tolerates the same input
+    // (verified with a manual ffmpeg run at 79 fps 1.69x speed on the
+    // same multicast) — no re-encode, no crash.
+    'cnn,365-news,gtv-news,samaa-news,92-news,aik-news,ary-news')
     .split(',').map((s) => s.trim()).filter(Boolean),
 );
 // Download / clip target — everything above is about the on-disk
@@ -930,9 +937,26 @@ async function clipWorker(job: { clipId: string }) {
   // Neo/SUNO/Aik 2026-09-08 — user tang aa gaya sunn sunn ke).
   const clipStartMs = clip.startAt.getTime();
   const clipEndMs   = clip.endAt.getTime();
+  // Per-file ACTUAL end (mtime-based) for FINALIZED files only —
+  // a crashed recording ffmpeg leaves stub files 1-5 s long even
+  // though SEG_SECONDS math says "60 s". The singleCover check
+  // used to pick the stub because its declared 60-s window covered
+  // the entire clip range — then ffmpeg -ss/-to read past the
+  // stub's real end and emitted 261 bytes (2026-09-15 PTV News).
+  // Trust mtime only for finalized files (marker `.recorded`
+  // sibling); live files stay at SEG_SECONDS so operators can
+  // clip up to the current write head.
+  const fileRealEndMs = (f: CoveringFile): number => {
+    const startMs = f.startedAt.getTime();
+    const declared = SEG_SECONDS * 1000;
+    if (!existsSync(f.path + '.recorded')) return startMs + declared;
+    const measured = estimateSegmentDurationMs(f.path, f.startedAt);
+    if (measured && measured < declared) return startMs + measured;
+    return startMs + declared;
+  };
   const singleCover = covering.find((f) => {
     const start = f.startedAt.getTime();
-    const end   = start + SEG_SECONDS * 1000;
+    const end   = fileRealEndMs(f);
     return start <= clipStartMs && end >= clipEndMs;
   });
   if (singleCover) {
@@ -1053,22 +1077,50 @@ async function clipWorker(job: { clipId: string }) {
     /** slice duration in seconds */
     dur: number;
   }
+  // Per-file ACTUAL end (mtime-based) — ONLY for FINALIZED files.
+  // A crashed recording ffmpeg can leave a stub file 1-5 s long even
+  // though DB / SEG_SECONDS math says "60 s"; the covering scan picks
+  // that stub for a window past its real content and ffmpeg reads
+  // nothing (2026-09-15 PTV News 25-s clip came back 261 bytes). We
+  // trust mtime-based real length only when the writer has flushed
+  // — signalled by the `.recorded` sibling file. For a file that is
+  // still open (no `.recorded`), mtime is "now" which would produce
+  // a spuriously short duration and reject valid marks on live
+  // recordings — so we fall back to SEG_SECONDS in that case.
+  const realEndMs = (f: CoveringFile): number => {
+    const startMs = f.startedAt.getTime();
+    const declared = SEG_SECONDS * 1000;
+    const finalized = existsSync(f.path + '.recorded');
+    if (!finalized) return startMs + declared;
+    const measured = estimateSegmentDurationMs(f.path, f.startedAt);
+    if (measured && measured < declared) return startMs + measured;
+    return startMs + declared;
+  };
   let ffInputArgs: string[];
   let perFileVideoConcat: string | null = null;   // filter fragment; null for single-file case
   let perFileAudioConcat: string | null = null;
   let sliceCount = 0;
   if (covering.length === 1) {
-    ffInputArgs = [...TOLERANCE_IN, '-ss', String(ss), '-to', String(Math.max(ss + 1, to)), '-i', first.path];
+    // Clamp `to` at the file's real end so ffmpeg never tries to seek
+    // past a truncated stub. `ss` is already relative to first.start.
+    const firstRealEndSec = (realEndMs(first) - first.startedAt.getTime()) / 1000;
+    const clampedTo = Math.min(to, firstRealEndSec);
+    if (clampedTo <= ss + 0.1) {
+      await prisma.clip.update({ where: { id: clip.id }, data: { status: 'FAILED' } });
+      log.warn({ clipId: clip.id, ss, to, firstRealEndSec, path: first.path }, 'clip: covering file too short — mark falls past real content');
+      return;
+    }
+    ffInputArgs = [...TOLERANCE_IN, '-ss', String(ss), '-to', String(Math.max(ss + 1, clampedTo)), '-i', first.path];
   } else {
     // Build a Slice per covering file after respecting overlap with
     // the previous file: each slice's wall-clock start is
     //   max(clipStart, prevFileEnd, fileStart)
-    // and wall-clock end is min(clipEnd, fileEnd).
+    // and wall-clock end is min(clipEnd, fileRealEnd).
     const slices: Slice[] = [];
     let prevWallEnd = 0;   // ms since epoch of the last kept slice's wall-clock end
     for (const f of covering) {
       const fileStartMs = f.startedAt.getTime();
-      const fileEndMs   = fileStartMs + SEG_SECONDS * 1000;
+      const fileEndMs   = realEndMs(f);   // <-- was: fileStartMs + SEG_SECONDS * 1000
       const sliceStartWallMs = Math.max(clipStartMs, prevWallEnd, fileStartMs);
       const sliceEndWallMs   = Math.min(clipEndMs, fileEndMs);
       const sliceDurMs = sliceEndWallMs - sliceStartWallMs;

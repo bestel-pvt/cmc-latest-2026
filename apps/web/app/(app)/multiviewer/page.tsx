@@ -12,7 +12,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useMutation } from '@tanstack/react-query';
 import {
   Maximize2, Minimize2, Save, Trash2, ChevronDown, Search, X,
   Volume2, VolumeX,
@@ -113,32 +113,22 @@ function buildLayouts(): Layout[] {
 const LAYOUTS = buildLayouts();
 
 /* ------------------------------------------------------------------ */
-/* Templates (localStorage)                                           */
+/* Templates (server-persisted via /api/wall-templates)               */
+/*                                                                    */
+/* Moved out of browser localStorage 2026-09-17 — hard refresh /      */
+/* browser restart was wiping saved layouts on the operator's PC.     */
+/* Server DB storage means the same named templates show up on any    */
+/* PC in the Pak Navy operations room.                                */
 /* ------------------------------------------------------------------ */
 
 interface Template {
+  /** DB row id — only present for server-fetched entries; the "save" */
+  /* handler doesn't need it since upsert-by-name is server-side. */
+  id?: string;
   name: string;
   layoutId: Layout['id'];
   /** Slot index (as string) → channel slug */
   slots: Record<string, string>;
-}
-
-const TEMPLATES_KEY = 'cmc-multiviewer-templates:v1';
-
-function loadTemplates(): Template[] {
-  if (typeof window === 'undefined') return [];
-  try {
-    const raw = localStorage.getItem(TEMPLATES_KEY);
-    if (!raw) return [];
-    const arr = JSON.parse(raw);
-    if (Array.isArray(arr)) return arr as Template[];
-  } catch { /* ignore corrupt localStorage */ }
-  return [];
-}
-
-function saveTemplates(list: Template[]): void {
-  if (typeof window === 'undefined') return;
-  localStorage.setItem(TEMPLATES_KEY, JSON.stringify(list));
 }
 
 /* ------------------------------------------------------------------ */
@@ -156,7 +146,6 @@ interface Channel {
 export default function MultiviewerPage() {
   const [layoutId, setLayoutId] = useState<Layout['id']>('mosaic');
   const [assignments, setAssignments] = useState<Record<string, string>>({});
-  const [templates, setTemplates] = useState<Template[]>([]);
   const [pickerSlotIdx, setPickerSlotIdx] = useState<number | null>(null);
   const [saveDialogOpen, setSaveDialogOpen] = useState(false);
   const [templateName, setTemplateName] = useState('');
@@ -194,8 +183,27 @@ export default function MultiviewerPage() {
     return m;
   }, [channels]);
 
-  // Load templates once on mount.
-  useEffect(() => { setTemplates(loadTemplates()); }, []);
+  // Server-persisted templates. Refetches invalidate on save/delete so
+  // the row list updates immediately after mutations.
+  const templatesQuery = useQuery<Template[]>({
+    queryKey: ['wall-templates'],
+    queryFn: async () => api<Template[]>('/api/wall-templates'),
+  });
+  const templates = templatesQuery.data ?? [];
+  const saveTemplateMutation = useMutation({
+    // NOTE: api util already sets Content-Type + JSON.stringify's the
+    // body when it's an object. Passing JSON.stringify(t) here would
+    // double-stringify and the server would parse `body.name` as
+    // undefined ("name required" 400).
+    mutationFn: (t: Omit<Template, 'id'>) => api<Template>('/api/wall-templates', {
+      method: 'POST', body: t,
+    }),
+    onSuccess: () => { templatesQuery.refetch(); },
+  });
+  const deleteTemplateMutation = useMutation({
+    mutationFn: (id: string) => api(`/api/wall-templates/${id}`, { method: 'DELETE' }),
+    onSuccess: () => { templatesQuery.refetch(); },
+  });
 
   // Track browser fullscreen state (Esc / F11 exit needs a listener).
   useEffect(() => {
@@ -227,20 +235,48 @@ export default function MultiviewerPage() {
   const handleSaveTemplate = useCallback(() => {
     const name = templateName.trim();
     if (!name) return;
-    const t: Template = { name, layoutId, slots: { ...assignments } };
-    const next = [...templates.filter((x) => x.name !== name), t]
-      .sort((a, b) => a.name.localeCompare(b.name));
-    setTemplates(next);
-    saveTemplates(next);
-    setTemplateName('');
-    setSaveDialogOpen(false);
-  }, [templateName, layoutId, assignments, templates]);
+    saveTemplateMutation.mutate(
+      { name, layoutId, slots: { ...assignments } },
+      {
+        onSuccess: () => {
+          toast.success(`Template "${name}" saved`);
+          setTemplateName('');
+          setSaveDialogOpen(false);
+        },
+        onError: (e) => toast.error(e instanceof Error ? e.message : 'Save failed'),
+      },
+    );
+  }, [templateName, layoutId, assignments, saveTemplateMutation]);
 
-  const handleDeleteTemplate = useCallback((name: string) => {
-    const next = templates.filter((x) => x.name !== name);
-    setTemplates(next);
-    saveTemplates(next);
-  }, [templates]);
+  const handleDeleteTemplate = useCallback((id: string | undefined, name: string) => {
+    if (!id) return;
+    deleteTemplateMutation.mutate(id, {
+      onSuccess: () => toast.success(`Template "${name}" deleted`),
+      onError: (e) => toast.error(e instanceof Error ? e.message : 'Delete failed'),
+    });
+  }, [deleteTemplateMutation]);
+
+  /** Auto-fill: assign the first N active channels (in the loaded
+   *  order — API returns them alphabetically by name) into the
+   *  layout's N slots. Skips channels already present in the
+   *  assignments so the operator can pre-pin a few tiles and use
+   *  auto-fill for the rest. */
+  const handleAutoFill = useCallback(() => {
+    const active = (channels ?? []).filter((c) => c.active !== false);
+    if (active.length === 0) { toast.error('No active channels to fill'); return; }
+    const already = new Set(Object.values(assignments));
+    const pool = active.filter((c) => !already.has(c.slug));
+    const next = { ...assignments };
+    let poolIdx = 0;
+    for (let i = 0; i < layout.slots.length; i++) {
+      if (next[String(i)]) continue;   // keep operator's existing pins
+      if (poolIdx >= pool.length) break;   // ran out of unique channels
+      next[String(i)] = pool[poolIdx]!.slug;
+      poolIdx++;
+    }
+    setAssignments(next);
+    toast.success(`Auto-filled ${poolIdx} tile${poolIdx === 1 ? '' : 's'}`);
+  }, [channels, assignments, layout]);
 
   const toggleFullscreen = useCallback(() => {
     const el = wallRef.current;
@@ -381,6 +417,16 @@ export default function MultiviewerPage() {
           <Save className="h-3.5 w-3.5 mr-1" /> Save as template
         </Button>
 
+        <Button
+          variant="secondary"
+          size="sm"
+          onClick={handleAutoFill}
+          className="h-7"
+          title="Fill empty tiles with active channels (existing pins kept)"
+        >
+          Auto-fill
+        </Button>
+
         <div className="ml-auto flex items-center gap-2">
           {audioSlotIdx !== null ? (
             <div
@@ -508,7 +554,7 @@ function TemplateDropdown({
 }: {
   templates: Template[];
   onApply: (t: Template) => void;
-  onDelete: (name: string) => void;
+  onDelete: (id: string | undefined, name: string) => void;
 }) {
   const [open, setOpen] = useState(false);
   return (
@@ -539,7 +585,7 @@ function TemplateDropdown({
                 </div>
               </button>
               <button
-                onClick={(e) => { e.stopPropagation(); onDelete(t.name); }}
+                onClick={(e) => { e.stopPropagation(); onDelete(t.id, t.name); }}
                 className="p-1 text-muted hover:text-accent-red opacity-0 group-hover:opacity-100"
                 title="Delete template"
               >

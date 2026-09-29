@@ -31,6 +31,7 @@ import clipsRoutes from './routes/clips.js';
 import usersRoutes from './routes/users.js';
 import auditRoutes from './routes/audit.js';
 import dashboardRoutes from './routes/dashboard.js';
+import wallTemplatesRoutes from './routes/wall-templates.js';
 // Removed in Phase 3.1.5 — CMC has no user-facing settings (change-
 // password lives under /api/auth), no legal-holds workflow, no
 // desktop-viewer downloads. Files kept in the repo for now in case a
@@ -86,6 +87,7 @@ async function main() {
   await app.register(clipsRoutes,       { prefix: '/api/clips' });
   await app.register(usersRoutes,       { prefix: '/api/users' });
   await app.register(auditRoutes,       { prefix: '/api/audit' });
+  await app.register(wallTemplatesRoutes, { prefix: '/api/wall-templates' });
 
   // Live HLS static-file serving.
   // services/live-hls writes per-channel `<HLS_DIR>/<slug>/live.m3u8` +

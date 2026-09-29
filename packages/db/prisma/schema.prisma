@@ -551,3 +551,22 @@ model AIFeedback {
   @@index([kind, ranAt])
   @@index([channelId, kind, ranAt])
 }
+
+/// Saved multiviewer wall layouts + tile → channel-slug assignments.
+/// Shared across all operators — the Pak Navy team is small and
+/// typically works from a common set of named layouts (e.g. "Prime
+/// News", "PTV suite", "English feeds"). Moved out of browser
+/// localStorage 2026-09-17 because hard refresh / browser restart
+/// was clearing it.
+model WallTemplate {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  /// LAYOUTS[].id from the multiviewer page (single | dual | grid4 | grid8 | mosaic | grid32)
+  layoutId  String
+  /// slot-index (as string, "0".."31") → channel slug
+  slots     Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([updatedAt])
+}

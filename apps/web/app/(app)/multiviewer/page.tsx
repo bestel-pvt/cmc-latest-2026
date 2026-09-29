@@ -143,9 +143,31 @@ interface Channel {
   active?: boolean;
 }
 
+/**
+ * Initial wall state is restored from the URL query string so a
+ * full page reload (R key) puts the operator back on the exact
+ * same layout + tile assignments they had — the point of R now
+ * is to nuke Chrome's accumulated MSE buffers / GPU decode
+ * contexts (which a JS re-mount CAN'T free), so we do a real
+ * `location.reload()` and hydrate from `?layout=…&a=…`.
+ */
+function readUrlState(): { layoutId: Layout['id']; assignments: Record<string, string> } {
+  if (typeof window === 'undefined') return { layoutId: 'mosaic', assignments: {} };
+  try {
+    const q = new URLSearchParams(window.location.search);
+    const l = q.get('layout') as Layout['id'] | null;
+    const layoutId = LAYOUTS.find((x) => x.id === l) ? (l as Layout['id']) : 'mosaic';
+    const aRaw = q.get('a');
+    const assignments = aRaw ? JSON.parse(decodeURIComponent(aRaw)) as Record<string, string> : {};
+    return { layoutId, assignments };
+  } catch {
+    return { layoutId: 'mosaic', assignments: {} };
+  }
+}
+
 export default function MultiviewerPage() {
-  const [layoutId, setLayoutId] = useState<Layout['id']>('mosaic');
-  const [assignments, setAssignments] = useState<Record<string, string>>({});
+  const [layoutId, setLayoutId] = useState<Layout['id']>(() => readUrlState().layoutId);
+  const [assignments, setAssignments] = useState<Record<string, string>>(() => readUrlState().assignments);
   const [pickerSlotIdx, setPickerSlotIdx] = useState<number | null>(null);
   const [saveDialogOpen, setSaveDialogOpen] = useState(false);
   const [templateName, setTemplateName] = useState('');
@@ -210,6 +232,51 @@ export default function MultiviewerPage() {
     const on = () => setIsFullscreen(!!document.fullscreenElement);
     document.addEventListener('fullscreenchange', on);
     return () => document.removeEventListener('fullscreenchange', on);
+  }, []);
+
+  // Push layout + assignments to the URL every time they change, so a
+  // full page reload (R key) hydrates back to the exact same wall.
+  // Uses replaceState — no navigation entry per keypress, no history
+  // clutter. `a=` is JSON-encoded; small enough for even a 32-tile
+  // full-slug map (< 1.5 KB) which browsers accept fine.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const q = new URLSearchParams();
+    q.set('layout', layoutId);
+    if (Object.keys(assignments).length > 0) {
+      q.set('a', encodeURIComponent(JSON.stringify(assignments)));
+    }
+    const next = window.location.pathname + '?' + q.toString();
+    if (next !== window.location.pathname + window.location.search) {
+      window.history.replaceState({}, '', next);
+    }
+  }, [layoutId, assignments]);
+
+  // Fullscreen auto-restore after R-key reload.
+  // Chrome forbids requestFullscreen() without a user gesture, so we
+  // can't just call it on mount. Trick: stamp sessionStorage with a
+  // "was fullscreen at reload time" flag; after reload, the first
+  // keypress or click on the page silently promotes to fullscreen.
+  // Operator sees no prompt — R press is itself the gesture that
+  // restores fullscreen on the fresh page.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (sessionStorage.getItem('cmc-wall-was-fs') !== '1') return;
+    const restore = () => {
+      const el = wallRef.current;
+      if (el && !document.fullscreenElement) {
+        el.requestFullscreen().catch(() => { /* silently ok — operator can F11 */ });
+      }
+      sessionStorage.removeItem('cmc-wall-was-fs');
+      window.removeEventListener('keydown', restore);
+      window.removeEventListener('click', restore);
+    };
+    window.addEventListener('keydown', restore);
+    window.addEventListener('click', restore);
+    return () => {
+      window.removeEventListener('keydown', restore);
+      window.removeEventListener('click', restore);
+    };
   }, []);
 
   const assignSlot = useCallback((idx: number, slug: string | null) => {
@@ -312,10 +379,22 @@ export default function MultiviewerPage() {
     });
   }, []);
 
-  /** Always-on: `r` (or `R`) refreshes every tile — unmount+remount
-   *  every HlsTile so hls.js drops any latched failure and reconnects
-   *  fresh. Works in fullscreen too. Ignores modifier combos so
-   *  browser shortcuts like Ctrl-R for a full page reload still fire. */
+  /** Always-on: `r` (or `R`) → full page reload.
+   *
+   *  Upgraded 2026-09-29 from a JS-level HlsTile re-mount to a real
+   *  `window.location.reload()`. Motivation: a re-mount only rebuilds
+   *  the JavaScript hls.js instance, but Chrome's MSE source buffers,
+   *  GPU decode contexts and renderer-process memory (the things that
+   *  make 24×7 walls blink after many hours) are NOT freed by JS
+   *  unmount — only a process/renderer restart frees them, which is
+   *  what a page reload triggers. Layout + assignments already sync
+   *  to the URL (see the replaceState effect above) so reload puts
+   *  the operator back on the exact same wall. Fullscreen is
+   *  restored by the sessionStorage-flagged listener above.
+   *
+   *  Ignores modifier combos so browser shortcuts (Ctrl-R, F5) still
+   *  do the browser's own thing.
+   */
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement | null)?.tagName;
@@ -323,8 +402,10 @@ export default function MultiviewerPage() {
       if (e.ctrlKey || e.metaKey || e.altKey) return;
       if (e.key === 'r' || e.key === 'R') {
         e.preventDefault();
-        setRefreshTick((t) => t + 1);
-        toast.success('Wall refreshed');
+        if (document.fullscreenElement) {
+          sessionStorage.setItem('cmc-wall-was-fs', '1');
+        }
+        window.location.reload();
       }
     };
     window.addEventListener('keydown', onKey);

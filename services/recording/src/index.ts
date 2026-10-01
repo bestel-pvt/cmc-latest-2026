@@ -1248,6 +1248,15 @@ async function clipWorker(job: { clipId: string }) {
         const outPath = join(workDir, `slice-${String(i).padStart(5, '0')}.mp4`);
         const sliceArgs: string[] = [
           '-hide_banner', '-loglevel', 'warning',
+          // Cap encoder threads so the mezzanine spawn can't eat
+          // every core. Default libx264 (-threads 0) spreads across
+          // all logical CPUs and would spike this box's load every
+          // ~3-5 s per slice for ~5 min on a 1-hour clip; live-hls
+          // and recording ingest would then fall behind in sync.
+          // 4 threads is enough for a 480p veryfast encode to run
+          // at >10× real-time on this box while leaving the rest
+          // of the fleet unaffected.
+          '-threads', '4',
           ...TOLERANCE_IN,
           '-ss', s.ssIn.toFixed(3),
           '-i', s.file.path,

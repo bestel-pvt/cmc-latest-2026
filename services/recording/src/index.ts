@@ -1151,14 +1151,25 @@ async function clipWorker(job: { clipId: string }) {
       );
     }
     sliceCount = slices.length;
-    // Build the filter fragments — each input i gets a per-stream
-    // setpts/asetpts (so its PTS starts at 0 in the concat filter's
-    // eyes), then all inputs are joined with the concat filter.
+    // Build the filter fragments — each input i gets per-stream
+    // trim+setpts: trim/atrim force BOTH video and audio to emit
+    // EXACTLY `dur` seconds, then setpts/asetpts rebase to zero so
+    // the concat filter stitches cleanly.
+    //
+    // Why trim-at-filter instead of just input -t: input-side -ss
+    // is keyframe-aligned on video and AAC-frame-aligned on audio
+    // (~21 ms granularity each, independent). Without a filter-side
+    // duration lock, each slice's video and audio can drift by up
+    // to one keyframe-vs-AAC-frame skew (~20–40 ms per slice). Over
+    // 60+ slices (a 1-hour clip = ~63 60-s files) this snowballs
+    // into >1 s audible drift. trim/atrim with the SAME duration
+    // on both streams closes that gap at every slice boundary.
     const vLines: string[] = [];
     const aLines: string[] = [];
     for (let i = 0; i < slices.length; i++) {
-      vLines.push(`[${i}:v]setpts=PTS-STARTPTS[v${i}]`);
-      aLines.push(`[${i}:a:0]asetpts=PTS-STARTPTS[a${i}]`);
+      const d = slices[i]!.dur.toFixed(3);
+      vLines.push(`[${i}:v]trim=duration=${d},setpts=PTS-STARTPTS[v${i}]`);
+      aLines.push(`[${i}:a:0]atrim=duration=${d},asetpts=PTS-STARTPTS[a${i}]`);
     }
     const vJoin = slices.map((_, i) => `[v${i}]`).join('') + `concat=n=${slices.length}:v=1:a=0[vraw]`;
     // aresample=async=1000:first_pts=0 after concat compensates sub-frame

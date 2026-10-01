@@ -1161,7 +1161,14 @@ async function clipWorker(job: { clipId: string }) {
       aLines.push(`[${i}:a:0]asetpts=PTS-STARTPTS[a${i}]`);
     }
     const vJoin = slices.map((_, i) => `[v${i}]`).join('') + `concat=n=${slices.length}:v=1:a=0[vraw]`;
-    const aJoin = slices.map((_, i) => `[a${i}]`).join('') + `concat=n=${slices.length}:v=0:a=1[outa_src]`;
+    // aresample=async=1000:first_pts=0 after concat compensates sub-frame
+    // audio-PTS skew at every slice boundary. Each AAC frame is 1024
+    // samples @ 48 kHz = ~21 ms; input-side -ss can only snap to the
+    // nearest AAC frame, so a 5-slice clip accumulates up to ~100 ms of
+    // audio-vs-video drift that becomes clearly audible in long clips.
+    // The async resampler stretches/compresses sample timing to keep
+    // audio locked to the concat-filter's output clock.
+    const aJoin = slices.map((_, i) => `[a${i}]`).join('') + `concat=n=${slices.length}:v=0:a=1,aresample=async=1000:first_pts=0[outa_src]`;
     perFileVideoConcat = [...vLines, vJoin].join(';');
     perFileAudioConcat = [...aLines, aJoin].join(';');
   }
@@ -1285,6 +1292,13 @@ async function clipWorker(job: { clipId: string }) {
       // segment). No compress-below-source regression possible.
       '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', vBitrate,
       '-maxrate', vMaxrate, '-bufsize', vBufsize,
+      // Force constant-rate output (PAL 25 fps) — Pakistani broadcast is
+      // 25 fps PAL; source TS can carry sub-frame PTS jitter (VFR) that
+      // the mp4 muxer preserves, letting audio drift away from video
+      // over multi-minute clips. CFR locks every frame to a 40 ms grid,
+      // and aresample=async on the audio side (above) keeps samples
+      // locked to that same grid.
+      '-fps_mode', 'cfr', '-r', '25',
       '-c:a', 'aac', '-b:a', A_BITRATE, '-ac', '2', '-ar', '48000',
       ...(isMovLike ? ['-movflags', '+faststart'] : []),
       '-y', mainPath,

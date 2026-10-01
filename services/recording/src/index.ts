@@ -1100,6 +1100,7 @@ async function clipWorker(job: { clipId: string }) {
   let perFileVideoConcat: string | null = null;   // filter fragment; null for single-file case
   let perFileAudioConcat: string | null = null;
   let sliceCount = 0;
+  const concatListPath = join(tmpdir(), `clip-concat-${clip.id}.txt`);
   if (covering.length === 1) {
     // Clamp `to` at the file's real end so ffmpeg never tries to seek
     // past a truncated stub. `ss` is already relative to first.start.
@@ -1138,62 +1139,44 @@ async function clipWorker(job: { clipId: string }) {
       log.warn({ clipId: clip.id }, 'clip: per-file slicing produced 0 slices');
       return;
     }
-    // One -i per slice. Each -i gets its own -ss/-t so the demuxer
-    // only feeds ffmpeg the exact bytes we want. TOLERANCE_IN before
-    // each -i is required per-input in ffmpeg's arg model.
-    ffInputArgs = [];
-    for (const s of slices) {
-      ffInputArgs.push(
-        ...TOLERANCE_IN,
-        '-ss', s.ssIn.toFixed(3),
-        '-t',  s.dur.toFixed(3),
-        '-i',  s.file.path,
-      );
-    }
     sliceCount = slices.length;
-    // Build the filter fragments — each slice gets forced into a
-    // perfectly uniform, drift-proof shape before concat:
+    // Multi-slice path: ffconcat demuxer with inpoint/outpoint per file.
     //
-    //   Video: trim to EXACTLY `dur` seconds → rebase PTS → force
-    //          25 fps CFR via `fps` filter. Every slice emits
-    //          exactly dur*25 frames on a 40 ms grid.
+    // Why the filter_complex-concat approach failed (3 iterations):
+    // Every per-slice `-ss` snapped the video demuxer to its nearest
+    // keyframe (~40 ms grain) and the audio demuxer to its nearest AAC
+    // frame (~21 ms grain) — INDEPENDENT grains. Rebasing each stream
+    // separately with setpts/asetpts then placed each slice's video
+    // "zero" at a different wall-clock moment than that slice's audio
+    // "zero". Over 60+ slices (1-hour clip) the per-slice skew summed
+    // to seconds of audible desync — exactly what we saw in the
+    // PTV News DG ISPR 3800-s clip (drift at 2:00, 41-s silence at
+    // 53:32 whose END shifted but could never be aligned by a filter).
     //
-    //   Audio: trim to EXACTLY `dur` seconds → rebase PTS → resample
-    //          to 48 kHz stereo (locked format for concat) → `apad`
-    //          to a WHOLE duration of `dur`. apad guarantees the
-    //          stream reaches exactly `dur` seconds even when the
-    //          source audio dropped out mid-slice (padding with
-    //          silence) — this is how we eliminate the "no audio
-    //          for 41 s in the middle" symptom reported on long
-    //          clips.
-    //
-    // With both streams forced to the same `dur` on the same CFR
-    // grid, concat has zero timing slack to accumulate across
-    // slices. A/V stays locked across 60+ slices.
-    const vLines: string[] = [];
-    const aLines: string[] = [];
-    for (let i = 0; i < slices.length; i++) {
-      const d = slices[i]!.dur.toFixed(3);
-      vLines.push(`[${i}:v]trim=duration=${d},setpts=PTS-STARTPTS,fps=25[v${i}]`);
-      aLines.push(`[${i}:a:0]atrim=duration=${d},asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=stereo,apad=whole_dur=${d}[a${i}]`);
+    // Concat demuxer solves this at a lower layer: it reads the mp4
+    // segments at DEMUX time, applies inpoint/outpoint keyed to the
+    // files' decode timestamps, and splices them into a single
+    // contiguous PTS timeline BEFORE any decoding. Audio and video
+    // ride the SAME demuxer clock the entire way through — there is
+    // no per-stream PTS reset step for a skew to leak into.
+    const concatLines = ['ffconcat version 1.0'];
+    for (const s of slices) {
+      // ffconcat parses POSIX-style paths; backslashes on Windows get
+      // treated as escape chars. CMC paths never contain quotes but
+      // we escape defensively just in case.
+      const p = s.file.path.replace(/\\/g, '/').replace(/'/g, "'\\''");
+      concatLines.push(`file '${p}'`);
+      concatLines.push(`inpoint ${s.ssIn.toFixed(3)}`);
+      concatLines.push(`outpoint ${(s.ssIn + s.dur).toFixed(3)}`);
     }
-    const vJoin = slices.map((_, i) => `[v${i}]`).join('') + `concat=n=${slices.length}:v=1:a=0[vraw]`;
-    // aresample=async=1000:first_pts=0 after concat compensates sub-frame
-    // audio-PTS skew at every slice boundary. Each AAC frame is 1024
-    // samples @ 48 kHz = ~21 ms; input-side -ss can only snap to the
-    // nearest AAC frame, so a 5-slice clip accumulates up to ~100 ms of
-    // audio-vs-video drift that becomes clearly audible in long clips.
-    // The async resampler stretches/compresses sample timing to keep
-    // audio locked to the concat-filter's output clock.
-    const aJoin = slices.map((_, i) => `[a${i}]`).join('') + `concat=n=${slices.length}:v=0:a=1,aresample=async=1000:first_pts=0[outa_src]`;
-    perFileVideoConcat = [...vLines, vJoin].join(';');
-    perFileAudioConcat = [...aLines, aJoin].join(';');
+    writeFileSync(concatListPath, concatLines.join('\n') + '\n', 'utf8');
+    ffInputArgs = [...TOLERANCE_IN, '-f', 'concat', '-safe', '0', '-i', concatListPath];
+    // perFileVideoConcat / perFileAudioConcat stay null — the main
+    // filter graph then falls through to the single-input shape
+    // ([0:v] scale [outv] + -map 0:a:0?), identical to the single-
+    // file path. -fps_mode cfr -r 25 on the encoder still locks
+    // output to a 25-fps grid for belt-and-suspenders CFR safety.
   }
-  // Path kept only so the finally's unlinkSync stays valid for the
-  // single-file path (which never wrote it anyway — safely no-ops).
-  // Multi-slice path skips concat demuxer entirely, so also no-op.
-  const concatListPath = join(tmpdir(), `clip-concat-${clip.id}.txt`);
-  void concatListPath;
   log.info({
     clipId: clip.id,
     files: covering.length,

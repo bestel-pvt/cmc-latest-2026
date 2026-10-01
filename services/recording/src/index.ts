@@ -1096,10 +1096,8 @@ async function clipWorker(job: { clipId: string }) {
     if (measured && measured < declared) return startMs + measured;
     return startMs + declared;
   };
-  let ffInputArgs: string[];
-  let perFileVideoConcat: string | null = null;   // filter fragment; null for single-file case
-  let perFileAudioConcat: string | null = null;
-  let sliceCount = 0;
+  let ffInputArgs: string[] = [];           // only used in single-file path
+  const slices: Slice[] = [];                // populated only in multi-slice path
   const concatListPath = join(tmpdir(), `clip-concat-${clip.id}.txt`);
   if (covering.length === 1) {
     // Clamp `to` at the file's real end so ffmpeg never tries to seek
@@ -1117,15 +1115,14 @@ async function clipWorker(job: { clipId: string }) {
     // the previous file: each slice's wall-clock start is
     //   max(clipStart, prevFileEnd, fileStart)
     // and wall-clock end is min(clipEnd, fileRealEnd).
-    const slices: Slice[] = [];
     let prevWallEnd = 0;   // ms since epoch of the last kept slice's wall-clock end
     for (const f of covering) {
       const fileStartMs = f.startedAt.getTime();
-      const fileEndMs   = realEndMs(f);   // <-- was: fileStartMs + SEG_SECONDS * 1000
+      const fileEndMs   = realEndMs(f);
       const sliceStartWallMs = Math.max(clipStartMs, prevWallEnd, fileStartMs);
       const sliceEndWallMs   = Math.min(clipEndMs, fileEndMs);
       const sliceDurMs = sliceEndWallMs - sliceStartWallMs;
-      if (sliceDurMs <= 0) continue;   // this file adds nothing after overlap
+      if (sliceDurMs <= 0) continue;
       slices.push({
         file: f,
         ssIn: (sliceStartWallMs - fileStartMs) / 1000,
@@ -1134,49 +1131,16 @@ async function clipWorker(job: { clipId: string }) {
       prevWallEnd = sliceEndWallMs;
     }
     if (slices.length === 0) {
-      // Should never happen after the covering scan already passed.
       await prisma.clip.update({ where: { id: clip.id }, data: { status: 'FAILED' } });
       log.warn({ clipId: clip.id }, 'clip: per-file slicing produced 0 slices');
       return;
     }
-    sliceCount = slices.length;
-    // Multi-slice path: ffconcat demuxer with inpoint/outpoint per file.
-    //
-    // Why the filter_complex-concat approach failed (3 iterations):
-    // Every per-slice `-ss` snapped the video demuxer to its nearest
-    // keyframe (~40 ms grain) and the audio demuxer to its nearest AAC
-    // frame (~21 ms grain) — INDEPENDENT grains. Rebasing each stream
-    // separately with setpts/asetpts then placed each slice's video
-    // "zero" at a different wall-clock moment than that slice's audio
-    // "zero". Over 60+ slices (1-hour clip) the per-slice skew summed
-    // to seconds of audible desync — exactly what we saw in the
-    // PTV News DG ISPR 3800-s clip (drift at 2:00, 41-s silence at
-    // 53:32 whose END shifted but could never be aligned by a filter).
-    //
-    // Concat demuxer solves this at a lower layer: it reads the mp4
-    // segments at DEMUX time, applies inpoint/outpoint keyed to the
-    // files' decode timestamps, and splices them into a single
-    // contiguous PTS timeline BEFORE any decoding. Audio and video
-    // ride the SAME demuxer clock the entire way through — there is
-    // no per-stream PTS reset step for a skew to leak into.
-    const concatLines = ['ffconcat version 1.0'];
-    for (const s of slices) {
-      // ffconcat parses POSIX-style paths; backslashes on Windows get
-      // treated as escape chars. CMC paths never contain quotes but
-      // we escape defensively just in case.
-      const p = s.file.path.replace(/\\/g, '/').replace(/'/g, "'\\''");
-      concatLines.push(`file '${p}'`);
-      concatLines.push(`inpoint ${s.ssIn.toFixed(3)}`);
-      concatLines.push(`outpoint ${(s.ssIn + s.dur).toFixed(3)}`);
-    }
-    writeFileSync(concatListPath, concatLines.join('\n') + '\n', 'utf8');
-    ffInputArgs = [...TOLERANCE_IN, '-f', 'concat', '-safe', '0', '-i', concatListPath];
-    // perFileVideoConcat / perFileAudioConcat stay null — the main
-    // filter graph then falls through to the single-input shape
-    // ([0:v] scale [outv] + -map 0:a:0?), identical to the single-
-    // file path. -fps_mode cfr -r 25 on the encoder still locks
-    // output to a 25-fps grid for belt-and-suspenders CFR safety.
+    // No ffInputArgs built here — the multi-slice path renders each
+    // slice to its own mezzanine mp4 inside the try block below, then
+    // stitches them with concat demuxer in `-c copy` mode. See the
+    // mezzanine block in the try/catch for details.
   }
+  const sliceCount = slices.length;
   log.info({
     clipId: clip.id,
     files: covering.length,
@@ -1219,96 +1183,114 @@ async function clipWorker(job: { clipId: string }) {
   const mainPath = join(workDir, `main.${clip.format.toLowerCase()}`);
 
   try {
-    // ============================================================ Pass 1: main
-    // Clean video with just a discreet chain-of-custody watermark
-    // strip at the bottom (user email + timestamp). No PAK NAVY /
-    // Analysys logos anywhere — the operator asked for un-branded
-    // exports.
-    void FONT_BOLD;   // unused now (was for PAK NAVY corner text)
-    // Watermark strip removed 2026-08-25 per operator request. Kept
-    // wm/FONT_* references live above so a future re-enable is a
-    // one-line change back.
-    void wm; void FONT_REG;
-    // Pure stretch — same as ingest. No pillars, no letterbox. If the
-    // source is already this exact size the scaler is essentially a
-    // no-op, no quality loss.
+    void FONT_BOLD; void wm; void FONT_REG; void hasBranding;
     const scalePrefix = (w > 0 && h > 0)
       ? `scale=${w}:${h}:flags=lanczos`
       : 'null';
-    // Two shapes for the filter graph:
-    //   Single-file: [0:v] scale [outv]. Audio is untouched — the
-    //     single-file input-side -ss/-to is already frame-accurate.
-    //   Multi-slice: per-file trim + concat filter builds [vraw] and
-    //     [outa_src], then we scale [vraw] into [outv]. Every source
-    //     stream's PTS is rebased to 0 before concat so the filter
-    //     never confuses one file's timeline with another's.
-    const mainFilter: string[] = [];
-    if (perFileVideoConcat && perFileAudioConcat) {
-      mainFilter.push(perFileVideoConcat);
-      mainFilter.push(perFileAudioConcat);
-      mainFilter.push(`[vraw]${scalePrefix}[outv]`);
+
+    if (slices.length === 0) {
+      // ======================================= Single-file path (unchanged)
+      // The input-side -ss/-to on a single mp4 is already frame-accurate;
+      // one filter_complex pass handles scale + encode cleanly.
+      const mainArgs: string[] = [
+        '-hide_banner', '-loglevel', 'warning',
+        ...ffInputArgs,
+        '-f', 'lavfi', '-t', String(duration + 1), '-i', 'anullsrc=r=48000:cl=stereo',
+        '-filter_complex', `[0:v]${scalePrefix}[outv]`,
+        '-map', '[outv]',
+        '-map', '0:a:0?', '-map', '1:a:0',
+        '-t', String(duration),
+        '-shortest',
+        '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', vBitrate,
+        '-maxrate', vMaxrate, '-bufsize', vBufsize,
+        '-fps_mode', 'cfr', '-r', '25',
+        '-c:a', 'aac', '-b:a', A_BITRATE, '-ac', '2', '-ar', '48000',
+        ...(isMovLike ? ['-movflags', '+faststart'] : []),
+        '-y', mainPath,
+      ];
+      log.info({ clipId: clip.id }, 'ffmpeg single-file render');
+      await runFfmpeg(mainArgs, 'main');
     } else {
-      mainFilter.push(`[0:v]${scalePrefix}[outv]`);
+      // ======================================= Multi-slice mezzanine path
+      //
+      // Rewrite 2026-10-01 (4th attempt at the drift fix). Earlier
+      // approaches shared one ffmpeg process across all slices:
+      //   - filter_complex concat with setpts/asetpts rebase
+      //   - filter_complex concat + trim/atrim + fps=25 + apad
+      //   - ffconcat demuxer with inpoint/outpoint
+      //
+      // Each failed differently. The filter-concat approaches drifted
+      // because per-slice input `-ss` was keyframe-aligned on video
+      // and AAC-frame-aligned on audio (independent grains), so each
+      // slice's "zero" was at a different wall-clock skew — summing
+      // to seconds of drift over 60+ slices. The ffconcat demuxer
+      // approach choked on PTV News mp3-in-mp4 segments ("Header
+      // missing" at every slice boundary).
+      //
+      // Mezzanine render side-steps all of this:
+      //   1. Render each slice to its own self-contained mp4 with
+      //      uniform codec params (libx264 CFR 25 fps + AAC 48 kHz
+      //      stereo, scaled to final resolution, exact duration).
+      //      Each mezzanine is a complete, standards-compliant file;
+      //      the odd mp3-in-mp4 audio is transcoded away.
+      //   2. ffconcat demuxer in `-c copy` mode stitches the
+      //      mezzanines byte-level with no decoding, so there's no
+      //      filter graph for a skew to leak into.
+      //
+      // Cost: 64 ffmpeg spawns for a 1-hour clip (vs 1 before). Each
+      // mezzanine is a 60-s encode at veryfast → ~3-5 s wall time
+      // each on this box, so ~5 min total for a 1-hour clip. The
+      // extra wait is the price of correctness; the user already
+      // paid much more in lost trust across 3 broken attempts.
+      const mezzaninePaths: string[] = [];
+      for (let i = 0; i < slices.length; i++) {
+        const s = slices[i]!;
+        const outPath = join(workDir, `slice-${String(i).padStart(5, '0')}.mp4`);
+        const sliceArgs: string[] = [
+          '-hide_banner', '-loglevel', 'warning',
+          ...TOLERANCE_IN,
+          '-ss', s.ssIn.toFixed(3),
+          '-i', s.file.path,
+          '-f', 'lavfi', '-t', (s.dur + 1).toFixed(3), '-i', 'anullsrc=r=48000:cl=stereo',
+          '-t', s.dur.toFixed(3),
+          '-filter_complex', `[0:v]${scalePrefix}[outv]`,
+          '-map', '[outv]',
+          '-map', '0:a:0?', '-map', '1:a:0',
+          '-shortest',
+          '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', vBitrate,
+          '-maxrate', vMaxrate, '-bufsize', vBufsize,
+          '-fps_mode', 'cfr', '-r', '25',
+          '-c:a', 'aac', '-b:a', A_BITRATE, '-ac', '2', '-ar', '48000',
+          // Mezzanine temp files — no faststart needed, concat
+          // final re-muxes anyway. Skipping faststart saves a
+          // second-pass moov relocation per slice.
+          '-y', outPath,
+        ];
+        await runFfmpeg(sliceArgs, `slice-${i + 1}/${slices.length}`);
+        mezzaninePaths.push(outPath);
+      }
+
+      // Build ffconcat list of mezzanines. Every mezzanine has
+      // identical codec params by construction, so `-c copy` concat
+      // just stitches them.
+      const concatLines = ['ffconcat version 1.0'];
+      for (const p of mezzaninePaths) {
+        const pp = p.replace(/\\/g, '/').replace(/'/g, "'\\''");
+        concatLines.push(`file '${pp}'`);
+      }
+      writeFileSync(concatListPath, concatLines.join('\n') + '\n', 'utf8');
+
+      const concatArgs: string[] = [
+        '-hide_banner', '-loglevel', 'warning',
+        '-f', 'concat', '-safe', '0', '-i', concatListPath,
+        '-c', 'copy',
+        ...(isMovLike ? ['-movflags', '+faststart'] : []),
+        '-y', mainPath,
+      ];
+      log.info({ clipId: clip.id, slices: slices.length }, 'ffmpeg final concat (mezzanines → mp4)');
+      await runFfmpeg(concatArgs, 'final-concat');
     }
 
-    const mainArgs: string[] = [
-      '-hide_banner', '-loglevel', 'warning',
-      ...ffInputArgs,
-      // Silent audio fallback — used only if source audio wasn't
-      // mapped. For the multi-slice path, [outa_src] carries the
-      // trimmed+concatenated real audio; for single-file, 0:a:0?
-      // carries it. Either way this input is a belt-and-suspenders
-      // stream so the mux never runs dry on audio.
-      '-f', 'lavfi', '-t', String(duration + 1), '-i', 'anullsrc=r=48000:cl=stereo',
-    ];
-    // Branding disabled — PAK_LOGO/ANL_LOGO removed; keep gate false-only path.
-    // if (hasBranding) mainArgs.push('-i', PAK_LOGO, '-i', ANL_LOGO);
-    void hasBranding;
-    // Silent-audio fallback input's index depends on how many source
-    // inputs we have: single-file = index 1, multi-slice = index N.
-    const silentIdx = perFileVideoConcat ? sliceCount : 1;
-    // Audio map differs by shape:
-    //   Single: 0:a:0? (source, optional) + silent fallback
-    //   Multi:  [outa_src] (trimmed+concat real audio) + silent fallback
-    const audioMap = perFileAudioConcat
-      ? ['-map', '[outa_src]', '-map', `${silentIdx}:a:0`]
-      : ['-map', '0:a:0?', '-map', `${silentIdx}:a:0`];
-    mainArgs.push(
-      '-filter_complex', mainFilter.join(';'),
-      '-map', '[outv]',
-      ...audioMap,
-      // Authoritative OUTPUT-side duration cap. -ss/-to at input level
-      // interact oddly with -filter_complex + -shortest: when the source
-      // audio track extends past the requested -to, ffmpeg was letting
-      // the output run to source-EOF (~60 s for a single-segment clip)
-      // even though the operator marked out at 38 s (reported for a
-      // 92-news clip on 2026-08-27). `-t duration` after the input
-      // guarantees the output stops at exactly the marked length.
-      '-t', String(duration),
-      '-shortest',
-      // Match the ingest bitrate exactly — clip = watermarked passthrough
-      // in terms of bytes. Ingest is 700k VBR-capped; we output at the
-      // same 700k so a 60-s clip is ~5.5 MB (matches a 60-s source
-      // segment). No compress-below-source regression possible.
-      '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', vBitrate,
-      '-maxrate', vMaxrate, '-bufsize', vBufsize,
-      // Force constant-rate output (PAL 25 fps) — Pakistani broadcast is
-      // 25 fps PAL; source TS can carry sub-frame PTS jitter (VFR) that
-      // the mp4 muxer preserves, letting audio drift away from video
-      // over multi-minute clips. CFR locks every frame to a 40 ms grid,
-      // and aresample=async on the audio side (above) keeps samples
-      // locked to that same grid.
-      '-fps_mode', 'cfr', '-r', '25',
-      '-c:a', 'aac', '-b:a', A_BITRATE, '-ac', '2', '-ar', '48000',
-      ...(isMovLike ? ['-movflags', '+faststart'] : []),
-      '-y', mainPath,
-    );
-    log.info({ clipId: clip.id }, 'ffmpeg pass 1 — main content');
-    await runFfmpeg(mainArgs, 'main');
-
-    // Title card pass removed 2026-08-08 — operator wants the raw
-    // clip video only, no PAK NAVY / Analysys title-card intro.
-    // The pass-1 output IS the final clip; just move it into place.
     const { renameSync } = await import('node:fs');
     try { renameSync(mainPath, outFile); }
     catch { const { copyFileSync } = await import('node:fs'); copyFileSync(mainPath, outFile); }

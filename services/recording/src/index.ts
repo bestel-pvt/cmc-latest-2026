@@ -1151,25 +1151,31 @@ async function clipWorker(job: { clipId: string }) {
       );
     }
     sliceCount = slices.length;
-    // Build the filter fragments — each input i gets per-stream
-    // trim+setpts: trim/atrim force BOTH video and audio to emit
-    // EXACTLY `dur` seconds, then setpts/asetpts rebase to zero so
-    // the concat filter stitches cleanly.
+    // Build the filter fragments — each slice gets forced into a
+    // perfectly uniform, drift-proof shape before concat:
     //
-    // Why trim-at-filter instead of just input -t: input-side -ss
-    // is keyframe-aligned on video and AAC-frame-aligned on audio
-    // (~21 ms granularity each, independent). Without a filter-side
-    // duration lock, each slice's video and audio can drift by up
-    // to one keyframe-vs-AAC-frame skew (~20–40 ms per slice). Over
-    // 60+ slices (a 1-hour clip = ~63 60-s files) this snowballs
-    // into >1 s audible drift. trim/atrim with the SAME duration
-    // on both streams closes that gap at every slice boundary.
+    //   Video: trim to EXACTLY `dur` seconds → rebase PTS → force
+    //          25 fps CFR via `fps` filter. Every slice emits
+    //          exactly dur*25 frames on a 40 ms grid.
+    //
+    //   Audio: trim to EXACTLY `dur` seconds → rebase PTS → resample
+    //          to 48 kHz stereo (locked format for concat) → `apad`
+    //          to a WHOLE duration of `dur`. apad guarantees the
+    //          stream reaches exactly `dur` seconds even when the
+    //          source audio dropped out mid-slice (padding with
+    //          silence) — this is how we eliminate the "no audio
+    //          for 41 s in the middle" symptom reported on long
+    //          clips.
+    //
+    // With both streams forced to the same `dur` on the same CFR
+    // grid, concat has zero timing slack to accumulate across
+    // slices. A/V stays locked across 60+ slices.
     const vLines: string[] = [];
     const aLines: string[] = [];
     for (let i = 0; i < slices.length; i++) {
       const d = slices[i]!.dur.toFixed(3);
-      vLines.push(`[${i}:v]trim=duration=${d},setpts=PTS-STARTPTS[v${i}]`);
-      aLines.push(`[${i}:a:0]atrim=duration=${d},asetpts=PTS-STARTPTS[a${i}]`);
+      vLines.push(`[${i}:v]trim=duration=${d},setpts=PTS-STARTPTS,fps=25[v${i}]`);
+      aLines.push(`[${i}:a:0]atrim=duration=${d},asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=stereo,apad=whole_dur=${d}[a${i}]`);
     }
     const vJoin = slices.map((_, i) => `[v${i}]`).join('') + `concat=n=${slices.length}:v=1:a=0[vraw]`;
     // aresample=async=1000:first_pts=0 after concat compensates sub-frame

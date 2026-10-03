@@ -1124,7 +1124,12 @@ async function clipWorker(job: { clipId: string }) {
       log.warn({ clipId: clip.id, ss, to, firstRealEndSec, path: first.path }, 'clip: covering file too short — mark falls past real content');
       return;
     }
-    ffInputArgs = [...TOLERANCE_IN, '-ss', String(ss), '-to', String(Math.max(ss + 1, clampedTo)), '-i', first.path];
+    // Keep ffInputArgs for INPUT-only args (no -ss/-to). Output-side
+    // -ss/-to is applied as output options in the main pass below —
+    // input-side -ss would snap the video demuxer to the nearest
+    // keyframe and the audio demuxer to the nearest AAC frame
+    // INDEPENDENTLY, baking a ~20-40 ms A/V skew into the whole clip.
+    ffInputArgs = [...TOLERANCE_IN, '-i', first.path];
   } else {
     // Build a Slice per covering file after respecting overlap with
     // the previous file: each slice's wall-clock start is
@@ -1204,9 +1209,12 @@ async function clipWorker(job: { clipId: string }) {
       : 'null';
 
     if (slices.length === 0) {
-      // ======================================= Single-file path (unchanged)
-      // The input-side -ss/-to on a single mp4 is already frame-accurate;
-      // one filter_complex pass handles scale + encode cleanly.
+      // ======================================= Single-file path
+      // Output-side -ss decodes-and-discards until the exact timestamp,
+      // keeping video and audio first-frame/first-sample locked to the
+      // same source moment. Input-side -ss would independently keyframe-
+      // snap video and AAC-frame-snap audio, baking a 20-40 ms A/V skew
+      // into the clip (the "drift in the first ~3 s" symptom).
       const mainArgs: string[] = [
         '-hide_banner', '-loglevel', 'warning',
         ...ffInputArgs,
@@ -1214,6 +1222,7 @@ async function clipWorker(job: { clipId: string }) {
         '-filter_complex', `[0:v]${scalePrefix}[outv]`,
         '-map', '[outv]',
         '-map', '0:a:0?', '-map', '1:a:0',
+        ...(ss > 0.01 ? ['-ss', String(ss)] : []),
         '-t', String(duration),
         '-shortest',
         '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', vBitrate,
@@ -1261,6 +1270,26 @@ async function clipWorker(job: { clipId: string }) {
       for (let i = 0; i < slices.length; i++) {
         const s = slices[i]!;
         const outPath = join(workDir, `slice-${String(i).padStart(5, '0')}.mp4`);
+        // Seek placement: slice-0 is the ONLY slice that can start
+        // mid-file (clip's starting offset within the first covering
+        // segment). All subsequent slices have ssIn=0 because our
+        // slice math rolls `prevWallEnd` forward. For slice-0,
+        // input-side -ss (before -i) is a keyframe-aligned fast
+        // seek, which plants the video first-frame at the keyframe
+        // but leaves the audio first-sample AAC-frame-aligned
+        // INDEPENDENTLY — a ~20-40 ms grain mismatch between the
+        // two "zeros" that persists for the entire slice as a
+        // constant A/V skew. User saw it as "drift in the first
+        // ~3 s of the clip, OK after that" (2026-10-03). Switching
+        // slice-0 to OUTPUT-side -ss (after -i, before -t) makes
+        // ffmpeg decode-and-discard until the exact timestamp,
+        // emitting the first output frame of both streams at the
+        // same source time. Costs ~0.5-1 s of extra decode once
+        // per clip. Other slices stay on the cheap input-side -ss
+        // (effectively a no-op since ssIn=0).
+        const isFirstSlice = i === 0;
+        const inputSeek = isFirstSlice ? [] : ['-ss', s.ssIn.toFixed(3)];
+        const outputSeek = isFirstSlice && s.ssIn > 0.01 ? ['-ss', s.ssIn.toFixed(3)] : [];
         const sliceArgs: string[] = [
           '-hide_banner', '-loglevel', 'warning',
           // Cap encoder threads so the mezzanine spawn can't eat
@@ -1273,9 +1302,10 @@ async function clipWorker(job: { clipId: string }) {
           // of the fleet unaffected.
           '-threads', '4',
           ...TOLERANCE_IN,
-          '-ss', s.ssIn.toFixed(3),
+          ...inputSeek,
           '-i', s.file.path,
           '-f', 'lavfi', '-t', (s.dur + 1).toFixed(3), '-i', 'anullsrc=r=48000:cl=stereo',
+          ...outputSeek,
           '-t', s.dur.toFixed(3),
           '-filter_complex', `[0:v]${scalePrefix}[outv]`,
           '-map', '[outv]',

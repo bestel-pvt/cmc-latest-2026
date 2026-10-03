@@ -1218,7 +1218,9 @@ async function clipWorker(job: { clipId: string }) {
       const mainArgs: string[] = [
         '-hide_banner', '-loglevel', 'warning',
         ...ffInputArgs,
-        '-f', 'lavfi', '-t', String(duration + 1), '-i', 'anullsrc=r=48000:cl=stereo',
+        // Span output-ss endpoint so silent fallback can keep up —
+        // see slice-rendering block for the full explanation.
+        '-f', 'lavfi', '-t', String(ss + duration + 1), '-i', 'anullsrc=r=48000:cl=stereo',
         '-filter_complex', `[0:v]${scalePrefix}[outv]`,
         '-map', '[outv]',
         '-map', '0:a:0?', '-map', '1:a:0',
@@ -1304,7 +1306,17 @@ async function clipWorker(job: { clipId: string }) {
           ...TOLERANCE_IN,
           ...inputSeek,
           '-i', s.file.path,
-          '-f', 'lavfi', '-t', (s.dur + 1).toFixed(3), '-i', 'anullsrc=r=48000:cl=stereo',
+          // anullsrc must span the OUTPUT-ss endpoint, not just the
+          // slice duration. With output-side -ss on slice-0 we tell
+          // ffmpeg to wait until timestamps reach ssIn before any
+          // output; anullsrc PTS starts at 0 and climbs with content,
+          // so a (dur+1)-second anullsrc never reaches ssIn and the
+          // slice mezzanine comes back with zero streams (clip then
+          // fails in final-concat with "Output file does not contain
+          // any stream"). Spanning the full window keeps the silent
+          // fallback aligned with the output's timeline regardless of
+          // seek style.
+          '-f', 'lavfi', '-t', (s.ssIn + s.dur + 1).toFixed(3), '-i', 'anullsrc=r=48000:cl=stereo',
           ...outputSeek,
           '-t', s.dur.toFixed(3),
           '-filter_complex', `[0:v]${scalePrefix}[outv]`,

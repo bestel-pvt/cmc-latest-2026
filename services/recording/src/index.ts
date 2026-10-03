@@ -1091,9 +1091,24 @@ async function clipWorker(job: { clipId: string }) {
     const startMs = f.startedAt.getTime();
     const declared = SEG_SECONDS * 1000;
     const finalized = existsSync(f.path + '.recorded');
+    // Live (not-yet-finalized) files: trust declared window — their
+    // mtime moves with every append and would spuriously truncate.
     if (!finalized) return startMs + declared;
+    // Finalized files: trust mtime BOTH directions. Previously this
+    // only trusted measured when `< declared` (to guard against crash-
+    // stubs reading as "60 s"), capping over-length segments to 60 s.
+    // That cap caused a 100–500 ms content gap at EVERY slice boundary
+    // because the segment muxer rolls on the next keyframe AFTER 60 s
+    // (so finalized segments are typically 60.2–60.6 s), and the next
+    // segment's `startedAt` is already offset to that actual rollover
+    // moment. Discarding the extra content left a hole the next slice
+    // couldn't fill — the "1-2 s swallowed around 2 s into the clip"
+    // report (2026-10-03 PTV News / Afghanistan). Trusting measured
+    // either direction closes the gap while keeping the crash-stub
+    // short-circuit (estimateSegmentDurationMs already range-guards
+    // 1 s–15 min, so a stat glitch can't poison the length).
     const measured = estimateSegmentDurationMs(f.path, f.startedAt);
-    if (measured && measured < declared) return startMs + measured;
+    if (measured) return startMs + measured;
     return startMs + declared;
   };
   let ffInputArgs: string[] = [];           // only used in single-file path
@@ -1298,6 +1313,43 @@ async function clipWorker(job: { clipId: string }) {
       ];
       log.info({ clipId: clip.id, slices: slices.length }, 'ffmpeg final concat (mezzanines → mp4)');
       await runFfmpeg(concatArgs, 'final-concat');
+    }
+
+    // Attach a cover image so WhatsApp (and other social platforms)
+    // show a non-black thumbnail in the share chat. The video's first
+    // frame is often black (ad break, source blackout, encoder GOP
+    // header), and most mobile viewers extract their preview from
+    // frame 0. An MP4 attached_pic disposition is read first.
+    //
+    // Best effort: if any pass here fails we keep the clip without
+    // cover art rather than failing the whole render.
+    const withCoverPath = join(workDir, `withcover.${clip.format.toLowerCase()}`);
+    try {
+      const thumbPath = join(workDir, 'thumb.jpg');
+      // Pick a midpoint sample — late enough to miss intro blackouts,
+      // early enough to miss any trailing fade.
+      const sampleAt = Math.max(1, Math.min(duration / 2, 10));
+      await runFfmpeg([
+        '-hide_banner', '-loglevel', 'error',
+        '-ss', sampleAt.toFixed(3),
+        '-i', mainPath,
+        '-frames:v', '1', '-q:v', '3',
+        '-y', thumbPath,
+      ], 'thumb-extract');
+      await runFfmpeg([
+        '-hide_banner', '-loglevel', 'error',
+        '-i', mainPath, '-i', thumbPath,
+        '-map', '0', '-map', '1',
+        '-c', 'copy', '-c:v:1', 'mjpeg',
+        '-disposition:v:1', 'attached_pic',
+        ...(isMovLike ? ['-movflags', '+faststart'] : []),
+        '-y', withCoverPath,
+      ], 'cover-attach');
+      unlinkSync(mainPath);
+      const { renameSync: rnTmp } = await import('node:fs');
+      rnTmp(withCoverPath, mainPath);
+    } catch (coverErr) {
+      log.warn({ clipId: clip.id, err: coverErr }, 'cover-art attach failed — keeping clip without cover');
     }
 
     const { renameSync } = await import('node:fs');

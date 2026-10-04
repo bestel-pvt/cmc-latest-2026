@@ -194,6 +194,17 @@ const RECORDING_TRANSCODE_SLUGS = new Set(
     'cnn,365-news,gtv-news,samaa-news,92-news,aik-news,ary-news')
     .split(',').map((s) => s.trim()).filter(Boolean),
 );
+// Hard-override list — these slugs stay on `-c copy` no matter what
+// the codec probe reports. Needed when the auto-force path
+// (codec !== 'h264') mis-labels a stream that is actually h264 but
+// whose per-channel probe comes back with something unexpected. The
+// transcode fallback then pegs one CPU core on a 1080p libx264 run
+// and the output falls behind real-time, which plays back as
+// "slow motion". See CNN 2026-10-04.
+const RECORDING_FORCE_COPY_SLUGS = new Set(
+  (process.env.RECORDING_FORCE_COPY_SLUGS ?? '')
+    .split(',').map((s) => s.trim()).filter(Boolean),
+);
 // Download / clip target — everything above is about the on-disk
 // recording, not the download. The download endpoint reads these.
 const REC_W = Number(process.env.RECORDING_W ?? 854);
@@ -337,8 +348,9 @@ function spawnFFmpeg(slug: string, sourceUrl: string, kind: string, outDir: stri
   // of dawn-news stall 2026-09-10 — probe returned null after every
   // service restart, transcode crashed on spawn, recording never
   // wrote a single file).
-  const needsTranscode = RECORDING_TRANSCODE_SLUGS.has(slug)
-    || (codec !== undefined && codec !== null && codec !== 'h264');
+  const needsTranscode = !RECORDING_FORCE_COPY_SLUGS.has(slug)
+    && (RECORDING_TRANSCODE_SLUGS.has(slug)
+        || (codec !== undefined && codec !== null && codec !== 'h264'));
   const videoArgs = needsTranscode
     ? [
         // Re-encode at NATIVE resolution — no -vf scale here so

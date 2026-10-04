@@ -191,7 +191,13 @@ const RECORDING_TRANSCODE_SLUGS = new Set(
     // ranges (261-byte renders). `-c copy` tolerates the same input
     // (verified with a manual ffmpeg run at 79 fps 1.69x speed on the
     // same multicast) — no re-encode, no crash.
-    'cnn,365-news,gtv-news,samaa-news,92-news,aik-news,ary-news')
+    // 2026-10-04: removed cnn — the "transcode" branch was pegging
+    // one CPU core on a 1080p libx264 veryfast run and falling behind
+    // real-time, which plays back as slow motion. CNN source is
+    // actually h264 and copies cleanly; the probe-based auto-force
+    // was mislabelling the stream so we also added it to
+    // RECORDING_FORCE_COPY_SLUGS below as a belt-and-suspenders.
+    '365-news,gtv-news,samaa-news,92-news,aik-news,ary-news')
     .split(',').map((s) => s.trim()).filter(Boolean),
 );
 // Hard-override list — these slugs stay on `-c copy` no matter what
@@ -202,7 +208,7 @@ const RECORDING_TRANSCODE_SLUGS = new Set(
 // and the output falls behind real-time, which plays back as
 // "slow motion". See CNN 2026-10-04.
 const RECORDING_FORCE_COPY_SLUGS = new Set(
-  (process.env.RECORDING_FORCE_COPY_SLUGS ?? '')
+  (process.env.RECORDING_FORCE_COPY_SLUGS ?? 'cnn')
     .split(',').map((s) => s.trim()).filter(Boolean),
 );
 // Download / clip target — everything above is about the on-disk

@@ -1309,17 +1309,33 @@ async function clipWorker(job: { clipId: string }) {
       }
       writeFileSync(concatListPath, concatLines.join('\n') + '\n', 'utf8');
 
+      // Flag notes:
+      //   `-fflags +discardcorrupt` — drop packets flagged corrupt by
+      //     the demuxer. We deliberately DO NOT set +genpts or +igndts
+      //     here: concat demuxer already makes timestamps continuous
+      //     across the file boundary on its own, and +genpts was
+      //     fighting that continuity (encoder saw a brief PTS reset at
+      //     the file1→file2 transition and emitted a frozen frame or
+      //     dropped frames — showed up as a ~0.5 s "cut" at the
+      //     boundary 2026-10-06).
+      //   `-err_detect ignore_err` — survive bad frames instead of
+      //     aborting (helps mp3-in-mp4 sources that choke at seek).
+      //   `-vsync 2` (passthrough) — let the encoder preserve the
+      //     demuxer's PTS; combined with -r 25 the encoder still
+      //     outputs 25-fps content, but it treats the demuxer's
+      //     continuous PTS as authoritative instead of fabricating
+      //     its own cadence that could skew by a frame at the join.
       const concatArgs: string[] = [
         '-hide_banner', '-loglevel', 'warning',
         '-threads', '4',
-        '-fflags', '+genpts+igndts+discardcorrupt',
+        '-fflags', '+discardcorrupt',
         '-err_detect', 'ignore_err',
         '-analyzeduration', '20000000',
         '-probesize', '20000000',
         '-f', 'concat', '-safe', '0',
         '-i', concatListPath,
         '-vf', `${scalePrefix},tpad=stop_mode=clone:stop_duration=${duration}`,
-        '-af', `aresample=48000,aformat=channel_layouts=stereo,apad=whole_dur=${duration}`,
+        '-af', `aresample=async=1000:first_pts=0,aformat=channel_layouts=stereo,apad=whole_dur=${duration}`,
         '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', vBitrate,
         '-maxrate', vMaxrate, '-bufsize', vBufsize,
         '-fps_mode', 'cfr', '-r', '25',

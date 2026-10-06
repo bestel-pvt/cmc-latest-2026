@@ -1258,122 +1258,78 @@ async function clipWorker(job: { clipId: string }) {
     } else {
       // ======================================= Multi-slice mezzanine path
       //
-      // Rewrite 2026-10-01 (4th attempt at the drift fix). Earlier
-      // approaches shared one ffmpeg process across all slices:
-      //   - filter_complex concat with setpts/asetpts rebase
-      //   - filter_complex concat + trim/atrim + fps=25 + apad
-      //   - ffconcat demuxer with inpoint/outpoint
+      // Rewrite 2026-10-06 — abandon mezzanine chain, go to the
+      // STANDARD ffconcat-demuxer + single-pass re-encode pattern.
       //
-      // Each failed differently. The filter-concat approaches drifted
-      // because per-slice input `-ss` was keyframe-aligned on video
-      // and AAC-frame-aligned on audio (independent grains), so each
-      // slice's "zero" was at a different wall-clock skew — summing
-      // to seconds of drift over 60+ slices. The ffconcat demuxer
-      // approach choked on PTV News mp3-in-mp4 segments ("Header
-      // missing" at every slice boundary).
+      // History of failed approaches (all shared the same flaw —
+      // multiple ffmpeg processes with per-slice encode boundaries):
+      //   - filter_complex concat with setpts/asetpts rebase (drift)
+      //   - filter_complex concat + trim/atrim + fps=25 + apad (drift)
+      //   - ffconcat demuxer with inpoint/outpoint + `-c copy` (choked
+      //     on mp3-in-mp4 segments at boundaries)
+      //   - per-slice mezzanine render + `-c copy` concat (intermittent
+      //     "1-sec cut" at the slice-0/slice-1 boundary even after the
+      //     tpad+apad fix on 2026-10-06)
       //
-      // Mezzanine render side-steps all of this:
-      //   1. Render each slice to its own self-contained mp4 with
-      //      uniform codec params (libx264 CFR 25 fps + AAC 48 kHz
-      //      stereo, scaled to final resolution, exact duration).
-      //      Each mezzanine is a complete, standards-compliant file;
-      //      the odd mp3-in-mp4 audio is transcoded away.
-      //   2. ffconcat demuxer in `-c copy` mode stitches the
-      //      mezzanines byte-level with no decoding, so there's no
-      //      filter graph for a skew to leak into.
+      // The root problem common to all of them: SEPARATE ffmpeg encodes
+      // per slice means SEPARATE codec contexts, SEPARATE GOP headers,
+      // SEPARATE PTS epochs — and `-c copy` concat has to stitch those
+      // disparate pieces at the container layer, where any mismatch
+      // becomes a visible playback glitch (freeze, cut, A/V slip).
       //
-      // Cost: 64 ffmpeg spawns for a 1-hour clip (vs 1 before). Each
-      // mezzanine is a 60-s encode at veryfast → ~3-5 s wall time
-      // each on this box, so ~5 min total for a 1-hour clip. The
-      // extra wait is the price of correctness; the user already
-      // paid much more in lost trust across 3 broken attempts.
-      const mezzaninePaths: string[] = [];
-      for (let i = 0; i < slices.length; i++) {
-        const s = slices[i]!;
-        const outPath = join(workDir, `slice-${String(i).padStart(5, '0')}.mp4`);
-        // Seek placement: slice-0 is the ONLY slice that can start
-        // mid-file (clip's starting offset within the first covering
-        // segment). All subsequent slices have ssIn=0 because our
-        // slice math rolls `prevWallEnd` forward. For slice-0,
-        // input-side -ss (before -i) is a keyframe-aligned fast
-        // seek, which plants the video first-frame at the keyframe
-        // but leaves the audio first-sample AAC-frame-aligned
-        // INDEPENDENTLY — a ~20-40 ms grain mismatch between the
-        // two "zeros" that persists for the entire slice as a
-        // constant A/V skew. User saw it as "drift in the first
-        // ~3 s of the clip, OK after that" (2026-10-03). Switching
-        // slice-0 to OUTPUT-side -ss (after -i, before -t) makes
-        // ffmpeg decode-and-discard until the exact timestamp,
-        // emitting the first output frame of both streams at the
-        // same source time. Costs ~0.5-1 s of extra decode once
-        // per clip. Other slices stay on the cheap input-side -ss
-        // (effectively a no-op since ssIn=0).
-        const isFirstSlice = i === 0;
-        const inputSeek = isFirstSlice ? [] : ['-ss', s.ssIn.toFixed(3)];
-        const outputSeek = isFirstSlice && s.ssIn > 0.01 ? ['-ss', s.ssIn.toFixed(3)] : [];
-        const sliceArgs: string[] = [
-          '-hide_banner', '-loglevel', 'warning',
-          // Cap encoder threads so the mezzanine spawn can't eat
-          // every core. Default libx264 (-threads 0) spreads across
-          // all logical CPUs and would spike this box's load every
-          // ~3-5 s per slice for ~5 min on a 1-hour clip; live-hls
-          // and recording ingest would then fall behind in sync.
-          // 4 threads is enough for a 480p veryfast encode to run
-          // at >10× real-time on this box while leaving the rest
-          // of the fleet unaffected.
-          '-threads', '4',
-          ...TOLERANCE_IN,
-          ...inputSeek,
-          '-i', s.file.path,
-          ...outputSeek,
-          '-t', s.dur.toFixed(3),
-          // Pad BOTH streams out to the full slice duration so neither
-          // can trip -shortest and cut the mezzanine early. Previous
-          // -shortest + 2-track audio mapping lost 0.5-1 s off the end
-          // of slice-0 whenever a segment's audio ran short (sometimes
-          // happens on live multicast with mid-segment audio drop) —
-          // that short slice then concat'd against slice-1 and left
-          // the "1 sec cut around 2 s into the clip" the user keeps
-          // reporting. tpad clones the last video frame to fill the
-          // gap, apad silences the audio tail — same approach the
-          // concat path uses, applied one layer earlier.
-          '-filter_complex',
-            `[0:v]${scalePrefix},tpad=stop_mode=clone:stop_duration=${s.dur.toFixed(3)}[outv];` +
-            `[0:a:0]aresample=48000,aformat=channel_layouts=stereo,apad=whole_dur=${s.dur.toFixed(3)}[outa]`,
-          '-map', '[outv]',
-          '-map', '[outa]',
-          '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', vBitrate,
-          '-maxrate', vMaxrate, '-bufsize', vBufsize,
-          '-fps_mode', 'cfr', '-r', '25',
-          '-c:a', 'aac', '-b:a', A_BITRATE, '-ac', '2', '-ar', '48000',
-          // Mezzanine temp files — no faststart needed, concat
-          // final re-muxes anyway. Skipping faststart saves a
-          // second-pass moov relocation per slice.
-          '-y', outPath,
-        ];
-        await runFfmpeg(sliceArgs, `slice-${i + 1}/${slices.length}`);
-        mezzaninePaths.push(outPath);
-      }
-
-      // Build ffconcat list of mezzanines. Every mezzanine has
-      // identical codec params by construction, so `-c copy` concat
-      // just stitches them.
+      // The standard way to concatenate several source files into
+      // ONE clean video is a single-pass re-encode via the ffconcat
+      // demuxer: inpoint/outpoint per file in the list, one output
+      // encoder context, one continuous PTS timeline. No per-slice
+      // boundaries exist in the final file at all.
+      //
+      // Robust-flag choices below:
+      //   `-fflags +genpts+igndts+discardcorrupt` — regenerate PTS
+      //     from scratch so each source segment's own PTS=0 doesn't
+      //     trigger "DTS out of order" at the boundary; ignore source
+      //     DTS entirely; drop packets flagged corrupt by the demuxer.
+      //   `-err_detect ignore_err` — let the decoder keep going past
+      //     a bad frame instead of aborting (handles the mp3 "Header
+      //     missing" case that killed the prior ffconcat-only path).
+      //   `-vf scale,tpad` — resize to final res; clone the last video
+      //     frame out to -t if the stream ends early.
+      //   `-af aresample,aformat,apad` — normalize audio format and
+      //     pad silence out to -t if the audio stream ends early.
+      //   `-fps_mode cfr -r 25` — lock output to a 25-fps grid.
+      //   `-t duration` — authoritative output length cap.
       const concatLines = ['ffconcat version 1.0'];
-      for (const p of mezzaninePaths) {
-        const pp = p.replace(/\\/g, '/').replace(/'/g, "'\\''");
-        concatLines.push(`file '${pp}'`);
+      for (const s of slices) {
+        // ffconcat parses POSIX-style paths; backslashes on Windows
+        // get treated as escape characters. CMC paths never contain
+        // quotes but we escape single-quotes defensively.
+        const p = s.file.path.replace(/\\/g, '/').replace(/'/g, "'\\''");
+        concatLines.push(`file '${p}'`);
+        concatLines.push(`inpoint ${s.ssIn.toFixed(3)}`);
+        concatLines.push(`outpoint ${(s.ssIn + s.dur).toFixed(3)}`);
       }
       writeFileSync(concatListPath, concatLines.join('\n') + '\n', 'utf8');
 
       const concatArgs: string[] = [
         '-hide_banner', '-loglevel', 'warning',
-        '-f', 'concat', '-safe', '0', '-i', concatListPath,
-        '-c', 'copy',
+        '-threads', '4',
+        '-fflags', '+genpts+igndts+discardcorrupt',
+        '-err_detect', 'ignore_err',
+        '-analyzeduration', '20000000',
+        '-probesize', '20000000',
+        '-f', 'concat', '-safe', '0',
+        '-i', concatListPath,
+        '-vf', `${scalePrefix},tpad=stop_mode=clone:stop_duration=${duration}`,
+        '-af', `aresample=48000,aformat=channel_layouts=stereo,apad=whole_dur=${duration}`,
+        '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', vBitrate,
+        '-maxrate', vMaxrate, '-bufsize', vBufsize,
+        '-fps_mode', 'cfr', '-r', '25',
+        '-c:a', 'aac', '-b:a', A_BITRATE, '-ar', '48000', '-ac', '2',
+        '-t', String(duration),
         ...(isMovLike ? ['-movflags', '+faststart'] : []),
         '-y', mainPath,
       ];
-      log.info({ clipId: clip.id, slices: slices.length }, 'ffmpeg final concat (mezzanines → mp4)');
-      await runFfmpeg(concatArgs, 'final-concat');
+      log.info({ clipId: clip.id, slices: slices.length }, 'ffmpeg single-pass concat + re-encode');
+      await runFfmpeg(concatArgs, 'single-pass');
     }
 
     // Attach a cover image so WhatsApp (and other social platforms)

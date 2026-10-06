@@ -921,7 +921,19 @@ const routes: FastifyPluginAsync = async (app) => {
       await new Promise<void>((resolve) => {
         const ff = spawn('ffmpeg', [
           '-hide_banner', '-loglevel', 'error', '-nostdin',
-          '-fflags', '+discardcorrupt+igndts+genpts',
+          // +genpts and +igndts were overriding the concat demuxer's
+          // own cross-file timestamp continuity and triggering a
+          // decoder reset at every file boundary; for channels whose
+          // audio stream is unusual (mp3-in-mp4, or a stream that
+          // has mid-segment PTS jitter) the reset cascaded into an
+          // ffmpeg abort and the waveform API returned 0 bytes,
+          // which the clip editor shows as "Waveform unavailable".
+          // ABB TAKK on 2026-10-07 exhibited exactly this (other
+          // channels in the same time window loaded fine). Dropping
+          // the extra flags lets the demuxer's native continuity
+          // handle the join and keeps the decoder going past the
+          // intermittent bad audio frames via -err_detect ignore_err.
+          '-fflags', '+discardcorrupt',
           '-err_detect', 'ignore_err',
           '-f', 'concat', '-safe', '0', '-i', listPath,
           '-vn', '-ac', '1', '-ar', String(sr),

@@ -1236,15 +1236,16 @@ async function clipWorker(job: { clipId: string }) {
       const mainArgs: string[] = [
         '-hide_banner', '-loglevel', 'warning',
         ...ffInputArgs,
-        // Span output-ss endpoint so silent fallback can keep up —
-        // see slice-rendering block for the full explanation.
-        '-f', 'lavfi', '-t', String(ss + duration + 1), '-i', 'anullsrc=r=48000:cl=stereo',
-        '-filter_complex', `[0:v]${scalePrefix}[outv]`,
-        '-map', '[outv]',
-        '-map', '0:a:0?', '-map', '1:a:0',
         ...(ss > 0.01 ? ['-ss', String(ss)] : []),
         '-t', String(duration),
-        '-shortest',
+        // tpad + apad pad both streams to the full requested duration
+        // so neither can trip -shortest and cut the clip early when a
+        // segment's audio runs short mid-stream.
+        '-filter_complex',
+          `[0:v]${scalePrefix},tpad=stop_mode=clone:stop_duration=${duration}[outv];` +
+          `[0:a:0]aresample=48000,aformat=channel_layouts=stereo,apad=whole_dur=${duration}[outa]`,
+        '-map', '[outv]',
+        '-map', '[outa]',
         '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', vBitrate,
         '-maxrate', vMaxrate, '-bufsize', vBufsize,
         '-fps_mode', 'cfr', '-r', '25',
@@ -1324,23 +1325,23 @@ async function clipWorker(job: { clipId: string }) {
           ...TOLERANCE_IN,
           ...inputSeek,
           '-i', s.file.path,
-          // anullsrc must span the OUTPUT-ss endpoint, not just the
-          // slice duration. With output-side -ss on slice-0 we tell
-          // ffmpeg to wait until timestamps reach ssIn before any
-          // output; anullsrc PTS starts at 0 and climbs with content,
-          // so a (dur+1)-second anullsrc never reaches ssIn and the
-          // slice mezzanine comes back with zero streams (clip then
-          // fails in final-concat with "Output file does not contain
-          // any stream"). Spanning the full window keeps the silent
-          // fallback aligned with the output's timeline regardless of
-          // seek style.
-          '-f', 'lavfi', '-t', (s.ssIn + s.dur + 1).toFixed(3), '-i', 'anullsrc=r=48000:cl=stereo',
           ...outputSeek,
           '-t', s.dur.toFixed(3),
-          '-filter_complex', `[0:v]${scalePrefix}[outv]`,
+          // Pad BOTH streams out to the full slice duration so neither
+          // can trip -shortest and cut the mezzanine early. Previous
+          // -shortest + 2-track audio mapping lost 0.5-1 s off the end
+          // of slice-0 whenever a segment's audio ran short (sometimes
+          // happens on live multicast with mid-segment audio drop) —
+          // that short slice then concat'd against slice-1 and left
+          // the "1 sec cut around 2 s into the clip" the user keeps
+          // reporting. tpad clones the last video frame to fill the
+          // gap, apad silences the audio tail — same approach the
+          // concat path uses, applied one layer earlier.
+          '-filter_complex',
+            `[0:v]${scalePrefix},tpad=stop_mode=clone:stop_duration=${s.dur.toFixed(3)}[outv];` +
+            `[0:a:0]aresample=48000,aformat=channel_layouts=stereo,apad=whole_dur=${s.dur.toFixed(3)}[outa]`,
           '-map', '[outv]',
-          '-map', '0:a:0?', '-map', '1:a:0',
-          '-shortest',
+          '-map', '[outa]',
           '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', vBitrate,
           '-maxrate', vMaxrate, '-bufsize', vBufsize,
           '-fps_mode', 'cfr', '-r', '25',
@@ -1386,13 +1387,23 @@ async function clipWorker(job: { clipId: string }) {
     const withCoverPath = join(workDir, `withcover.${clip.format.toLowerCase()}`);
     try {
       const thumbPath = join(workDir, 'thumb.jpg');
-      // Pick a midpoint sample — late enough to miss intro blackouts,
-      // early enough to miss any trailing fade.
-      const sampleAt = Math.max(1, Math.min(duration / 2, 10));
+      // Hard-coded midpoint -ss hits whatever frame happens to live
+      // at that timestamp — ad transitions, source blackouts, and
+      // encoder GOP headers routinely leave that spot as a black
+      // frame, which is what social platforms then show as the
+      // share thumbnail. The `thumbnail` filter samples a window of
+      // frames and emits the ONE statistically most-distinctive
+      // frame of that window — black frames score near zero on the
+      // RMS/luma histogram the filter uses, so they get skipped
+      // automatically. We ask for a window of 100 frames (~4 s at
+      // 25 fps) from near the clip's midpoint, which is far enough
+      // from both intro and outro to usually land on real content.
+      const windowStart = Math.max(0.5, Math.min(duration / 2 - 2, duration - 5));
       await runFfmpeg([
         '-hide_banner', '-loglevel', 'error',
-        '-ss', sampleAt.toFixed(3),
+        '-ss', windowStart.toFixed(3),
         '-i', mainPath,
+        '-vf', 'thumbnail=100',
         '-frames:v', '1', '-q:v', '3',
         '-y', thumbPath,
       ], 'thumb-extract');

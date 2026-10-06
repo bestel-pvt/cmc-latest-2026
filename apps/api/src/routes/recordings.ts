@@ -895,9 +895,27 @@ const routes: FastifyPluginAsync = async (app) => {
     });
     if (covering.length === 0) return reply.notFound();
 
+    // Drop segments whose on-disk size is clearly short of a 60-s
+    // fMP4 (ingest ffmpeg crashed/respawned mid-write — the file
+    // header is truncated and the mp4 demuxer aborts on it, which
+    // then cascades through the concat demuxer and kills the whole
+    // decode. ABB TAKK on 2026-10-07 had ~12 of 52 segments in a
+    // 32-min window land under 6 MB because the ingest kept hitting
+    // non-monotonic DTS and respawning). We'd rather drop a few
+    // seconds of silence from the waveform than lose the whole thing.
+    // 6 MB ≈ 20 s at the normal ingest bitrate — anything shorter
+    // was almost certainly a crash-stub.
+    const PARTIAL_BYTES = 6_000_000;
     const playable = covering.filter((s) => {
-      try { return statSync(s.path).size >= 4096; } catch { return false; }
+      try {
+        const sz = statSync(s.path).size;
+        return sz >= PARTIAL_BYTES;
+      } catch { return false; }
     });
+    const skipped = covering.length - playable.length;
+    if (skipped > 0) {
+      app.log.warn({ channelId: q.channelId, from: q.from, to: q.to, covering: covering.length, playable: playable.length, skipped }, 'waveform: skipped partial segments');
+    }
     if (playable.length === 0) return reply.notFound();
 
     // Decode ALL segments in ONE ffmpeg concat call, not N sequential
@@ -916,23 +934,16 @@ const routes: FastifyPluginAsync = async (app) => {
       .map((s) => `file '${s.path.replace(/\\/g, '/').replace(/'/g, "'\\''")}'`)
       .join('\n');
     writeFileSync(listPath, listBody);
+    let ffExitCode: number | null = null;
+    let ffStderr = '';
     try {
       const chunks: Buffer[] = [];
       await new Promise<void>((resolve) => {
         const ff = spawn('ffmpeg', [
           '-hide_banner', '-loglevel', 'error', '-nostdin',
-          // +genpts and +igndts were overriding the concat demuxer's
-          // own cross-file timestamp continuity and triggering a
-          // decoder reset at every file boundary; for channels whose
-          // audio stream is unusual (mp3-in-mp4, or a stream that
-          // has mid-segment PTS jitter) the reset cascaded into an
-          // ffmpeg abort and the waveform API returned 0 bytes,
-          // which the clip editor shows as "Waveform unavailable".
-          // ABB TAKK on 2026-10-07 exhibited exactly this (other
-          // channels in the same time window loaded fine). Dropping
-          // the extra flags lets the demuxer's native continuity
-          // handle the join and keeps the decoder going past the
-          // intermittent bad audio frames via -err_detect ignore_err.
+          // Trust concat demuxer's native cross-file timestamp
+          // continuity (dropped +genpts and +igndts because they
+          // override it and cause decoder resets at boundaries).
           '-fflags', '+discardcorrupt',
           '-err_detect', 'ignore_err',
           '-f', 'concat', '-safe', '0', '-i', listPath,
@@ -945,14 +956,44 @@ const routes: FastifyPluginAsync = async (app) => {
         // and returning HTTP 500 to the operator.
         const kill = setTimeout(() => { try { ff.kill('SIGKILL'); } catch {} }, 300_000);
         ff.stdout.on('data', (b) => chunks.push(b));
-        ff.on('exit', () => { clearTimeout(kill); resolve(); });
-        ff.on('error', () => { clearTimeout(kill); resolve(); });
+        ff.stderr?.on('data', (b: Buffer) => { if (ffStderr.length < 8192) ffStderr += b.toString('utf8'); });
+        ff.on('exit', (code) => { ffExitCode = code; clearTimeout(kill); resolve(); });
+        ff.on('error', (err) => { ffStderr += `\nspawn error: ${err.message}`; clearTimeout(kill); resolve(); });
       });
       const wav = Buffer.concat(chunks);
-      const samples = new Int16Array(wav.buffer, wav.byteOffset, wav.byteLength / 2);
+      // Guard against odd-byte stdout (ffmpeg killed mid-sample).
+      // Int16Array constructor requires a byteLength aligned to 2.
+      const alignedBytes = wav.byteLength - (wav.byteLength % 2);
+      const samples = new Int16Array(wav.buffer, wav.byteOffset, alignedBytes / 2);
       const room = Math.min(samples.length, buf.length);
       buf.set(samples.subarray(0, room));
       offset = room;
+      // Explicit log of what the decode actually produced so we can
+      // tell "no samples at all" (hard failure) from "a few samples"
+      // (partial success → flat-ish waveform) from the API log.
+      app.log.info({
+        channelId: q.channelId,
+        from: q.from,
+        to: q.to,
+        playableSegments: playable.length,
+        skippedPartialSegments: skipped,
+        ffExitCode,
+        bytesDecoded: wav.byteLength,
+        samplesStored: offset,
+        expectedSamples,
+        ffStderrHead: ffStderr.slice(0, 400),
+      }, 'waveform: decode complete');
+      // If ffmpeg produced effectively nothing and exited non-zero,
+      // return a clear 500 instead of a flatline waveform that the
+      // operator reads as "unavailable" with no explanation.
+      if (offset === 0 && ffExitCode !== 0) {
+        return reply.code(500).send({
+          error: 'waveform decode produced no samples',
+          ffExitCode,
+          skippedPartialSegments: skipped,
+          ffStderrHead: ffStderr.slice(0, 400),
+        });
+      }
     } finally {
       try { unlinkSync(listPath); } catch {}
     }

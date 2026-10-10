@@ -1358,6 +1358,29 @@ async function clipWorker(job: { clipId: string }) {
       //     outputs 25-fps content, but it treats the demuxer's
       //     continuous PTS as authoritative instead of fabricating
       //     its own cadence that could skew by a frame at the join.
+      // Filter-based accurate trim replaces the output-side `-ss` that
+      // DIDN'T work with the concat demuxer (user: "mazeed piche ho
+      // gayi, 3 sec pehle se bani", 2026-10-11). The output-side -ss
+      // waits for input PTS to reach the target, but concat demuxer's
+      // PTS semantics are inconsistent — on this build it preserved
+      // original file timestamps instead of renormalizing to 0, so
+      // `-ss 3` was waiting for PTS=3 which never arrived (frames
+      // started at PTS 54+). The output never got trimmed and the full
+      // 3-s pre-roll ended up in the clip.
+      //
+      // Instead we FORCE normalise PTS to zero in the filter chain
+      // (`setpts=PTS-STARTPTS`), then apply `trim=start=PREROLL` which
+      // is unambiguous: drop the first PREROLL seconds of the
+      // normalised stream. Same pattern for audio.
+      //
+      // The `-t duration` output cap still trims the postroll on the
+      // last slice at the exact mark-out.
+      const vFilter = outputSsOffset > 0.01
+        ? `setpts=PTS-STARTPTS,trim=start=${outputSsOffset.toFixed(3)},setpts=PTS-STARTPTS,${scalePrefix},tpad=stop_mode=clone:stop_duration=${duration}`
+        : `${scalePrefix},tpad=stop_mode=clone:stop_duration=${duration}`;
+      const aFilter = outputSsOffset > 0.01
+        ? `asetpts=PTS-STARTPTS,atrim=start=${outputSsOffset.toFixed(3)},asetpts=PTS-STARTPTS,aresample=async=1000:first_pts=0,aformat=channel_layouts=stereo,apad=whole_dur=${duration}`
+        : `aresample=async=1000:first_pts=0,aformat=channel_layouts=stereo,apad=whole_dur=${duration}`;
       const concatArgs: string[] = [
         '-hide_banner', '-loglevel', 'warning',
         '-threads', '4',
@@ -1367,12 +1390,8 @@ async function clipWorker(job: { clipId: string }) {
         '-probesize', '20000000',
         '-f', 'concat', '-safe', '0',
         '-i', concatListPath,
-        // Output-side -ss AFTER the concat input decodes-and-discards
-        // the keyframe pre-roll we added via `inpoint - PREROLL` on
-        // the first slice above. Must come BEFORE `-t`.
-        ...(outputSsOffset > 0.01 ? ['-ss', outputSsOffset.toFixed(3)] : []),
-        '-vf', `${scalePrefix},tpad=stop_mode=clone:stop_duration=${duration}`,
-        '-af', `aresample=async=1000:first_pts=0,aformat=channel_layouts=stereo,apad=whole_dur=${duration}`,
+        '-vf', vFilter,
+        '-af', aFilter,
         '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', vBitrate,
         '-maxrate', vMaxrate, '-bufsize', vBufsize,
         '-fps_mode', 'cfr', '-r', '25',

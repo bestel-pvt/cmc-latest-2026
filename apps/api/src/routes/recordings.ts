@@ -365,13 +365,20 @@ const routes: FastifyPluginAsync = async (app) => {
         await runFf([
           '-hide_banner', '-loglevel', 'error', '-y',
           '-err_detect', 'ignore_err',
-          '-fflags', '+genpts+discardcorrupt+igndts',
+          // +genpts+igndts were overriding the concat demuxer's native
+          // cross-file timestamp continuity and injecting PTS resets at
+          // every boundary — the mp4 muxer then wrote an index that
+          // media players treat as damaged. Removed 2026-10-11 after a
+          // user reported "download first click 500, second click
+          // succeeds but file won't play in media player".
+          '-fflags', '+discardcorrupt',
           '-f', 'concat', '-safe', '0', '-i', listPath,
           '-vf', 'scale=854:480:flags=lanczos',
           '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency',
           '-profile:v', 'main', '-pix_fmt', 'yuv420p',
           '-threads', '2',
           '-b:v', '700k', '-maxrate', '1000k', '-bufsize', '2000k',
+          '-fps_mode', 'cfr', '-r', '25',
           '-c:a', 'aac', '-b:a', '96k', '-ac', '2', '-ar', '48000',
           '-movflags', '+faststart',
           outPath,
@@ -379,9 +386,26 @@ const routes: FastifyPluginAsync = async (app) => {
       } finally {
         dlRelease();
       }
-      // Belt-and-braces: ffmpeg exit-code 0 but empty output = broken input list
+      // Belt-and-braces validation. The old size>1024 check let a
+      // corrupt mp4 (writeable but with a broken moov atom) through
+      // the cache — that was the "second click downloads but won't
+      // play" symptom. ffmpeg -v error -f null - exits non-zero on
+      // files that can't be opened, which is the exact check a media
+      // player would run. ffprobe would be cleaner but isn't shipped
+      // on the CMC Windows ffmpeg build.
       if (!existsSync(outPath) || statSync(outPath).size < 1024) {
         throw new Error('ffmpeg produced empty output');
+      }
+      const checkOk = await new Promise<boolean>((resolve) => {
+        const probe = spawn('ffmpeg', [
+          '-v', 'error', '-i', outPath, '-c', 'copy',
+          '-t', '0.1', '-f', 'null', '-',
+        ], { stdio: ['ignore', 'ignore', 'pipe'] });
+        probe.on('exit', (code) => resolve(code === 0));
+        probe.on('error', () => resolve(false));
+      });
+      if (!checkOk) {
+        throw new Error('ffmpeg output is not playable (bad mp4 header or codec)');
       }
       return outPath;
     })().catch((err) => {

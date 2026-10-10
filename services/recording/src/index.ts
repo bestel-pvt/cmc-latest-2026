@@ -1297,15 +1297,48 @@ async function clipWorker(job: { clipId: string }) {
       //     pad silence out to -t if the audio stream ends early.
       //   `-fps_mode cfr -r 25` — lock output to a 25-fps grid.
       //   `-t duration` — authoritative output length cap.
+      // Accurate seek strategy:
+      //   - inpoint on first slice is pulled back by PREROLL seconds
+      //     because ffconcat `inpoint` is keyframe-aligned on mp4 — a
+      //     raw inpoint=ssIn makes the demuxer land on the previous
+      //     keyframe (up to ~GOP seconds earlier) and that pre-roll
+      //     ends up in the final clip (user: "clip start se pehle se
+      //     start kr rha", 2026-10-11). We then apply an output-side
+      //     `-ss PREROLL` which decodes-and-discards until the exact
+      //     requested timestamp, giving frame-accurate start.
+      //   - outpoint on last slice is extended by POSTROLL seconds
+      //     so the demuxer doesn't close the stream a frame or two
+      //     short of the mark-out (user: "end se bhi jaldi band ho
+      //     rhi"). The `-t duration` output cap then trims the
+      //     postroll back off at the exact mark-out.
+      const PREROLL = 3.0;
+      const POSTROLL = 2.0;
+      let outputSsOffset = 0;
       const concatLines = ['ffconcat version 1.0'];
-      for (const s of slices) {
+      for (let i = 0; i < slices.length; i++) {
+        const s = slices[i]!;
+        const isFirst = i === 0;
+        const isLast = i === slices.length - 1;
         // ffconcat parses POSIX-style paths; backslashes on Windows
         // get treated as escape characters. CMC paths never contain
         // quotes but we escape single-quotes defensively.
         const p = s.file.path.replace(/\\/g, '/').replace(/'/g, "'\\''");
+        let inpoint = s.ssIn;
+        let outpoint = s.ssIn + s.dur;
+        if (isFirst && s.ssIn > 0.01) {
+          const preroll = Math.min(s.ssIn, PREROLL);
+          inpoint = s.ssIn - preroll;
+          outputSsOffset = preroll;
+        }
+        if (isLast) {
+          // Extend outpoint but clamp to file's real end so we don't
+          // tell the demuxer to read past EOF.
+          const fileRealEndSec = (realEndMs(s.file) - s.file.startedAt.getTime()) / 1000;
+          outpoint = Math.min(fileRealEndSec, s.ssIn + s.dur + POSTROLL);
+        }
         concatLines.push(`file '${p}'`);
-        concatLines.push(`inpoint ${s.ssIn.toFixed(3)}`);
-        concatLines.push(`outpoint ${(s.ssIn + s.dur).toFixed(3)}`);
+        concatLines.push(`inpoint ${inpoint.toFixed(3)}`);
+        concatLines.push(`outpoint ${outpoint.toFixed(3)}`);
       }
       writeFileSync(concatListPath, concatLines.join('\n') + '\n', 'utf8');
 
@@ -1334,6 +1367,10 @@ async function clipWorker(job: { clipId: string }) {
         '-probesize', '20000000',
         '-f', 'concat', '-safe', '0',
         '-i', concatListPath,
+        // Output-side -ss AFTER the concat input decodes-and-discards
+        // the keyframe pre-roll we added via `inpoint - PREROLL` on
+        // the first slice above. Must come BEFORE `-t`.
+        ...(outputSsOffset > 0.01 ? ['-ss', outputSsOffset.toFixed(3)] : []),
         '-vf', `${scalePrefix},tpad=stop_mode=clone:stop_duration=${duration}`,
         '-af', `aresample=async=1000:first_pts=0,aformat=channel_layouts=stereo,apad=whole_dur=${duration}`,
         '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', vBitrate,

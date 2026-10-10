@@ -1311,87 +1311,58 @@ async function clipWorker(job: { clipId: string }) {
       //     short of the mark-out (user: "end se bhi jaldi band ho
       //     rhi"). The `-t duration` output cap then trims the
       //     postroll back off at the exact mark-out.
-      const PREROLL = 3.0;
-      const POSTROLL = 2.0;
-      let outputSsOffset = 0;
-      const concatLines = ['ffconcat version 1.0'];
+      // Rewrite 2026-10-11 (nth attempt). Dropped ffconcat demuxer
+      // entirely. Both inpoint+output-ss and inpoint+filter-trim
+      // produced "3 seconds piche se bani" because the demuxer's
+      // keyframe-aligned seek + build-dependent PTS semantics made
+      // every trim position unreliable to compute from the app side.
+      //
+      // Standard ffmpeg idiom for "assemble a video out of precise
+      // windows cut from several source files": ONE `-i` per source
+      // segment, plus a single `-filter_complex` that does per-input
+      // trim at absolute file-relative PTS, rebases each slice's PTS
+      // to zero, normalises to 25-fps CFR, and feeds the concat
+      // filter. trim's start/end on the raw decoded video stream work
+      // in seconds since file start — unambiguous, build-independent.
+      // Keep concatListPath referenced only so the finally's unlinkSync
+      // stays a no-op; this path doesn't write a concat list.
+      void concatListPath;
+
+      // One -i per source segment file.
+      const inputArgs: string[] = [];
+      for (const s of slices) {
+        inputArgs.push(...TOLERANCE_IN, '-i', s.file.path);
+      }
+      // Build the filter graph:
+      //   For each slice i:
+      //     [i:v]trim=start=X:end=Y,setpts=PTS-STARTPTS,fps=25[vi]
+      //     [i:a]atrim=start=X:end=Y,asetpts=PTS-STARTPTS,aresample=48000,aformat=stereo[ai]
+      //   Concat all slices:
+      //     [v0][a0][v1][a1]...concat=n=N:v=1:a=1[vraw][araw]
+      //   Final processing:
+      //     [vraw]scale,tpad[outv]
+      //     [araw]apad[outa]
+      const parts: string[] = [];
       for (let i = 0; i < slices.length; i++) {
         const s = slices[i]!;
-        const isFirst = i === 0;
-        const isLast = i === slices.length - 1;
-        // ffconcat parses POSIX-style paths; backslashes on Windows
-        // get treated as escape characters. CMC paths never contain
-        // quotes but we escape single-quotes defensively.
-        const p = s.file.path.replace(/\\/g, '/').replace(/'/g, "'\\''");
-        let inpoint = s.ssIn;
-        let outpoint = s.ssIn + s.dur;
-        if (isFirst && s.ssIn > 0.01) {
-          const preroll = Math.min(s.ssIn, PREROLL);
-          inpoint = s.ssIn - preroll;
-          outputSsOffset = preroll;
-        }
-        if (isLast) {
-          // Extend outpoint but clamp to file's real end so we don't
-          // tell the demuxer to read past EOF.
-          const fileRealEndSec = (realEndMs(s.file) - s.file.startedAt.getTime()) / 1000;
-          outpoint = Math.min(fileRealEndSec, s.ssIn + s.dur + POSTROLL);
-        }
-        concatLines.push(`file '${p}'`);
-        concatLines.push(`inpoint ${inpoint.toFixed(3)}`);
-        concatLines.push(`outpoint ${outpoint.toFixed(3)}`);
+        const start = s.ssIn.toFixed(3);
+        const end = (s.ssIn + s.dur).toFixed(3);
+        parts.push(`[${i}:v]trim=start=${start}:end=${end},setpts=PTS-STARTPTS,fps=25[v${i}]`);
+        parts.push(`[${i}:a]atrim=start=${start}:end=${end},asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=stereo[a${i}]`);
       }
-      writeFileSync(concatListPath, concatLines.join('\n') + '\n', 'utf8');
+      const concatInputsRef = slices.map((_, i) => `[v${i}][a${i}]`).join('');
+      parts.push(`${concatInputsRef}concat=n=${slices.length}:v=1:a=1[vraw][araw]`);
+      parts.push(`[vraw]${scalePrefix},tpad=stop_mode=clone:stop_duration=${duration}[outv]`);
+      parts.push(`[araw]apad=whole_dur=${duration}[outa]`);
+      const filterComplex = parts.join(';');
 
-      // Flag notes:
-      //   `-fflags +discardcorrupt` — drop packets flagged corrupt by
-      //     the demuxer. We deliberately DO NOT set +genpts or +igndts
-      //     here: concat demuxer already makes timestamps continuous
-      //     across the file boundary on its own, and +genpts was
-      //     fighting that continuity (encoder saw a brief PTS reset at
-      //     the file1→file2 transition and emitted a frozen frame or
-      //     dropped frames — showed up as a ~0.5 s "cut" at the
-      //     boundary 2026-10-06).
-      //   `-err_detect ignore_err` — survive bad frames instead of
-      //     aborting (helps mp3-in-mp4 sources that choke at seek).
-      //   `-vsync 2` (passthrough) — let the encoder preserve the
-      //     demuxer's PTS; combined with -r 25 the encoder still
-      //     outputs 25-fps content, but it treats the demuxer's
-      //     continuous PTS as authoritative instead of fabricating
-      //     its own cadence that could skew by a frame at the join.
-      // Filter-based accurate trim replaces the output-side `-ss` that
-      // DIDN'T work with the concat demuxer (user: "mazeed piche ho
-      // gayi, 3 sec pehle se bani", 2026-10-11). The output-side -ss
-      // waits for input PTS to reach the target, but concat demuxer's
-      // PTS semantics are inconsistent — on this build it preserved
-      // original file timestamps instead of renormalizing to 0, so
-      // `-ss 3` was waiting for PTS=3 which never arrived (frames
-      // started at PTS 54+). The output never got trimmed and the full
-      // 3-s pre-roll ended up in the clip.
-      //
-      // Instead we FORCE normalise PTS to zero in the filter chain
-      // (`setpts=PTS-STARTPTS`), then apply `trim=start=PREROLL` which
-      // is unambiguous: drop the first PREROLL seconds of the
-      // normalised stream. Same pattern for audio.
-      //
-      // The `-t duration` output cap still trims the postroll on the
-      // last slice at the exact mark-out.
-      const vFilter = outputSsOffset > 0.01
-        ? `setpts=PTS-STARTPTS,trim=start=${outputSsOffset.toFixed(3)},setpts=PTS-STARTPTS,${scalePrefix},tpad=stop_mode=clone:stop_duration=${duration}`
-        : `${scalePrefix},tpad=stop_mode=clone:stop_duration=${duration}`;
-      const aFilter = outputSsOffset > 0.01
-        ? `asetpts=PTS-STARTPTS,atrim=start=${outputSsOffset.toFixed(3)},asetpts=PTS-STARTPTS,aresample=async=1000:first_pts=0,aformat=channel_layouts=stereo,apad=whole_dur=${duration}`
-        : `aresample=async=1000:first_pts=0,aformat=channel_layouts=stereo,apad=whole_dur=${duration}`;
       const concatArgs: string[] = [
         '-hide_banner', '-loglevel', 'warning',
         '-threads', '4',
-        '-fflags', '+discardcorrupt',
-        '-err_detect', 'ignore_err',
-        '-analyzeduration', '20000000',
-        '-probesize', '20000000',
-        '-f', 'concat', '-safe', '0',
-        '-i', concatListPath,
-        '-vf', vFilter,
-        '-af', aFilter,
+        ...inputArgs,
+        '-filter_complex', filterComplex,
+        '-map', '[outv]',
+        '-map', '[outa]',
         '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', vBitrate,
         '-maxrate', vMaxrate, '-bufsize', vBufsize,
         '-fps_mode', 'cfr', '-r', '25',
@@ -1400,8 +1371,8 @@ async function clipWorker(job: { clipId: string }) {
         ...(isMovLike ? ['-movflags', '+faststart'] : []),
         '-y', mainPath,
       ];
-      log.info({ clipId: clip.id, slices: slices.length }, 'ffmpeg single-pass concat + re-encode');
-      await runFfmpeg(concatArgs, 'single-pass');
+      log.info({ clipId: clip.id, slices: slices.length }, 'ffmpeg multi-input + filter_complex trim+concat');
+      await runFfmpeg(concatArgs, 'multi-input');
     }
 
     // Attach a cover image so WhatsApp (and other social platforms)

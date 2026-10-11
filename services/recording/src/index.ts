@@ -1250,7 +1250,8 @@ async function clipWorker(job: { clipId: string }) {
         '-map', '[outa]',
         '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', vBitrate,
         '-maxrate', vMaxrate, '-bufsize', vBufsize,
-        '-fps_mode', 'cfr', '-r', '25',
+        // Passthrough — see multi-slice path for the explanation.
+        '-fps_mode', 'passthrough',
         '-c:a', 'aac', '-b:a', A_BITRATE, '-ac', '2', '-ar', '48000',
         ...(isMovLike ? ['-movflags', '+faststart'] : []),
         '-y', mainPath,
@@ -1383,7 +1384,17 @@ async function clipWorker(job: { clipId: string }) {
         '-map', '[outa]',
         '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', vBitrate,
         '-maxrate', vMaxrate, '-bufsize', vBufsize,
-        '-fps_mode', 'cfr', '-r', '25',
+        // -fps_mode passthrough preserves input PTS as-is. The previous
+        // `-r 25 -fps_mode cfr` combined with `-t duration` was the
+        // actual source of the "last 8 s frozen" symptom: when the
+        // trimmed input stream naturally ended before `-t duration`,
+        // the CFR encoder generated frames at 25 fps all the way out
+        // to `-t`, picking the LAST decoded frame for every output
+        // PTS past input EOF — a hidden tpad-equivalent at the
+        // encoder layer that no amount of filter-chain cleanup could
+        // reach. Passthrough lets the output stream end naturally
+        // when input ends.
+        '-fps_mode', 'passthrough',
         '-c:a', 'aac', '-b:a', A_BITRATE, '-ar', '48000', '-ac', '2',
         '-t', String(duration),
         ...(isMovLike ? ['-movflags', '+faststart'] : []),

@@ -1352,8 +1352,16 @@ async function clipWorker(job: { clipId: string }) {
       }
       const concatInputsRef = slices.map((_, i) => `[v${i}][a${i}]`).join('');
       parts.push(`${concatInputsRef}concat=n=${slices.length}:v=1:a=1[vraw][araw]`);
-      parts.push(`[vraw]${scalePrefix},tpad=stop_mode=clone:stop_duration=${duration}[outv]`);
-      parts.push(`[araw]apad=whole_dur=${duration}[outa]`);
+      // Scale only — NO tpad or apad padding. If a source segment has
+      // less content than the slice's wall-clock window (ingest dropout
+      // mid-window, source blackout, partial segment), we'd rather end
+      // the clip at that natural EOF than cover the gap with a frozen
+      // last-frame + silence tail. The user calls that frozen tail
+      // "7 secs stucked" and treats it as a bug (dawn-news clip
+      // 2026-10-11 ended with ~8 s of frozen frame + silent audio).
+      // `-t duration` still caps the output as a safety ceiling.
+      parts.push(`[vraw]${scalePrefix}[outv]`);
+      parts.push(`[araw]anull[outa]`);
       const filterComplex = parts.join(';');
 
       const concatArgs: string[] = [

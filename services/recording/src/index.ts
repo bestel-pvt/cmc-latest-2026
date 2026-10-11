@@ -1238,12 +1238,14 @@ async function clipWorker(job: { clipId: string }) {
         ...ffInputArgs,
         ...(ss > 0.01 ? ['-ss', String(ss)] : []),
         '-t', String(duration),
-        // tpad + apad pad both streams to the full requested duration
-        // so neither can trip -shortest and cut the clip early when a
-        // segment's audio runs short mid-stream.
+        // No tpad/apad — if source has less content than the user's
+        // marked window (dropout / blackout / short segment), end the
+        // clip at natural EOF rather than cover the gap with a frozen
+        // last-frame + silence tail. Same reasoning as the multi-slice
+        // path. `-t duration` still caps as a safety ceiling.
         '-filter_complex',
-          `[0:v]${scalePrefix},tpad=stop_mode=clone:stop_duration=${duration}[outv];` +
-          `[0:a:0]aresample=48000,aformat=channel_layouts=stereo,apad=whole_dur=${duration}[outa]`,
+          `[0:v]${scalePrefix}[outv];` +
+          `[0:a:0]aresample=48000,aformat=channel_layouts=stereo[outa]`,
         '-map', '[outv]',
         '-map', '[outa]',
         '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', vBitrate,

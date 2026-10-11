@@ -1,5 +1,5 @@
 import type { FastifyPluginAsync } from 'fastify';
-import { createReadStream, statSync, writeFileSync, mkdirSync, existsSync, readdirSync, unlinkSync } from 'node:fs';
+import { createReadStream, statSync, writeFileSync, mkdirSync, existsSync, readdirSync, readFileSync, unlinkSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import os, { tmpdir } from 'node:os';
@@ -609,9 +609,26 @@ const routes: FastifyPluginAsync = async (app) => {
       if (roomMs > 0 && effectiveDurMs > roomMs) effectiveDurMs = roomMs;
       const durS = effectiveDurMs / 1000;
       const dir = join(HLS_CACHE, s.id);
+      // ACTUAL per-slice durations from the splitter's CSV sidecar.
+      // If missing (segment not yet split OR split predates the CSV
+      // feature), fall back to the uniform 6-s grid.
+      let actualDurs: number[] | null = null;
+      const listCsv = join(dir, 'list.csv');
+      if (existsSync(listCsv)) {
+        try {
+          const rows = readFileSync(listCsv, 'utf8').split('\n').filter((r) => r.trim().length > 0);
+          actualDurs = rows.map((r) => {
+            const parts = r.split(',');
+            const start = Number(parts[1]);
+            const end = Number(parts[2]);
+            return Number.isFinite(start) && Number.isFinite(end) && end > start ? end - start : SUB_DURATION;
+          });
+        } catch { actualDurs = null; }
+      }
       let nSub: number;
-      if (existsSync(join(dir, '.ready'))) {
-        // Count actual .ts files produced by ffmpeg.
+      if (actualDurs && actualDurs.length > 0) {
+        nSub = actualDurs.length;
+      } else if (existsSync(join(dir, '.ready'))) {
         try {
           nSub = readdirSync(dir).filter((f: string) => f.endsWith('.ts')).length;
         } catch {
@@ -620,11 +637,21 @@ const routes: FastifyPluginAsync = async (app) => {
       } else {
         nSub = Math.max(1, Math.floor(durS / SUB_DURATION));
       }
+      // Emit per-slice PDT so hls.js never has to propagate from
+      // declared EXTINFs (which drifts whenever actual != declared).
+      // cumulativeMs accumulates ACTUAL slice durations when we have
+      // them; falls back to the declared grid otherwise.
+      let cumulativeMs = 0;
+      const segStartMs = s.startedAt.getTime();
       for (let k = 0; k < nSub; k++) {
-        const remaining = durS - k * SUB_DURATION;
-        const thisDur = Math.min(SUB_DURATION, Math.max(1, remaining));
+        const thisDur = actualDurs
+          ? (actualDurs[k] ?? SUB_DURATION)
+          : Math.min(SUB_DURATION, Math.max(1, durS - k * SUB_DURATION));
+        const slicePdtMs = segStartMs + cumulativeMs;
+        lines.push(`#EXT-X-PROGRAM-DATE-TIME:${new Date(slicePdtMs).toISOString()}`);
         lines.push(`#EXTINF:${thisDur.toFixed(3)},`);
         lines.push(`/api/recordings/segment-hls/${s.id}/${k}.ts`);
+        cumulativeMs += thisDur * 1000;
       }
     }
     lines.push('#EXT-X-ENDLIST');
@@ -711,6 +738,17 @@ const routes: FastifyPluginAsync = async (app) => {
           '-f', 'segment',
           '-segment_time', '6',
           '-segment_format', 'mpegts',
+          // CSV sidecar with ACTUAL per-slice start/end times. ffmpeg
+          // segment muxer emits each row as: filename, start, end. We
+          // read this later in session.m3u8 generation to emit EXTINF
+          // + per-slice PROGRAM-DATE-TIME anchored to real content,
+          // not the declared 6-s uniform grid — otherwise hls.js
+          // propagates PDT via "last PDT + sum of declared EXTINFs"
+          // and the mark/scrubber captured wall-clock drifts by up
+          // to ~1 s by the end of a 60-s segment (user reported
+          // 2026-10-12 on multiple channels).
+          '-segment_list', join(outDir, 'list.csv'),
+          '-segment_list_type', 'csv',
           // reset_timestamps=1 was the CAUSE of the 5.9s-then-loading
           // stall reported 2026-08-21 (network tab showed all .ts
           // slices served from disk cache, size=0B, 2-10ms — proving

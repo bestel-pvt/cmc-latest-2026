@@ -1290,17 +1290,24 @@ async function clipWorker(job: { clipId: string }) {
     await runFfmpeg(pass1Args, 'pass1-normalise');
 
     // ----- PASS 2: accurate trim of intermediate -----
-    // `-ss` + `-to` as INPUT options on a well-formed single mp4
-    // is the SIMPLEST and most well-tested seek pattern in ffmpeg.
-    // libx264 re-encode gives frame-accurate start/end (no keyframe
-    // pre-roll). `-fps_mode passthrough` so the encoder doesn't
-    // invent frames past input EOF.
+    // Input `-ss` for fast seek (user confirmed start is perfect
+    // after the two-pass switch), then OUTPUT `-t duration` to cap
+    // the encoder at the exact mark-out length.
+    //
+    // Previous version had INPUT `-to` which let libx264 emit a
+    // trailing GOP of frames past the target end timestamp (encoder
+    // drains in group-of-pictures boundaries, not frame-accurate on
+    // the input side). User reported "ending abhi bhi thora aage
+    // drift kr rha" 2026-10-12. Switching the end-cap to OUTPUT
+    // `-t duration` makes the muxer stop at exactly `duration`
+    // seconds past the output start — frame-accurate.
+    const trimDurSec = (clip.endAt.getTime() - clip.startAt.getTime()) / 1000;
     const pass2Args: string[] = [
       '-hide_banner', '-loglevel', 'warning',
       '-threads', '4',
       '-ss', trimSsSec.toFixed(3),
-      '-to', trimToSec.toFixed(3),
       '-i', intermediatePath,
+      '-t', trimDurSec.toFixed(3),
       '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', vBitrate,
       '-maxrate', vMaxrate, '-bufsize', vBufsize,
       '-fps_mode', 'passthrough',
@@ -1308,7 +1315,7 @@ async function clipWorker(job: { clipId: string }) {
       ...(isMovLike ? ['-movflags', '+faststart'] : []),
       '-y', mainPath,
     ];
-    log.info({ clipId: clip.id, trimSs: trimSsSec, trimTo: trimToSec }, 'clip pass 2: accurate trim');
+    log.info({ clipId: clip.id, trimSs: trimSsSec, trimDur: trimDurSec }, 'clip pass 2: accurate trim');
     await runFfmpeg(pass2Args, 'pass2-trim');
 
     // (unified two-pass handles both single-file and multi-slice.)

@@ -1226,183 +1226,92 @@ async function clipWorker(job: { clipId: string }) {
       ? `scale=${w}:${h}:flags=lanczos`
       : 'null';
 
-    if (slices.length === 0) {
-      // ======================================= Single-file path
-      // Output-side -ss decodes-and-discards until the exact timestamp,
-      // keeping video and audio first-frame/first-sample locked to the
-      // same source moment. Input-side -ss would independently keyframe-
-      // snap video and AAC-frame-snap audio, baking a 20-40 ms A/V skew
-      // into the clip (the "drift in the first ~3 s" symptom).
-      const mainArgs: string[] = [
-        '-hide_banner', '-loglevel', 'warning',
-        ...ffInputArgs,
-        ...(ss > 0.01 ? ['-ss', String(ss)] : []),
-        '-t', String(duration),
-        // No tpad/apad — if source has less content than the user's
-        // marked window (dropout / blackout / short segment), end the
-        // clip at natural EOF rather than cover the gap with a frozen
-        // last-frame + silence tail. Same reasoning as the multi-slice
-        // path. `-t duration` still caps as a safety ceiling.
-        '-filter_complex',
-          `[0:v]${scalePrefix}[outv];` +
-          `[0:a:0]aresample=48000,aformat=channel_layouts=stereo[outa]`,
-        '-map', '[outv]',
-        '-map', '[outa]',
-        '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', vBitrate,
-        '-maxrate', vMaxrate, '-bufsize', vBufsize,
-        // Passthrough — see multi-slice path for the explanation.
-        '-fps_mode', 'passthrough',
-        '-c:a', 'aac', '-b:a', A_BITRATE, '-ac', '2', '-ar', '48000',
-        ...(isMovLike ? ['-movflags', '+faststart'] : []),
-        '-y', mainPath,
-      ];
-      log.info({ clipId: clip.id }, 'ffmpeg single-file render');
-      await runFfmpeg(mainArgs, 'main');
-    } else {
-      // ======================================= Multi-slice mezzanine path
-      //
-      // Rewrite 2026-10-06 — abandon mezzanine chain, go to the
-      // STANDARD ffconcat-demuxer + single-pass re-encode pattern.
-      //
-      // History of failed approaches (all shared the same flaw —
-      // multiple ffmpeg processes with per-slice encode boundaries):
-      //   - filter_complex concat with setpts/asetpts rebase (drift)
-      //   - filter_complex concat + trim/atrim + fps=25 + apad (drift)
-      //   - ffconcat demuxer with inpoint/outpoint + `-c copy` (choked
-      //     on mp3-in-mp4 segments at boundaries)
-      //   - per-slice mezzanine render + `-c copy` concat (intermittent
-      //     "1-sec cut" at the slice-0/slice-1 boundary even after the
-      //     tpad+apad fix on 2026-10-06)
-      //
-      // The root problem common to all of them: SEPARATE ffmpeg encodes
-      // per slice means SEPARATE codec contexts, SEPARATE GOP headers,
-      // SEPARATE PTS epochs — and `-c copy` concat has to stitch those
-      // disparate pieces at the container layer, where any mismatch
-      // becomes a visible playback glitch (freeze, cut, A/V slip).
-      //
-      // The standard way to concatenate several source files into
-      // ONE clean video is a single-pass re-encode via the ffconcat
-      // demuxer: inpoint/outpoint per file in the list, one output
-      // encoder context, one continuous PTS timeline. No per-slice
-      // boundaries exist in the final file at all.
-      //
-      // Robust-flag choices below:
-      //   `-fflags +genpts+igndts+discardcorrupt` — regenerate PTS
-      //     from scratch so each source segment's own PTS=0 doesn't
-      //     trigger "DTS out of order" at the boundary; ignore source
-      //     DTS entirely; drop packets flagged corrupt by the demuxer.
-      //   `-err_detect ignore_err` — let the decoder keep going past
-      //     a bad frame instead of aborting (handles the mp3 "Header
-      //     missing" case that killed the prior ffconcat-only path).
-      //   `-vf scale,tpad` — resize to final res; clone the last video
-      //     frame out to -t if the stream ends early.
-      //   `-af aresample,aformat,apad` — normalize audio format and
-      //     pad silence out to -t if the audio stream ends early.
-      //   `-fps_mode cfr -r 25` — lock output to a 25-fps grid.
-      //   `-t duration` — authoritative output length cap.
-      // Accurate seek strategy:
-      //   - inpoint on first slice is pulled back by PREROLL seconds
-      //     because ffconcat `inpoint` is keyframe-aligned on mp4 — a
-      //     raw inpoint=ssIn makes the demuxer land on the previous
-      //     keyframe (up to ~GOP seconds earlier) and that pre-roll
-      //     ends up in the final clip (user: "clip start se pehle se
-      //     start kr rha", 2026-10-11). We then apply an output-side
-      //     `-ss PREROLL` which decodes-and-discards until the exact
-      //     requested timestamp, giving frame-accurate start.
-      //   - outpoint on last slice is extended by POSTROLL seconds
-      //     so the demuxer doesn't close the stream a frame or two
-      //     short of the mark-out (user: "end se bhi jaldi band ho
-      //     rhi"). The `-t duration` output cap then trims the
-      //     postroll back off at the exact mark-out.
-      // Rewrite 2026-10-11 (nth attempt). Dropped ffconcat demuxer
-      // entirely. Both inpoint+output-ss and inpoint+filter-trim
-      // produced "3 seconds piche se bani" because the demuxer's
-      // keyframe-aligned seek + build-dependent PTS semantics made
-      // every trim position unreliable to compute from the app side.
-      //
-      // Standard ffmpeg idiom for "assemble a video out of precise
-      // windows cut from several source files": ONE `-i` per source
-      // segment, plus a single `-filter_complex` that does per-input
-      // trim at absolute file-relative PTS, rebases each slice's PTS
-      // to zero, normalises to 25-fps CFR, and feeds the concat
-      // filter. trim's start/end on the raw decoded video stream work
-      // in seconds since file start — unambiguous, build-independent.
-      // Keep concatListPath referenced only so the finally's unlinkSync
-      // stays a no-op; this path doesn't write a concat list.
-      void concatListPath;
+    // ============================================================
+    // UNIFIED TWO-PASS CLIP RENDER (2026-10-12)
+    //
+    // Previous approach: single-pass ffmpeg with filter_complex trim
+    // + concat on multiple inputs. 10+ iterations trying to make
+    // trim-accuracy work across ingest quirks (keyframe snap, VFR
+    // sources, PDT drift, encoder-level frame duplication). Each
+    // fix exposed a new corner case. User rightly asked for a
+    // "standard library" / proven mechanism.
+    //
+    // New: standard "edit decision list" pattern — same two steps
+    // every NLE (DaVinci, Premiere, etc.) uses under the hood.
+    //
+    //   PASS 1 — normalize source window to a single clean mp4
+    //   (same code the DOWNLOAD endpoint uses, which the user has
+    //   confirmed works correctly). Concat ALL whole covering
+    //   segments through the concat demuxer, re-encode to a
+    //   uniform 854x480 / libx264 / AAC mp4 at the segment layer.
+    //   No trim here — just normalise.
+    //
+    //   PASS 2 — accurate trim of the normalised mp4. Simple
+    //   `ffmpeg -i <intermediate> -ss X -to Y -c libx264 -c aac`.
+    //   Trim operates on a KNOWN-good single mp4 with uniform
+    //   codec params and a continuous timeline, so there's no
+    //   per-slice PTS tomfoolery, no demuxer PDT drift, no fps
+    //   filter edge cases, no encoder end-pad surprise.
+    //
+    // Trade-off: two re-encodes instead of one (~2x CPU). Worth it
+    // for the accuracy — user has lost more time than any encode
+    // cost to re-run clips that landed wrong.
+    const intermediatePath = join(workDir, `intermediate.mp4`);
+    // SS/TO relative to the FIRST covering segment's startedAt.
+    // Pass 1 produces an mp4 whose t=0 maps to first segment's
+    // startedAt. Pass 2's -ss / -to use that reference.
+    const firstSegStartMs = first.startedAt.getTime();
+    const trimSsSec = (clip.startAt.getTime() - firstSegStartMs) / 1000;
+    const trimToSec = (clip.endAt.getTime()   - firstSegStartMs) / 1000;
 
-      // One -i per source segment file.
-      const inputArgs: string[] = [];
-      for (const s of slices) {
-        inputArgs.push(...TOLERANCE_IN, '-i', s.file.path);
-      }
-      // Build the filter graph:
-      //   For each slice i:
-      //     [i:v]trim=start=X:end=Y,setpts=PTS-STARTPTS,fps=25[vi]
-      //     [i:a]atrim=start=X:end=Y,asetpts=PTS-STARTPTS,aresample=48000,aformat=stereo[ai]
-      //   Concat all slices:
-      //     [v0][a0][v1][a1]...concat=n=N:v=1:a=1[vraw][araw]
-      //   Final processing:
-      //     [vraw]scale,tpad[outv]
-      //     [araw]apad[outa]
-      const parts: string[] = [];
-      for (let i = 0; i < slices.length; i++) {
-        const s = slices[i]!;
-        const start = s.ssIn.toFixed(3);
-        const end = (s.ssIn + s.dur).toFixed(3);
-        // No fps=25 per slice — `fps` was duplicating the last good
-        // frame when source had a mid-window gap, creating a hidden
-        // "frozen tail" even without tpad (dawn-news clip 2026-10-11:
-        // last 8 s of 80-s clip was frozen even though tpad was already
-        // removed). Encoder-level `-r 25 -fps_mode cfr` still gives a
-        // CFR output; letting the per-slice stream stay VFR means a
-        // real source gap ends the stream at natural EOF instead of
-        // being filled with clones.
-        parts.push(`[${i}:v]trim=start=${start}:end=${end},setpts=PTS-STARTPTS[v${i}]`);
-        parts.push(`[${i}:a]atrim=start=${start}:end=${end},asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=stereo[a${i}]`);
-      }
-      const concatInputsRef = slices.map((_, i) => `[v${i}][a${i}]`).join('');
-      parts.push(`${concatInputsRef}concat=n=${slices.length}:v=1:a=1[vraw][araw]`);
-      // Scale only — NO tpad or apad padding. If a source segment has
-      // less content than the slice's wall-clock window (ingest dropout
-      // mid-window, source blackout, partial segment), we'd rather end
-      // the clip at that natural EOF than cover the gap with a frozen
-      // last-frame + silence tail. The user calls that frozen tail
-      // "7 secs stucked" and treats it as a bug (dawn-news clip
-      // 2026-10-11 ended with ~8 s of frozen frame + silent audio).
-      // `-t duration` still caps the output as a safety ceiling.
-      parts.push(`[vraw]${scalePrefix}[outv]`);
-      parts.push(`[araw]anull[outa]`);
-      const filterComplex = parts.join(';');
-
-      const concatArgs: string[] = [
-        '-hide_banner', '-loglevel', 'warning',
-        '-threads', '4',
-        ...inputArgs,
-        '-filter_complex', filterComplex,
-        '-map', '[outv]',
-        '-map', '[outa]',
-        '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', vBitrate,
-        '-maxrate', vMaxrate, '-bufsize', vBufsize,
-        // -fps_mode passthrough preserves input PTS as-is. The previous
-        // `-r 25 -fps_mode cfr` combined with `-t duration` was the
-        // actual source of the "last 8 s frozen" symptom: when the
-        // trimmed input stream naturally ended before `-t duration`,
-        // the CFR encoder generated frames at 25 fps all the way out
-        // to `-t`, picking the LAST decoded frame for every output
-        // PTS past input EOF — a hidden tpad-equivalent at the
-        // encoder layer that no amount of filter-chain cleanup could
-        // reach. Passthrough lets the output stream end naturally
-        // when input ends.
-        '-fps_mode', 'passthrough',
-        '-c:a', 'aac', '-b:a', A_BITRATE, '-ar', '48000', '-ac', '2',
-        '-t', String(duration),
-        ...(isMovLike ? ['-movflags', '+faststart'] : []),
-        '-y', mainPath,
-      ];
-      log.info({ clipId: clip.id, slices: slices.length }, 'ffmpeg multi-input + filter_complex trim+concat');
-      await runFfmpeg(concatArgs, 'multi-input');
+    // ----- PASS 1: concat all covering segments → intermediate mp4 -----
+    const concatLines: string[] = ['ffconcat version 1.0'];
+    for (const f of covering) {
+      const p = f.path.replace(/\\/g, '/').replace(/'/g, "'\\''");
+      concatLines.push(`file '${p}'`);
     }
+    writeFileSync(concatListPath, concatLines.join('\n') + '\n', 'utf8');
+
+    const pass1Args: string[] = [
+      '-hide_banner', '-loglevel', 'warning',
+      '-threads', '4',
+      '-fflags', '+discardcorrupt',
+      '-err_detect', 'ignore_err',
+      '-f', 'concat', '-safe', '0', '-i', concatListPath,
+      '-vf', scalePrefix,
+      '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', vBitrate,
+      '-maxrate', vMaxrate, '-bufsize', vBufsize,
+      '-fps_mode', 'passthrough',
+      '-c:a', 'aac', '-b:a', A_BITRATE, '-ac', '2', '-ar', '48000',
+      '-movflags', '+faststart',
+      '-y', intermediatePath,
+    ];
+    log.info({ clipId: clip.id, segs: covering.length }, 'clip pass 1: normalise segments → intermediate mp4');
+    await runFfmpeg(pass1Args, 'pass1-normalise');
+
+    // ----- PASS 2: accurate trim of intermediate -----
+    // `-ss` + `-to` as INPUT options on a well-formed single mp4
+    // is the SIMPLEST and most well-tested seek pattern in ffmpeg.
+    // libx264 re-encode gives frame-accurate start/end (no keyframe
+    // pre-roll). `-fps_mode passthrough` so the encoder doesn't
+    // invent frames past input EOF.
+    const pass2Args: string[] = [
+      '-hide_banner', '-loglevel', 'warning',
+      '-threads', '4',
+      '-ss', trimSsSec.toFixed(3),
+      '-to', trimToSec.toFixed(3),
+      '-i', intermediatePath,
+      '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', vBitrate,
+      '-maxrate', vMaxrate, '-bufsize', vBufsize,
+      '-fps_mode', 'passthrough',
+      '-c:a', 'aac', '-b:a', A_BITRATE, '-ac', '2', '-ar', '48000',
+      ...(isMovLike ? ['-movflags', '+faststart'] : []),
+      '-y', mainPath,
+    ];
+    log.info({ clipId: clip.id, trimSs: trimSsSec, trimTo: trimToSec }, 'clip pass 2: accurate trim');
+    await runFfmpeg(pass2Args, 'pass2-trim');
+
+    // (unified two-pass handles both single-file and multi-slice.)
 
     // Attach a cover image so WhatsApp (and other social platforms)
     // show a non-black thumbnail in the share chat. The video's first

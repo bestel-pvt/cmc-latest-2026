@@ -349,17 +349,23 @@ export default function NewClipPage() {
   const captureMark = (v: HTMLVideoElement | null) => {
     if (!v) return { seconds: 0, absMs: null as number | null };
     const seconds = Math.max(0, v.currentTime);
-    // Prefer per-fragment PDT: currentFragPDT + (v.currentTime - fragStart).
-    // Falls back to first-PDT anchor + full currentTime when no fragment
-    // info is available (Safari native HLS, pre-FRAG_CHANGED).
-    const cur = currentFragRef.current;
-    let absMs: number | null = null;
-    if (cur) {
-      absMs = cur.pdt + Math.round((seconds - cur.start) * 1000);
-    } else {
-      const anchor = playlistStartMsRef.current;
-      absMs = anchor !== null ? anchor + Math.round(seconds * 1000) : null;
-    }
+    // Use playlist anchor + v.currentTime. The previous per-fragment
+    // PDT math (currentFragPDT + (currentTime - fragStart)) drifted
+    // for sources where the splitter produces sub-fragments whose
+    // ACTUAL duration doesn't match the declared 6-s EXTINF — hls.js
+    // propagates PDT with "last PDT + sum of declared EXTINFs",
+    // accumulating ~0.5 s of error per sub-fragment, so by the end
+    // of a 60-s segment the per-fragment PDT is 5-6 s ahead of
+    // reality. That drift showed up as a 6-s offset between the
+    // scrubber cursor and the captured OUT timestamp on a Dawn News
+    // clip (2026-10-11) and translated directly into 6-8 s of frozen
+    // tail at render time.
+    //
+    // anchorMs + v.currentTime matches what the scrubber cursor
+    // actually displays, so IN/OUT capture is always consistent with
+    // what the user clicked.
+    const anchor = playlistStartMsRef.current;
+    const absMs = anchor !== null ? anchor + Math.round(seconds * 1000) : null;
     return { seconds, absMs };
   };
   const setIn  = (v: HTMLVideoElement | null) => { const m = captureMark(v); setMarkIn(m.seconds);  setMarkInMs(m.absMs); };

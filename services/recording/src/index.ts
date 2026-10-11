@@ -1349,7 +1349,15 @@ async function clipWorker(job: { clipId: string }) {
         const s = slices[i]!;
         const start = s.ssIn.toFixed(3);
         const end = (s.ssIn + s.dur).toFixed(3);
-        parts.push(`[${i}:v]trim=start=${start}:end=${end},setpts=PTS-STARTPTS,fps=25[v${i}]`);
+        // No fps=25 per slice — `fps` was duplicating the last good
+        // frame when source had a mid-window gap, creating a hidden
+        // "frozen tail" even without tpad (dawn-news clip 2026-10-11:
+        // last 8 s of 80-s clip was frozen even though tpad was already
+        // removed). Encoder-level `-r 25 -fps_mode cfr` still gives a
+        // CFR output; letting the per-slice stream stay VFR means a
+        // real source gap ends the stream at natural EOF instead of
+        // being filled with clones.
+        parts.push(`[${i}:v]trim=start=${start}:end=${end},setpts=PTS-STARTPTS[v${i}]`);
         parts.push(`[${i}:a]atrim=start=${start}:end=${end},asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=stereo[a${i}]`);
       }
       const concatInputsRef = slices.map((_, i) => `[v${i}][a${i}]`).join('');

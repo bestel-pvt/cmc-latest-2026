@@ -386,20 +386,29 @@ const routes: FastifyPluginAsync = async (app) => {
       } finally {
         dlRelease();
       }
-      // Belt-and-braces validation. The old size>1024 check let a
-      // corrupt mp4 (writeable but with a broken moov atom) through
-      // the cache — that was the "second click downloads but won't
-      // play" symptom. ffmpeg -v error -f null - exits non-zero on
-      // files that can't be opened, which is the exact check a media
-      // player would run. ffprobe would be cleaner but isn't shipped
-      // on the CMC Windows ffmpeg build.
+      // Validation: non-empty AND decoder can OPEN the moov. The
+      // previous `-c copy -t 0.1` check was too strict — it exited
+      // non-zero whenever the demuxer logged ANY warning (invalid
+      // SPS, missing PES header), even on files that media players
+      // handled fine. Hum News on 2026-10-12 triggered that false
+      // positive and the "first click 500, second click corrupt
+      // download" symptom came back.
+      //
+      // New check decodes a tiny amount of video (one frame window)
+      // through the full decoder. If a frame can actually be rendered
+      // the mp4 is playable. Decoder tolerance flags skip past
+      // non-fatal demuxer warnings instead of exiting non-zero.
       if (!existsSync(outPath) || statSync(outPath).size < 1024) {
         throw new Error('ffmpeg produced empty output');
       }
       const checkOk = await new Promise<boolean>((resolve) => {
         const probe = spawn('ffmpeg', [
-          '-v', 'error', '-i', outPath, '-c', 'copy',
-          '-t', '0.1', '-f', 'null', '-',
+          '-v', 'error',
+          '-err_detect', 'ignore_err',
+          '-fflags', '+discardcorrupt',
+          '-i', outPath,
+          '-t', '0.5',
+          '-f', 'null', '-',
         ], { stdio: ['ignore', 'ignore', 'pipe'] });
         probe.on('exit', (code) => resolve(code === 0));
         probe.on('error', () => resolve(false));

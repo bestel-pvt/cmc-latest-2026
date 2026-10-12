@@ -1272,6 +1272,17 @@ async function clipWorker(job: { clipId: string }) {
     }
     writeFileSync(concatListPath, concatLines.join('\n') + '\n', 'utf8');
 
+    // CFR 25 fps on both passes. Passthrough was producing VFR mp4
+    // that Windows Media Player / mobile players rendered as laggy
+    // and stuttery (user: "clip bht laggy, slow or stuck stuck aa
+    // rhi thi" 2026-10-12). CFR is a well-supported playback target.
+    // The end-pad risk that drove the previous passthrough switch
+    // does NOT apply here because:
+    //   - Pass 1 has no `-t` cap, so the encoder outputs the natural
+    //     concat duration and never pads past input EOF.
+    //   - Pass 2's `-ss + -t` trim window falls INSIDE the full-length
+    //     intermediate (slice math never asks for content past the
+    //     intermediate's end).
     const pass1Args: string[] = [
       '-hide_banner', '-loglevel', 'warning',
       '-threads', '4',
@@ -1281,7 +1292,7 @@ async function clipWorker(job: { clipId: string }) {
       '-vf', scalePrefix,
       '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', vBitrate,
       '-maxrate', vMaxrate, '-bufsize', vBufsize,
-      '-fps_mode', 'passthrough',
+      '-fps_mode', 'cfr', '-r', '25',
       '-c:a', 'aac', '-b:a', A_BITRATE, '-ac', '2', '-ar', '48000',
       '-movflags', '+faststart',
       '-y', intermediatePath,
@@ -1310,7 +1321,7 @@ async function clipWorker(job: { clipId: string }) {
       '-t', trimDurSec.toFixed(3),
       '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', vBitrate,
       '-maxrate', vMaxrate, '-bufsize', vBufsize,
-      '-fps_mode', 'passthrough',
+      '-fps_mode', 'cfr', '-r', '25',
       '-c:a', 'aac', '-b:a', A_BITRATE, '-ac', '2', '-ar', '48000',
       ...(isMovLike ? ['-movflags', '+faststart'] : []),
       '-y', mainPath,
@@ -1331,26 +1342,52 @@ async function clipWorker(job: { clipId: string }) {
     const withCoverPath = join(workDir, `withcover.${clip.format.toLowerCase()}`);
     try {
       const thumbPath = join(workDir, 'thumb.jpg');
-      // Hard-coded midpoint -ss hits whatever frame happens to live
-      // at that timestamp — ad transitions, source blackouts, and
-      // encoder GOP headers routinely leave that spot as a black
-      // frame, which is what social platforms then show as the
-      // share thumbnail. The `thumbnail` filter samples a window of
-      // frames and emits the ONE statistically most-distinctive
-      // frame of that window — black frames score near zero on the
-      // RMS/luma histogram the filter uses, so they get skipped
-      // automatically. We ask for a window of 100 frames (~4 s at
-      // 25 fps) from near the clip's midpoint, which is far enough
-      // from both intro and outro to usually land on real content.
+      // Earlier version used `thumbnail=100` at the midpoint. That
+      // works for ~90 % of clips but fails for clips that are mostly
+      // dark (news bulletin after dark intro, b-roll with low light),
+      // where the whole 100-frame window scores near zero and the
+      // filter picks a black frame anyway.
+      //
+      // New approach: skip frames whose average brightness is below
+      // a threshold (`blackframe=amount=0:threshold=32` reports
+      // black-ish frames), then pick the thumbnail from what's left.
+      // We sample a wider 300-frame window (~12 s at 25 fps) to give
+      // the filter chain more non-black candidates. If the whole
+      // clip is genuinely black, fall back to the first non-trivial
+      // frame via a second attempt.
       const windowStart = Math.max(0.5, Math.min(duration / 2 - 2, duration - 5));
-      await runFfmpeg([
-        '-hide_banner', '-loglevel', 'error',
-        '-ss', windowStart.toFixed(3),
-        '-i', mainPath,
-        '-vf', 'thumbnail=100',
-        '-frames:v', '1', '-q:v', '3',
-        '-y', thumbPath,
-      ], 'thumb-extract');
+      try {
+        // signalstats exposes YAVG (luma average 0-255) per frame via
+        // frame metadata. select='gt(lavfi.signalstats.YAVG,40)' keeps
+        // only non-dark frames. thumbnail=300 then picks the most
+        // distinctive of those over a ~12 s window. If no non-dark
+        // frame exists in the window, select emits nothing and the
+        // fallback below runs.
+        await runFfmpeg([
+          '-hide_banner', '-loglevel', 'error',
+          '-ss', windowStart.toFixed(3),
+          '-i', mainPath,
+          '-vf', "signalstats,select='gt(lavfi.signalstats.YAVG,40)',thumbnail=300",
+          '-frames:v', '1', '-q:v', '3',
+          '-y', thumbPath,
+        ], 'thumb-extract');
+        // signalstats path may succeed yet still produce 0 bytes if
+        // the whole window was dark; treat that as a failure and
+        // fall back.
+        if (!existsSync(thumbPath) || statSync(thumbPath).size < 1024) {
+          throw new Error('thumbnail from signalstats was empty');
+        }
+      } catch {
+        // Fallback: plain thumbnail=100 at midpoint.
+        await runFfmpeg([
+          '-hide_banner', '-loglevel', 'error',
+          '-ss', windowStart.toFixed(3),
+          '-i', mainPath,
+          '-vf', 'thumbnail=100',
+          '-frames:v', '1', '-q:v', '3',
+          '-y', thumbPath,
+        ], 'thumb-extract-fallback');
+      }
       await runFfmpeg([
         '-hide_banner', '-loglevel', 'error',
         '-i', mainPath, '-i', thumbPath,

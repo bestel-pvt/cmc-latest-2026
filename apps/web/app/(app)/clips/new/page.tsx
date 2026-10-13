@@ -440,24 +440,24 @@ export default function NewClipPage() {
   const outPct = markOut !== null && totalSeconds ? (markOut / totalSeconds) * 100 : null;
   const curPct = totalSeconds ? (current / totalSeconds) * 100 : 0;
 
-  // Wall-time-based display values. The video's currentTime advances by
-  // playlist-declared EXTINF durations, which under-report actual segment
-  // lengths for copy-mode/interlaced recordings (declared 60 s vs actual
-  // 60-70 s). markInMs/markOutMs are the TRUE wall time captured via
-  // per-fragment PDT; expressing them as offsets from the session anchor
-  // gives what the operator should see on the scrubber so the on-screen
-  // length matches the rendered clip's real duration. Falls back to
-  // v.currentTime seconds when wall data isn't available (Safari native
-  // HLS, or before the first fragment loads).
-  const inWallSec = (markInMs !== null && anchorMs !== null)
-    ? (markInMs - anchorMs) / 1000
-    : markIn;
-  const outWallSec = (markOutMs !== null && anchorMs !== null)
-    ? (markOutMs - anchorMs) / 1000
-    : markOut;
-  const lengthWallSec = (markInMs !== null && markOutMs !== null)
-    ? (markOutMs - markInMs) / 1000
-    : (markIn !== null && markOut !== null && markOut > markIn ? markOut - markIn : null);
+  // Display values match the scrubber cursor's units (v.currentTime).
+  // Previous version expressed IN/OUT as `(markInMs - anchorMs) / 1000`
+  // in wall-clock seconds, which was correct for the clip renderer but
+  // DID NOT MATCH the cursor display on channels whose source has a
+  // PTS-vs-wall-clock clock drift (ABB TAKK 2026-10-14: scrubber at
+  // 01:39.122 showed IN as 01:44.984 even after the per-slice PDT
+  // scaleFactor fix absorbed the drift, because the DISPLAY was in
+  // wall-clock while the CURSOR was in PTS/EXTINF units — same amount
+  // of drift between the two, just different units).
+  //
+  // The clip renderer still receives markInMs/markOutMs (wall-clock)
+  // and extracts from the correct frames; this change only aligns
+  // what the operator sees in the editor with where they clicked.
+  const inWallSec = markIn;
+  const outWallSec = markOut;
+  const lengthWallSec = (markIn !== null && markOut !== null && markOut > markIn)
+    ? markOut - markIn
+    : null;
 
   // Landing view when the URL has neither ?segmentId= nor ?sessionStart=
   if (!segmentId && !(sessionStart && sessionEnd)) {

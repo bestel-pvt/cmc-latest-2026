@@ -647,20 +647,45 @@ const routes: FastifyPluginAsync = async (app) => {
         nSub = Math.max(1, Math.floor(durS / SUB_DURATION));
       }
       // Emit per-slice PDT so hls.js never has to propagate from
-      // declared EXTINFs (which drifts whenever actual != declared).
-      // cumulativeMs accumulates ACTUAL slice durations when we have
-      // them; falls back to the declared grid otherwise.
+      // declared EXTINFs. Two layered concerns:
+      //   (1) hls.js's `fragment.programDateTime` must reflect the
+      //       wall-clock moment of the FRAME shown at that fragment,
+      //       otherwise clip IN/OUT marks captured from the editor
+      //       drift against what the clip renderer later extracts
+      //       (which uses raw wall-clock markInMs/markOutMs).
+      //   (2) EXTINF must reflect PTS duration so hls.js plays each
+      //       fragment for the right length and v.currentTime
+      //       advances consistently.
+      //
+      // For most channels the splitter's actual PTS durations sum
+      // to approximately the segment's wall-clock durationMs, so
+      // scaleFactor ≈ 1 and these are equivalent. ABB TAKK has a
+      // source clock drift (reported 2026-10-14: ~2 s offset
+      // between scrubber cursor and captured IN) where PTS and
+      // wall-clock diverge inside a single 60-s segment. Scaling
+      // PDT by (segmentWallDurMs / totalCsvMs) stretches/compresses
+      // the propagation so each fragment's PDT lands on real wall
+      // clock instead of PTS cumulative, which fixes the drift
+      // without touching other channels.
       let cumulativeMs = 0;
       const segStartMs = s.startedAt.getTime();
+      const segmentWallDurMs = s.durationMs;
+      let totalCsvMs = 0;
+      if (actualDurs) {
+        for (let k = 0; k < nSub; k++) totalCsvMs += (actualDurs[k] ?? SUB_DURATION) * 1000;
+      } else {
+        totalCsvMs = nSub * SUB_DURATION * 1000;
+      }
+      const scaleFactor = totalCsvMs > 0 ? segmentWallDurMs / totalCsvMs : 1;
       for (let k = 0; k < nSub; k++) {
-        const thisDur = actualDurs
+        const thisDurPts = actualDurs
           ? (actualDurs[k] ?? SUB_DURATION)
           : Math.min(SUB_DURATION, Math.max(1, durS - k * SUB_DURATION));
-        const slicePdtMs = segStartMs + cumulativeMs;
+        const slicePdtMs = segStartMs + Math.round(cumulativeMs * scaleFactor);
         lines.push(`#EXT-X-PROGRAM-DATE-TIME:${new Date(slicePdtMs).toISOString()}`);
-        lines.push(`#EXTINF:${thisDur.toFixed(3)},`);
+        lines.push(`#EXTINF:${thisDurPts.toFixed(3)},`);
         lines.push(`/api/recordings/segment-hls/${s.id}/${k}.ts`);
-        cumulativeMs += thisDur * 1000;
+        cumulativeMs += thisDurPts * 1000;
       }
     }
     lines.push('#EXT-X-ENDLIST');

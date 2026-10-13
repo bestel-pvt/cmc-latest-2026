@@ -1265,28 +1265,10 @@ async function clipWorker(job: { clipId: string }) {
     const trimToSec = (clip.endAt.getTime()   - firstSegStartMs) / 1000;
 
     // ----- PASS 1: concat all covering segments → intermediate mp4 -----
-    // The `duration` directive per file is critical for sources with
-    // PTS-vs-wall-clock drift (ABB TAKK 1080i PAL — reported 2026-10-14,
-    // 2-6 s cumulative drift over multi-minute clips). Without it,
-    // concat demuxer uses each file's INTERNAL PTS span, which for
-    // ABB TAKK runs ~1.5-2% faster than wall-clock. Intermediate's
-    // timeline then diverges from the wall-clock-based trim position
-    // computed in pass 2, and the clip lands on content earlier than
-    // the user marked. With `duration` set from DB `durationMs` (= wall-
-    // clock span of the segment), concat demuxer caps each file at its
-    // true wall-clock length, intermediate timeline matches wall-clock,
-    // and pass 2's wall-clock seek is accurate.
     const concatLines: string[] = ['ffconcat version 1.0'];
     for (const f of covering) {
       const p = f.path.replace(/\\/g, '/').replace(/'/g, "'\\''");
       concatLines.push(`file '${p}'`);
-      // Number() unwraps possible BigInt (Prisma INT8 columns) and
-      // isFinite guards against null/undefined/NaN. Fall back to the
-      // declared segment duration if the DB value is unusable —
-      // otherwise ffmpeg bails with "Line N: invalid duration 'NaN'".
-      const dMs = Number(f.durationMs);
-      const durSec = isFinite(dMs) && dMs > 0 ? dMs / 1000 : SEG_SECONDS;
-      concatLines.push(`duration ${durSec.toFixed(3)}`);
     }
     writeFileSync(concatListPath, concatLines.join('\n') + '\n', 'utf8');
 

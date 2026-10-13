@@ -1280,7 +1280,13 @@ async function clipWorker(job: { clipId: string }) {
     for (const f of covering) {
       const p = f.path.replace(/\\/g, '/').replace(/'/g, "'\\''");
       concatLines.push(`file '${p}'`);
-      concatLines.push(`duration ${(f.durationMs / 1000).toFixed(3)}`);
+      // Number() unwraps possible BigInt (Prisma INT8 columns) and
+      // isFinite guards against null/undefined/NaN. Fall back to the
+      // declared segment duration if the DB value is unusable —
+      // otherwise ffmpeg bails with "Line N: invalid duration 'NaN'".
+      const dMs = Number(f.durationMs);
+      const durSec = isFinite(dMs) && dMs > 0 ? dMs / 1000 : SEG_SECONDS;
+      concatLines.push(`duration ${durSec.toFixed(3)}`);
     }
     writeFileSync(concatListPath, concatLines.join('\n') + '\n', 'utf8');
 

@@ -4,7 +4,7 @@ import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import {
   LayoutDashboard, Tv2, Film, ScrollText,
-  Users, Scissors, LayoutGrid, Image as ImageIcon, KeyRound, LogOut,
+  Users, Scissors, LayoutGrid, Image as ImageIcon, KeyRound, LogOut, Layers,
 } from 'lucide-react';
 import { WordMark } from '@/components/brand-mark';
 import { cn } from '@/lib/utils';
@@ -26,6 +26,7 @@ const NAV: NavItem[] = [
   { href: '/channels',    label: 'Channels',     icon: Tv2 },
   { href: '/recordings',  label: 'Recordings',   icon: Film },
   { href: '/clips',       label: 'Clips',        icon: Scissors },
+  { href: '/clip-merges', label: 'Merged Clips', icon: Layers },
   { href: '/frames',      label: 'Frames',       icon: ImageIcon },
 
   { section: 'Admin', href: '/admin/users',     label: 'Users',           icon: Users,      roles: ['ADMIN'] },

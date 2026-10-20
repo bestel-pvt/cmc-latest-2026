@@ -37,6 +37,7 @@ model User {
 
   auditLogs      AuditLog[]
   clips          Clip[]
+  clipMerges     ClipMerge[]
   legalHolds     LegalHold[]
   keywords       Keyword[]
   collages       Collage[]
@@ -115,6 +116,7 @@ model Channel {
   segments        RecordingSegment[]
   manifests       RecordingManifest[]
   clips           Clip[]
+  clipMergeSegments ClipMergeSegment[]
   alerts          Alert[]
   legalHolds      LegalHold[]
   tickerEvents    TickerEvent[]
@@ -286,6 +288,47 @@ model Clip {
   @@index([channelId, createdAt])
   @@index([createdById, createdAt])
   @@index([status])
+}
+
+// Multi-clip merge — operator picks N arbitrary {channel, startAt, endAt}
+// segments across any channels, worker renders each with the same
+// clipWorker pipeline, then stitches them in order into a single mp4.
+// Independent of the Clip model so a merge can exist alongside its
+// source clips without any coupling.
+model ClipMerge {
+  id             String             @id @default(cuid())
+  title          String
+  notes          String?
+  format         ClipFormat         @default(MP4)
+  resolution     String             @default("1920x1080")
+  status         ClipStatus         @default(QUEUED)
+  path           String?            // filled once READY
+  sizeBytes      BigInt?
+  sha256         String?
+  errorMessage   String?            // short reason text if FAILED
+  createdById    String
+  createdBy      User               @relation(fields: [createdById], references: [id])
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+  segments       ClipMergeSegment[]
+
+  @@index([createdById, createdAt])
+  @@index([status])
+}
+
+model ClipMergeSegment {
+  id            String     @id @default(cuid())
+  clipMergeId   String
+  clipMerge     ClipMerge  @relation(fields: [clipMergeId], references: [id], onDelete: Cascade)
+  orderIdx      Int        // 0-based position in the final output
+  channelId     String
+  channel       Channel    @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  startAt       DateTime
+  endAt         DateTime
+
+  @@unique([clipMergeId, orderIdx])
+  @@index([clipMergeId])
+  @@index([channelId])
 }
 
 // ---------- Alerts + Keywords -------------------------------------------

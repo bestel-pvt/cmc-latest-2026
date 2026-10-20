@@ -9,6 +9,10 @@ const routes: FastifyPluginAsync = async (app) => {
     const q = (req.query as { channelId?: string; status?: string; from?: string; to?: string; limit?: string }) ?? {};
     return app.prisma.clip.findMany({
       where: {
+        // Hide merge-scratch rows: they are internal mezzanines created
+        // by clipMergeWorker and deleted as soon as the parent merge
+        // finishes. See services/recording/src/index.ts:clipMergeWorker.
+        NOT: { notes: { startsWith: '__merge_scratch__' } },
         ...(q.channelId ? { channelId: q.channelId } : {}),
         ...(q.status    ? { status: q.status as never } : {}),
         ...(q.from || q.to ? {

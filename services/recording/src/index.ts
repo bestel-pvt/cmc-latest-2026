@@ -1448,6 +1448,115 @@ async function clipWorker(job: { clipId: string }) {
   }
 }
 
+// Multi-clip merge worker. Operator submits an ordered list of
+// {channel, startAt, endAt} segments; this worker renders each via
+// clipWorker (same accurate 2-pass pipeline, same resolution/bitrate)
+// to a scratch Clip row, then concatenates all the outputs in order
+// with `-c copy` (safe because every scratch output is produced by
+// the same encoder profile — no re-encode needed for the stitch).
+//
+// Scratch rows carry a `__merge_scratch__:<mergeId>` marker in notes
+// so the /api/clips list filter can hide them; they are deleted
+// (DB row + file) once the merge finishes, whether successful or
+// failed.
+async function clipMergeWorker(job: { clipMergeId: string }) {
+  const merge = await prisma.clipMerge.findUnique({
+    where: { id: job.clipMergeId },
+    include: { segments: { orderBy: { orderIdx: 'asc' } } },
+  });
+  if (!merge) return;
+  await prisma.clipMerge.update({ where: { id: merge.id }, data: { status: 'RENDERING', errorMessage: null } });
+  log.info({ clipMergeId: merge.id, segs: merge.segments.length }, 'rendering clip merge');
+
+  mkdirSync(CLIPS, { recursive: true });
+  const outFile = join(CLIPS, `merge_${merge.id}.${merge.format.toLowerCase()}`);
+  const scratchIds: string[] = [];
+  const scratchPaths: string[] = [];
+  const concatListPath = join(tmpdir(), `merge-concat-${merge.id}.txt`);
+  const cleanupScratch = async () => {
+    for (const sid of scratchIds) {
+      try {
+        const s = await prisma.clip.findUnique({ where: { id: sid }, select: { path: true } });
+        if (s?.path) { try { unlinkSync(s.path); } catch { /* */ } }
+        await prisma.clip.delete({ where: { id: sid } });
+      } catch { /* */ }
+    }
+  };
+
+  try {
+    for (const seg of merge.segments) {
+      const scratch = await prisma.clip.create({
+        data: {
+          channelId: seg.channelId,
+          startAt: seg.startAt,
+          endAt: seg.endAt,
+          title: `merge-scratch ${merge.id} #${seg.orderIdx}`,
+          notes: `__merge_scratch__:${merge.id}`,
+          format: merge.format,
+          resolution: merge.resolution,
+          watermarkText: null,
+          status: 'QUEUED',
+          createdById: merge.createdById,
+        },
+      });
+      scratchIds.push(scratch.id);
+      log.info({ clipMergeId: merge.id, scratchId: scratch.id, idx: seg.orderIdx, channelId: seg.channelId }, 'merge: rendering scratch segment');
+      // Call clipWorker as a function (same signature as the Redis
+      // handler uses). Awaiting is safe because clipWorker handles
+      // its own status transitions and failure modes internally.
+      await clipWorker({ clipId: scratch.id });
+      const rendered = await prisma.clip.findUnique({ where: { id: scratch.id }, select: { status: true, path: true } });
+      if (!rendered || rendered.status !== 'READY' || !rendered.path) {
+        throw new Error(`segment #${seg.orderIdx} did not render (status=${rendered?.status ?? 'missing'})`);
+      }
+      scratchPaths.push(rendered.path);
+    }
+
+    // Stitch all scratch mp4s with concat demuxer + `-c copy`. Scratch
+    // outputs share the same codec/profile/fps/sample-rate because
+    // they came from the SAME clipWorker invocation path, so concat
+    // demuxer stream-copy is safe — no re-encode cost, no quality
+    // loss, output ready in seconds regardless of merge length.
+    const concatLines = ['ffconcat version 1.0'];
+    for (const p of scratchPaths) {
+      concatLines.push(`file '${p.replace(/\\/g, '/').replace(/'/g, "'\\''")}'`);
+    }
+    writeFileSync(concatListPath, concatLines.join('\n') + '\n', 'utf8');
+
+    const args = [
+      '-hide_banner', '-loglevel', 'warning',
+      '-fflags', '+discardcorrupt',
+      '-err_detect', 'ignore_err',
+      '-f', 'concat', '-safe', '0', '-i', concatListPath,
+      '-c', 'copy',
+      '-movflags', '+faststart',
+      '-y', outFile,
+    ];
+    log.info({ clipMergeId: merge.id, segs: scratchPaths.length }, 'merge: stitching scratch outputs');
+    await runFfmpeg(args, 'merge-concat');
+
+    const size = statSync(outFile).size;
+    const hash = await sha256(outFile);
+    await prisma.clipMerge.update({
+      where: { id: merge.id },
+      data: { status: 'READY', path: outFile, sizeBytes: BigInt(size), sha256: hash },
+    });
+    log.info({ clipMergeId: merge.id, sizeMB: (size / 1024 / 1024).toFixed(1) }, 'clip merge ready');
+    await cleanupScratch();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.error({ err, clipMergeId: merge.id }, 'clip merge render failed');
+    await prisma.clipMerge.update({
+      where: { id: merge.id },
+      data: { status: 'FAILED', errorMessage: msg.slice(0, 500) },
+    });
+    try { unlinkSync(outFile); } catch { /* */ }
+    await cleanupScratch();
+  } finally {
+    try { unlinkSync(concatListPath); } catch { /* */ }
+  }
+}
+
 function hasFfmpeg(): boolean {
   try { return spawnSync('ffmpeg', ['-version'], { stdio: 'ignore' }).status === 0; }
   catch { return false; }
@@ -1497,23 +1606,46 @@ async function main() {
   // render out. Sequential to keep CPU sane; there are usually 0-5.
   try {
     const queued = await prisma.clip.findMany({
-      where: { status: { in: ['QUEUED', 'RENDERING'] } },
+      where: {
+        status: { in: ['QUEUED', 'RENDERING'] },
+        // Skip merge-scratch rows — they are driven synchronously by
+        // clipMergeWorker (await'd one at a time) and must not be
+        // double-processed by this sweep.
+        NOT: { notes: { startsWith: '__merge_scratch__' } },
+      },
       select: { id: true, title: true, status: true, createdAt: true },
       orderBy: { createdAt: 'asc' },
     });
     if (queued.length) {
       log.info({ count: queued.length }, 'catch-up: found queued clips, re-processing');
-      // If it was mid-render when we crashed, revert to QUEUED so
-      // clipWorker's own state transitions still fire.
       const midRender = queued.filter((c) => c.status === 'RENDERING').map((c) => c.id);
       if (midRender.length) {
         await prisma.clip.updateMany({ where: { id: { in: midRender } }, data: { status: 'QUEUED' } });
       }
-      // Fire and forget — each clipWorker is async.
       for (const c of queued) void clipWorker({ clipId: c.id });
     }
   } catch (err) {
     log.warn({ err }, 'catch-up sweep failed (non-fatal)');
+  }
+
+  // Same catch-up for clip merges — a merge that was mid-render when
+  // the service died needs to be redriven from scratch.
+  try {
+    const queuedMerges = await prisma.clipMerge.findMany({
+      where: { status: { in: ['QUEUED', 'RENDERING'] } },
+      select: { id: true, status: true },
+      orderBy: { createdAt: 'asc' },
+    });
+    if (queuedMerges.length) {
+      log.info({ count: queuedMerges.length }, 'catch-up: found queued clip merges, re-processing');
+      const midRender = queuedMerges.filter((m: { status: string }) => m.status === 'RENDERING').map((m: { id: string }) => m.id);
+      if (midRender.length) {
+        await prisma.clipMerge.updateMany({ where: { id: { in: midRender } }, data: { status: 'QUEUED' } });
+      }
+      for (const m of queuedMerges) void clipMergeWorker({ clipMergeId: m.id });
+    }
+  } catch (err) {
+    log.warn({ err }, 'merge catch-up sweep failed (non-fatal)');
   }
 
   // Periodic sweep — belt + suspenders against lost Redis pub/sub
@@ -1526,12 +1658,15 @@ async function main() {
     try {
       const stale = await prisma.clip.findMany({
         where: {
-          OR: [
-            { status: 'QUEUED' },
-            // RENDERING clips whose row hasn't been touched in >5 min
-            // = worker died mid-render (updatedAt bumps on every state
-            // transition).
-            { status: 'RENDERING', updatedAt: { lt: new Date(Date.now() - 5 * 60_000) } },
+          AND: [
+            { OR: [
+              { status: 'QUEUED' },
+              { status: 'RENDERING', updatedAt: { lt: new Date(Date.now() - 5 * 60_000) } },
+            ] },
+            // Scratch rows are driven synchronously by clipMergeWorker;
+            // the sweep would double-process them and race the merge's
+            // own await.
+            { NOT: { notes: { startsWith: '__merge_scratch__' } } },
           ],
         },
         select: { id: true, status: true },
@@ -1552,16 +1687,51 @@ async function main() {
     }
   }
   setInterval(sweepStuckClips, 30_000);
+
+  // Same sweep for merges — detects mid-render deaths and reprocesses.
+  const activeMergeIds = new Set<string>();
+  async function sweepStuckMerges(): Promise<void> {
+    try {
+      const stale = await prisma.clipMerge.findMany({
+        where: {
+          OR: [
+            { status: 'QUEUED' },
+            { status: 'RENDERING', updatedAt: { lt: new Date(Date.now() - 10 * 60_000) } },
+          ],
+        },
+        select: { id: true, status: true },
+        take: 10,
+      });
+      for (const m of stale) {
+        if (activeMergeIds.has(m.id)) continue;
+        activeMergeIds.add(m.id);
+        if (m.status === 'RENDERING') {
+          try { await prisma.clipMerge.update({ where: { id: m.id }, data: { status: 'QUEUED' } }); } catch { /* */ }
+        }
+        log.info({ clipMergeId: m.id, was: m.status }, 'sweep: reprocessing orphan clip merge');
+        void clipMergeWorker({ clipMergeId: m.id })
+          .finally(() => activeMergeIds.delete(m.id));
+      }
+    } catch (err) {
+      log.warn({ err }, 'clip merge sweep failed');
+    }
+  }
+  setInterval(sweepStuckMerges, 60_000);
   // First sweep immediately on boot too (redundant with catch-up above,
   // but harmless — dedup guard skips already-active clips).
   setTimeout(sweepStuckClips, 5_000);
 
-  // clip job queue + source-switch listener (recording resilience)
-  await redisSub.subscribe('demp:jobs:clip', 'demp:events:source-switch');
+  // clip + merge job queue + source-switch listener
+  await redisSub.subscribe('demp:jobs:clip', 'demp:jobs:clip-merge', 'demp:events:source-switch');
   redisSub.on('message', (ch, raw) => {
     if (ch === 'demp:jobs:clip') {
       try { const job = JSON.parse(raw); void clipWorker(job); }
       catch (err) { log.warn({ err }, 'bad clip job'); }
+      return;
+    }
+    if (ch === 'demp:jobs:clip-merge') {
+      try { const job = JSON.parse(raw); void clipMergeWorker(job); }
+      catch (err) { log.warn({ err }, 'bad clip-merge job'); }
       return;
     }
     if (ch === 'demp:events:source-switch') {

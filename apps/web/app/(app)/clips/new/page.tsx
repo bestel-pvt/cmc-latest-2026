@@ -16,7 +16,7 @@ import { useMutation, useQuery } from '@tanstack/react-query';
 import {
   ArrowLeft, Play, Pause, ChevronsLeft, ChevronsRight,
   Rewind, FastForward, Download, Save, Loader2, Volume2, VolumeX,
-  Split, ArrowRightToLine, ArrowLeftToLine,
+  Split, ArrowRightToLine, ArrowLeftToLine, Layers,
 } from 'lucide-react';
 import Link from 'next/link';
 import Hls from 'hls.js';
@@ -32,6 +32,7 @@ import { api } from '@/lib/api';
 import { CLIP_FORMATS, CLIP_RESOLUTIONS } from '@cmc/shared';
 import { fmtTimeCode } from '@/lib/utils';
 import { useAuth } from '@/lib/auth';
+import { pushToQueue } from '@/lib/merge-queue';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? '';
 
@@ -475,8 +476,23 @@ export default function NewClipPage() {
             {channel?.name ?? 'Loading channel…'} · {effectiveStart ? new Date(effectiveStart).toLocaleString() : ''}
           </p>
         </div>
-        <Button variant="secondary" onClick={() => toast.info('Drafts land in Phase 2.')}>
-          <Save className="h-4 w-4" /> Save draft
+        <Button
+          variant="secondary"
+          disabled={!canExport}
+          title="Queue this {in, out} range to merge with others into one file"
+          onClick={() => {
+            if (!startAtISO || !endAtISO) return;
+            const queue = pushToQueue({
+              channelId,
+              channelName: channel?.name ?? channelId,
+              startAt: startAtISO,
+              endAt: endAtISO,
+              labelHint: title.trim() || `${channel?.name ?? ''} ${new Date(startAtISO).toLocaleString()}`,
+            });
+            toast.success(`Added to merge queue (${queue.length})`);
+          }}
+        >
+          <Layers className="h-4 w-4" /> Add to merge queue
         </Button>
         <Button variant="gradient" onClick={() => exportMut.mutate()} disabled={!canExport || exportMut.isPending}>
           {exportMut.isPending ? <Loader2 className="animate-spin h-4 w-4" /> : <Download className="h-4 w-4" />}

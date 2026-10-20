@@ -28,6 +28,7 @@ import framesRoutes from './routes/frames.js';
 import sourcesRoutes from './routes/sources.js';
 import recordingsRoutes from './routes/recordings.js';
 import clipsRoutes from './routes/clips.js';
+import clipMergesRoutes from './routes/clipMerges.js';
 import usersRoutes from './routes/users.js';
 import auditRoutes from './routes/audit.js';
 import dashboardRoutes from './routes/dashboard.js';
@@ -85,6 +86,7 @@ async function main() {
   await app.register(sourcesRoutes,     { prefix: '/api/sources' });
   await app.register(recordingsRoutes,  { prefix: '/api/recordings' });
   await app.register(clipsRoutes,       { prefix: '/api/clips' });
+  await app.register(clipMergesRoutes,  { prefix: '/api/clip-merges' });
   await app.register(usersRoutes,       { prefix: '/api/users' });
   await app.register(auditRoutes,       { prefix: '/api/audit' });
   await app.register(wallTemplatesRoutes, { prefix: '/api/wall-templates' });

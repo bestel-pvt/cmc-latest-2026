@@ -61,6 +61,29 @@ export const createClipSchema = z.object({
 );
 export type CreateClipInput = z.infer<typeof createClipSchema>;
 
+// ---------- Clip Merges ----------
+// Operator picks N {channel, startAt, endAt} segments across any
+// channels; worker renders each as a mezzanine then stitches them in
+// `orderIdx` order into a single mp4.
+export const clipMergeSegmentSchema = z.object({
+  channelId: z.string().min(1),
+  startAt:   z.string().datetime(),
+  endAt:     z.string().datetime(),
+}).refine(
+  (d) => new Date(d.endAt).getTime() > new Date(d.startAt).getTime(),
+  { message: 'endAt must be greater than startAt', path: ['endAt'] },
+);
+export type ClipMergeSegmentInput = z.infer<typeof clipMergeSegmentSchema>;
+
+export const createClipMergeSchema = z.object({
+  title:      z.string().min(1).max(200),
+  notes:      z.string().max(1000).nullable().optional(),
+  format:     z.enum(['MP4','MOV','MKV','WEBM']).default('MP4'),
+  resolution: z.string().default('1920x1080'),
+  segments:   z.array(clipMergeSegmentSchema).min(2).max(30),
+});
+export type CreateClipMergeInput = z.infer<typeof createClipMergeSchema>;
+
 // ---------- Keywords ----------
 export const upsertKeywordSchema = z.object({
   text: z.string().min(1).max(200),

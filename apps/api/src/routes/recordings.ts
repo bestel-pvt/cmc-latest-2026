@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import os, { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { getSegmentPtsMs, getSegmentTruthfulStart, mapWithConcurrency } from '../lib/segmentPts.js';
 
 const routes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.authenticate);
@@ -540,6 +541,29 @@ const routes: FastifyPluginAsync = async (app) => {
     playable.length = 0;
     playable.push(...deduped);
 
+    // Resolve TRUE PTS-anchored start + duration for each playable
+    // segment. The DB carries filename-time (startedAt) and wall-clock
+    // duration (durationMs = mtime - filename), both of which lie by
+    // 3-5 s for first-of-process segments (fresh ffmpeg spawn →
+    // UDP-buffered content burst-fills the first file; measured
+    // 2026-10-20: file 10:05:35 held 61 s of content in 56 s of
+    // wall-clock writing). All downstream PDT math uses these
+    // overridden values so operator marks land on the SAME wall-clock
+    // the clipWorker will later extract from — zero drift. A
+    // `.pts` sibling file caches the measurement so repeated session
+    // loads on the same segments skip the ffmpeg probe.
+    const ptsMap = new Map<string, { trueStartMs: number; ptsMs: number }>();
+    const resolved = await mapWithConcurrency(
+      playable,
+      6,
+      async (s: (typeof playable)[number]) => {
+        const trueStart = await getSegmentTruthfulStart(s.path, s.startedAt);
+        const ptsMs = await getSegmentPtsMs(s.path);
+        return { id: s.id, trueStartMs: trueStart.getTime(), ptsMs: ptsMs ?? s.durationMs };
+      },
+    );
+    for (const r of resolved) ptsMap.set(r.id, { trueStartMs: r.trueStartMs, ptsMs: r.ptsMs });
+
     // Each 60-s recorded MP4 is exposed as ~10 sub-segments of ~6 s
     // (SUB_DURATION). Playlist lists every sub-segment across the
     // session, so hls.js loads ONLY the sub-segment(s) around the
@@ -567,14 +591,12 @@ const routes: FastifyPluginAsync = async (app) => {
     // exposes `hls.playingDate` = wall-clock time of the current
     // frame, so the client can send true UTC timestamps instead of
     // `sessionStart + relativeSeconds` math.
-    const firstPlayableStart = playable[0]!.startedAt;
-    // Kept for the first segment; per-boundary PDT below re-anchors
-    // every discontinuity so drift can't accumulate across many
-    // segments (reported for HUM News 2026-08-25 — long sessions
-    // drifted clip marks by tens of seconds because hls.js was
-    // extrapolating from a single PDT + EXTINFs that don't exactly
-    // sum to actual segment durations).
-    lines.push(`#EXT-X-PROGRAM-DATE-TIME:${firstPlayableStart.toISOString()}`);
+    // Anchor timeline at the TRUE first-frame wall-clock of the first
+    // playable segment (PTS-adjusted). Falls back to DB startedAt if
+    // the ptsMap lookup is empty (shouldn't happen but safe).
+    const firstId = playable[0]!.id;
+    const firstTrueMs = ptsMap.get(firstId)?.trueStartMs ?? playable[0]!.startedAt.getTime();
+    lines.push(`#EXT-X-PROGRAM-DATE-TIME:${new Date(firstTrueMs).toISOString()}`);
     // For each segment we need the ACTUAL slice count that ffmpeg's
     // segment muxer produced (or will produce). Estimating with
     // ceil(dur/6) is wrong when the tail is short — ffmpeg emits N
@@ -590,31 +612,27 @@ const routes: FastifyPluginAsync = async (app) => {
     // segment starts right after via #EXT-X-DISCONTINUITY anyway.
     for (let i = 0; i < playable.length; i++) {
       const s = playable[i];
+      // PTS-anchored start + duration (fallback to DB values if
+      // measurement failed earlier; see ptsMap build above).
+      const pts = ptsMap.get(s.id);
+      const trueStartMs = pts?.trueStartMs ?? s.startedAt.getTime();
+      const trueDurMs = pts?.ptsMs ?? s.durationMs;
       if (i > 0) {
         lines.push('#EXT-X-DISCONTINUITY');
-        // Re-anchor timeline at every discontinuity so hls.js's
-        // `programDateTime` for the current fragment is always the
-        // TRUE wall-clock start of that segment (from the DB row),
-        // not "first PDT + sum-of-declared-EXTINFs" which drifts
-        // whenever declared durations don't match ffmpeg's actual
-        // slice durations.
-        lines.push(`#EXT-X-PROGRAM-DATE-TIME:${s.startedAt.toISOString()}`);
+        // Re-anchor timeline at every discontinuity using the TRUE
+        // first-frame wall-clock. Was: filename-time (DB startedAt)
+        // which lies by up to 5 s for first-of-process segments.
+        lines.push(`#EXT-X-PROGRAM-DATE-TIME:${new Date(trueStartMs).toISOString()}`);
       }
       // CLAMP declared duration to actual wall-clock room before the
-      // next segment (or before the `to` query bound for the last
-      // segment). Prevents the "player says 4:02 but recording is
-      // 2:06" bug where a stale/inflated durationMs (rollover files,
-      // bad probe of mid-write MP4, 24h span accidentally recorded)
-      // makes hls.js compute a timeline longer than the real content
-      // — the operator then marks past the end and the clip window
-      // maps to nothing on disk (2026-09-15 PTV News 25-s clip came
-      // back as 261 B). Real content in the .ts slices doesn't change;
-      // we only trim what the manifest tells the player.
-      let effectiveDurMs = s.durationMs;
+      // next segment (or before `to` query bound for the last one).
+      // Prevents long-recording playlists from running past real
+      // content and letting operators mark into a hole.
+      let effectiveDurMs = trueDurMs;
       const nextStartMs = i + 1 < playable.length
-        ? playable[i + 1]!.startedAt.getTime()
+        ? (ptsMap.get(playable[i + 1]!.id)?.trueStartMs ?? playable[i + 1]!.startedAt.getTime())
         : to.getTime();
-      const roomMs = nextStartMs - s.startedAt.getTime();
+      const roomMs = nextStartMs - trueStartMs;
       if (roomMs > 0 && effectiveDurMs > roomMs) effectiveDurMs = roomMs;
       const durS = effectiveDurMs / 1000;
       const dir = join(HLS_CACHE, s.id);
@@ -646,42 +664,20 @@ const routes: FastifyPluginAsync = async (app) => {
       } else {
         nSub = Math.max(1, Math.floor(durS / SUB_DURATION));
       }
-      // Emit per-slice PDT so hls.js never has to propagate from
-      // declared EXTINFs. Two layered concerns:
-      //   (1) hls.js's `fragment.programDateTime` must reflect the
-      //       wall-clock moment of the FRAME shown at that fragment,
-      //       otherwise clip IN/OUT marks captured from the editor
-      //       drift against what the clip renderer later extracts
-      //       (which uses raw wall-clock markInMs/markOutMs).
-      //   (2) EXTINF must reflect PTS duration so hls.js plays each
-      //       fragment for the right length and v.currentTime
-      //       advances consistently.
-      //
-      // For most channels the splitter's actual PTS durations sum
-      // to approximately the segment's wall-clock durationMs, so
-      // scaleFactor ≈ 1 and these are equivalent. ABB TAKK has a
-      // source clock drift (reported 2026-10-14: ~2 s offset
-      // between scrubber cursor and captured IN) where PTS and
-      // wall-clock diverge inside a single 60-s segment. Scaling
-      // PDT by (segmentWallDurMs / totalCsvMs) stretches/compresses
-      // the propagation so each fragment's PDT lands on real wall
-      // clock instead of PTS cumulative, which fixes the drift
-      // without touching other channels.
+      // Emit per-slice PDT. With trueStartMs = mtime - ptsMs and
+      // trueDurMs = ptsMs, the PDT progression is already in true
+      // wall-clock, so cumulativeMs maps 1:1 — no scaleFactor
+      // compression needed. (Was: scaleFactor patched the
+      // filename-anchored PDT, cosmetically fixing display drift
+      // while silently misaligning what the clipWorker later
+      // extracted — observed as 2-5 s random clip drift when the
+      // clip window overlapped a first-of-process segment.)
       let cumulativeMs = 0;
-      const segStartMs = s.startedAt.getTime();
-      const segmentWallDurMs = s.durationMs;
-      let totalCsvMs = 0;
-      if (actualDurs) {
-        for (let k = 0; k < nSub; k++) totalCsvMs += (actualDurs[k] ?? SUB_DURATION) * 1000;
-      } else {
-        totalCsvMs = nSub * SUB_DURATION * 1000;
-      }
-      const scaleFactor = totalCsvMs > 0 ? segmentWallDurMs / totalCsvMs : 1;
       for (let k = 0; k < nSub; k++) {
         const thisDurPts = actualDurs
           ? (actualDurs[k] ?? SUB_DURATION)
           : Math.min(SUB_DURATION, Math.max(1, durS - k * SUB_DURATION));
-        const slicePdtMs = segStartMs + Math.round(cumulativeMs * scaleFactor);
+        const slicePdtMs = trueStartMs + Math.round(cumulativeMs);
         lines.push(`#EXT-X-PROGRAM-DATE-TIME:${new Date(slicePdtMs).toISOString()}`);
         lines.push(`#EXTINF:${thisDurPts.toFixed(3)},`);
         lines.push(`/api/recordings/segment-hls/${s.id}/${k}.ts`);

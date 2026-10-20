@@ -69,6 +69,7 @@ import { join, resolve } from 'node:path';
 import Redis from 'ioredis';
 import pino from 'pino';
 import { prisma } from '@cmc/db';
+import { getSegmentPtsMs, getSegmentTruthfulStart } from './lib/segmentPts.js';
 
 const log = pino({ transport: process.env.NODE_ENV === 'production' ? undefined : { target: 'pino-pretty' } });
 
@@ -907,6 +908,25 @@ async function clipWorker(job: { clipId: string }) {
     firstHour_iso: firstHour.toISOString(),
     lastHour_iso: lastHour.toISOString(),
   }, 'clip: covering scan starting');
+  // Two-phase scan:
+  //  Phase 1 — Loose candidate pick by FILENAME time, widened +/- 10 s
+  //  to catch first-of-process segments whose true content starts up
+  //  to 5 s BEFORE their filename (UDP buffer burst-fill on fresh
+  //  ffmpeg spawn — measured 2026-10-20: a segment named 10:05:35
+  //  actually held 61 s of content ending at 10:06:31.955).
+  //
+  //  Phase 2 — Resolve each candidate's TRUE first-frame wall-clock
+  //  via getSegmentTruthfulStart (= mtime - ptsMs). PTS is measured
+  //  once per segment with `ffmpeg -c copy -f null` and cached in
+  //  a `<file>.pts` sibling, so repeated clips on the same files
+  //  skip the measurement.
+  //
+  //  Result: `covering[i].startedAt` is the true content-start wall
+  //  time, matching session.m3u8's own PDT anchor — Pass 2's trim
+  //  math becomes zero-drift across normal and first-of-process
+  //  segments both. Was: 2-3 s random drift reported 2026-10-20.
+  interface Candidate { path: string; filenameStart: Date }
+  const candidates: Candidate[] = [];
   for (let cur = new Date(firstHour); cur.getTime() <= lastHour.getTime(); cur = new Date(cur.getTime() + 3600_000)) {
     const dir = join(
       RECORDINGS, clip.channelId,
@@ -920,20 +940,34 @@ async function clipWorker(job: { clipId: string }) {
     if (!dirExists) continue;
     let names: string[] = [];
     try { names = readdirSync(dir); } catch (err) { log.warn({ clipId: clip.id, dir, err }, 'clip: readdir failed'); continue; }
-    let matched = 0;
     for (const n of names) {
       const m = n.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z\.mp4$/);
       if (!m) continue;
-      const fileStart = new Date(+m[1]!, +m[2]! - 1, +m[3]!, +m[4]!, +m[5]!, +m[6]!);
-      const fileEnd   = new Date(fileStart.getTime() + SEG_SECONDS * 1000);
-      if (fileEnd > clip.startAt && fileStart < clip.endAt) {
-        covering.push({ path: join(dir, n), startedAt: fileStart });
-        matched++;
+      const filenameStart = new Date(+m[1]!, +m[2]! - 1, +m[3]!, +m[4]!, +m[5]!, +m[6]!);
+      // Widen the overlap check by 10 s on each side — Phase 2 resolves
+      // the true start and will discard anything that still misses the
+      // clip window.
+      const earliestPossibleStartMs = filenameStart.getTime() - 10_000;
+      const latestPossibleEndMs = filenameStart.getTime() + (SEG_SECONDS + 10) * 1000;
+      if (latestPossibleEndMs > clip.startAt.getTime() && earliestPossibleStartMs < clip.endAt.getTime()) {
+        candidates.push({ path: join(dir, n), filenameStart });
       }
     }
-    log.info({ clipId: clip.id, dir, totalEntries: names.length, matched }, 'clip: dir scan complete');
+    log.info({ clipId: clip.id, dir, totalEntries: names.length, phase1Picked: candidates.length }, 'clip: dir scan complete');
+  }
+  // Resolve each candidate's true content-start wall time + ptsMs.
+  for (const c of candidates) {
+    const trueStart = await getSegmentTruthfulStart(c.path, c.filenameStart);
+    const ptsMs = await getSegmentPtsMs(c.path);
+    const trueEndMs = ptsMs !== null
+      ? trueStart.getTime() + ptsMs
+      : trueStart.getTime() + SEG_SECONDS * 1000;
+    if (trueEndMs > clip.startAt.getTime() && trueStart.getTime() < clip.endAt.getTime()) {
+      covering.push({ path: c.path, startedAt: trueStart });
+    }
   }
   covering.sort((a, b) => a.startedAt.getTime() - b.startedAt.getTime());
+  log.info({ clipId: clip.id, candidates: candidates.length, kept: covering.length }, 'clip: covering resolved');
 
   // Overlapping-segment strategy (multiple concurrent recording ffmpegs
   // write the SAME wall-clock window into different .mp4 files, spawn
@@ -965,12 +999,18 @@ async function clipWorker(job: { clipId: string }) {
   // sibling); live files stay at SEG_SECONDS so operators can
   // clip up to the current write head.
   const fileRealEndMs = (f: CoveringFile): number => {
-    const startMs = f.startedAt.getTime();
-    const declared = SEG_SECONDS * 1000;
-    if (!existsSync(f.path + '.recorded')) return startMs + declared;
-    const measured = estimateSegmentDurationMs(f.path, f.startedAt);
-    if (measured && measured < declared) return startMs + measured;
-    return startMs + declared;
+    // f.startedAt is the TRUE first-frame wall-clock (= mtime - ptsMs).
+    // For a finalized file the end is exactly mtime; for a still-live
+    // file mtime moves with every append, so cap at startedAt +
+    // SEG_SECONDS + 10 s to avoid a mid-write mtime burst poisoning
+    // the math.
+    try {
+      const mtime = statSync(f.path).mtimeMs;
+      if (existsSync(f.path + '.recorded')) return mtime;
+      return Math.min(mtime, f.startedAt.getTime() + (SEG_SECONDS + 10) * 1000);
+    } catch {
+      return f.startedAt.getTime() + SEG_SECONDS * 1000;
+    }
   };
   const singleCover = covering.find((f) => {
     const start = f.startedAt.getTime();
@@ -1095,39 +1135,23 @@ async function clipWorker(job: { clipId: string }) {
     /** slice duration in seconds */
     dur: number;
   }
-  // Per-file ACTUAL end (mtime-based) — ONLY for FINALIZED files.
-  // A crashed recording ffmpeg can leave a stub file 1-5 s long even
-  // though DB / SEG_SECONDS math says "60 s"; the covering scan picks
-  // that stub for a window past its real content and ffmpeg reads
-  // nothing (2026-09-15 PTV News 25-s clip came back 261 bytes). We
-  // trust mtime-based real length only when the writer has flushed
-  // — signalled by the `.recorded` sibling file. For a file that is
-  // still open (no `.recorded`), mtime is "now" which would produce
-  // a spuriously short duration and reject valid marks on live
-  // recordings — so we fall back to SEG_SECONDS in that case.
+  // Per-file ACTUAL end wall-clock. With f.startedAt now anchored to
+  // mtime - ptsMs (true first frame), the end is simply the file's
+  // mtime for finalized files. For a still-live file mtime moves with
+  // every append, so cap at startedAt + SEG_SECONDS + 10 s to prevent
+  // a mid-write mtime burst from poisoning the slice math.
+  //
+  // Crash-stub protection still works via the covering scan — a stub
+  // with ptsMs below the clip window simply fails the overlap filter
+  // and never reaches this code.
   const realEndMs = (f: CoveringFile): number => {
-    const startMs = f.startedAt.getTime();
-    const declared = SEG_SECONDS * 1000;
-    const finalized = existsSync(f.path + '.recorded');
-    // Live (not-yet-finalized) files: trust declared window — their
-    // mtime moves with every append and would spuriously truncate.
-    if (!finalized) return startMs + declared;
-    // Finalized files: trust mtime BOTH directions. Previously this
-    // only trusted measured when `< declared` (to guard against crash-
-    // stubs reading as "60 s"), capping over-length segments to 60 s.
-    // That cap caused a 100–500 ms content gap at EVERY slice boundary
-    // because the segment muxer rolls on the next keyframe AFTER 60 s
-    // (so finalized segments are typically 60.2–60.6 s), and the next
-    // segment's `startedAt` is already offset to that actual rollover
-    // moment. Discarding the extra content left a hole the next slice
-    // couldn't fill — the "1-2 s swallowed around 2 s into the clip"
-    // report (2026-10-03 PTV News / Afghanistan). Trusting measured
-    // either direction closes the gap while keeping the crash-stub
-    // short-circuit (estimateSegmentDurationMs already range-guards
-    // 1 s–15 min, so a stat glitch can't poison the length).
-    const measured = estimateSegmentDurationMs(f.path, f.startedAt);
-    if (measured) return startMs + measured;
-    return startMs + declared;
+    try {
+      const mtime = statSync(f.path).mtimeMs;
+      if (existsSync(f.path + '.recorded')) return mtime;
+      return Math.min(mtime, f.startedAt.getTime() + (SEG_SECONDS + 10) * 1000);
+    } catch {
+      return f.startedAt.getTime() + SEG_SECONDS * 1000;
+    }
   };
   let ffInputArgs: string[] = [];           // only used in single-file path
   const slices: Slice[] = [];                // populated only in multi-slice path
